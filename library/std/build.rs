@@ -32,6 +32,7 @@ fn main() {
         || target.contains("solid")
         || target.contains("nintendo-3ds")
         || target.contains("nto")
+        || target.contains("zkvm")
     {
         // These platforms don't have any special requirements.
     } else {
