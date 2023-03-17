@@ -7,6 +7,8 @@
 //! wide/production use yet, it's still all in the experimental category. This
 //! will likely change over time.
 
+const WORD_SIZE: usize = core::mem::size_of::<u32>();
+
 pub mod alloc;
 #[path = "../unsupported/args.rs"]
 pub mod args;
@@ -19,7 +21,6 @@ pub mod fs;
 pub mod io;
 #[path = "../unsupported/net.rs"]
 pub mod net;
-#[path = "../unsupported/os.rs"]
 pub mod os;
 #[path = "../unix/os_str.rs"]
 pub mod os_str;

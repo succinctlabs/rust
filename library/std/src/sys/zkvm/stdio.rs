@@ -1,4 +1,4 @@
-use super::abi;
+use super::{abi, abi::fileno};
 use crate::io;
 
 pub struct Stdin;
@@ -12,8 +12,8 @@ impl Stdin {
 }
 
 impl io::Read for Stdin {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        Ok(0)
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Ok(unsafe { abi::sys_read(fileno::STDIN, buf.as_mut_ptr(), buf.len()) })
     }
 }
 
@@ -25,7 +25,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        unsafe { abi::zkvm_abi_write_stdout(buf) };
+        unsafe { abi::sys_write(fileno::STDOUT, buf.as_ptr(), buf.len()) }
 
         Ok(buf.len())
     }
@@ -43,7 +43,7 @@ impl Stderr {
 
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        unsafe { abi::zkvm_abi_write_stderr(buf) };
+        unsafe { abi::sys_write(fileno::STDERR, buf.as_ptr(), buf.len()) }
 
         Ok(buf.len())
     }
@@ -53,7 +53,7 @@ impl io::Write for Stderr {
     }
 }
 
-pub const STDIN_BUF_SIZE: usize = 0;
+pub const STDIN_BUF_SIZE: usize = crate::sys_common::io::DEFAULT_BUF_SIZE;
 
 pub fn is_ebadf(_err: &io::Error) -> bool {
     true

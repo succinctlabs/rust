@@ -1,8 +1,6 @@
-use super::abi;
+use super::{abi, WORD_SIZE};
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;
-
-const WORD_SIZE: usize = core::mem::size_of::<u32>();
 
 #[stable(feature = "alloc_system_type", since = "1.28.0")]
 unsafe impl GlobalAlloc for System {
@@ -15,7 +13,7 @@ unsafe impl GlobalAlloc for System {
             .size()
             / WORD_SIZE;
 
-        abi::zkvm_abi_alloc_words(nwords) as *mut u8
+        abi::sys_alloc_words(nwords) as *mut u8
     }
 
     #[inline]
