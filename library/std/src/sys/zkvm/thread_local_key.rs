@@ -9,20 +9,15 @@ pub unsafe fn create(_dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Key {
 
 #[inline]
 pub unsafe fn set(key: Key, value: *mut u8) {
-    let key = key as *mut *mut u8;
+    let key: *mut *mut u8 = core::ptr::from_exposed_addr_mut(key);
     *key = value;
 }
 
 #[inline]
 pub unsafe fn get(key: Key) -> *mut u8 {
-    let key = key as *mut *mut u8;
+    let key: *mut *mut u8 = core::ptr::from_exposed_addr_mut(key);
     *key
 }
 
 #[inline]
 pub unsafe fn destroy(_key: Key) {}
-
-#[inline]
-pub fn requires_synchronized_create() -> bool {
-    false
-}

@@ -21,6 +21,8 @@ pub mod fs;
 pub mod io;
 #[path = "../unsupported/net.rs"]
 pub mod net;
+#[path = "../unsupported/once.rs"]
+pub mod once;
 pub mod os;
 #[path = "../unix/os_str.rs"]
 pub mod os_str;

@@ -7,6 +7,7 @@
 // currently no risc0 fork of the libc crate, so we'd either have to
 // fork it or upstream it.
 
+#![allow(dead_code)]
 pub const DIGEST_WORDS: usize = 8;
 
 /// Standard IO file descriptors for use with sys_read and sys_write.
@@ -18,49 +19,6 @@ pub mod fileno {
 }
 
 extern "C" {
-    // Syscall names are all nul-terminated c-style string.  Raw access to syscalls:
-    pub fn syscall_0(name: *const u8, from_host: *mut u32, from_host_words: usize) -> (u32, u32);
-    pub fn syscall_1(
-        name: *const u8,
-        from_host: *mut u32,
-        from_host_words: usize,
-        a3: u32,
-    ) -> (u32, u32);
-    pub fn syscall_2(
-        name: *const u8,
-        from_host: *mut u32,
-        from_host_words: usize,
-        a3: u32,
-        a4: u32,
-    ) -> (u32, u32);
-    pub fn syscall_3(
-        name: *const u8,
-        from_host: *mut u32,
-        from_host_words: usize,
-        a3: u32,
-        a4: u32,
-        a5: u32,
-    ) -> (u32, u32);
-    pub fn syscall_4(
-        name: *const u8,
-        from_host: *mut u32,
-        from_host_words: usize,
-        a3: u32,
-        a4: u32,
-        a5: u32,
-        a6: u32,
-    ) -> (u32, u32);
-    pub fn syscall_5(
-        name: *const u8,
-        from_host: *mut u32,
-        from_host_words: usize,
-        a3: u32,
-        a4: u32,
-        a5: u32,
-        a6: u32,
-        a7: u32,
-    ) -> (u32, u32);
-
     // Wrappers around syscalls provided by risc0-zkvm-platform:
     pub fn sys_halt();
     pub fn sys_output(output_id: u32, output_value: u32);
