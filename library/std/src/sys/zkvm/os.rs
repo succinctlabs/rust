@@ -93,7 +93,7 @@ pub fn getenv(varname: &OsStr) -> Option<OsString> {
 
     // Convert to OsString.
     //
-    // TODO: We can probably get rid of the extra copy here if we
+    // FIXME: We can probably get rid of the extra copy here if we
     // reimplement "os_str" instead of just using the generic unix
     // "os_str".
     let u8s: &[u8] = unsafe { crate::slice::from_raw_parts(words.cast() as *const u8, nbytes) };

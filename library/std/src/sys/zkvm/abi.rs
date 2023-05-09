@@ -2,7 +2,7 @@
 
 // Included here so we don't have to depend on risc0-zkvm-platform.
 //
-// TODO: Should we move this to the "libc" crate?  It seems like other
+// FIXME: Should we move this to the "libc" crate?  It seems like other
 // architectures put a lot of this kind of stuff there.  But there's
 // currently no risc0 fork of the libc crate, so we'd either have to
 // fork it or upstream it.
