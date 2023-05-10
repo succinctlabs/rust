@@ -43,6 +43,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_family = "wasm")] {
         mod wasm;
         pub use self::wasm::*;
+    } else if #[cfg(target_os = "zkvm")] {
+        mod zkvm;
+        pub use self::zkvm::*;
     } else if #[cfg(all(target_vendor = "fortanix", target_env = "sgx"))] {
         mod sgx;
         pub use self::sgx::*;
