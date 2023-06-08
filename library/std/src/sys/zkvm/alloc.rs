@@ -5,14 +5,7 @@ use crate::alloc::{GlobalAlloc, Layout, System};
 unsafe impl GlobalAlloc for System {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let nwords = layout
-            .align_to(WORD_SIZE)
-            .expect("Unable to align allocation to word size")
-            .pad_to_align()
-            .size()
-            / WORD_SIZE;
-
-        abi::sys_alloc_words(nwords) as *mut u8
+        abi::sys_alloc_aligned(layout.size(), layout.align())
     }
 
     #[inline]
