@@ -49,4 +49,5 @@ extern "C" {
 
     // Allocate memory from global HEAP.
     pub fn sys_alloc_words(nwords: usize) -> *mut u32;
+    pub fn sys_alloc_aligned(nwords: usize, align: usize) -> *mut u8;
 }
