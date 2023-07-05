@@ -1,4 +1,4 @@
-use super::{abi, WORD_SIZE};
+use super::abi;
 use crate::alloc::{GlobalAlloc, Layout, System};
 
 #[stable(feature = "alloc_system_type", since = "1.28.0")]

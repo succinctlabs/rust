@@ -46,6 +46,12 @@ extern "C" {
         varname: *const u8,
         varname_len: usize,
     ) -> usize;
+    pub fn sys_argc() -> usize;
+    pub fn sys_argv(
+        out_words: *mut u32,
+        out_nwords: usize,
+        arg_index: usize,
+    ) -> usize;
 
     // Allocate memory from global HEAP.
     pub fn sys_alloc_words(nwords: usize) -> *mut u32;

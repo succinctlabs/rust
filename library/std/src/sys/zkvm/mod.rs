@@ -10,7 +10,7 @@
 const WORD_SIZE: usize = core::mem::size_of::<u32>();
 
 pub mod alloc;
-#[path = "../unsupported/args.rs"]
+#[path = "../zkvm/args.rs"]
 pub mod args;
 #[path = "../unix/cmath.rs"]
 pub mod cmath;
