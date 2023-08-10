@@ -36,6 +36,14 @@ jobs:
           submodules: 'recursive'
           path: rust
 
+      # We need the full history for the main repo so the build tooling can
+      # determine the cached LLVM download.
+      - name: Fetch full branch history
+        run: |
+          cd rust
+          git fetch --unshallow origin $(git branch --show-current)
+          echo "Branch history fetched!"
+
       - name: Check out risc0/risc0
         uses: actions/checkout@v3
         with:
