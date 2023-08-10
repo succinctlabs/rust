@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Install Rust
         uses: risc0/actions-rs-toolchain@v1
+        with:
+            toolchain: stable
 
       - name: Check out risc0/rust
         uses: actions/checkout@v3
