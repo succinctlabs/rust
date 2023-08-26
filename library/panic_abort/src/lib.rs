@@ -18,6 +18,9 @@
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(target_os = "zkvm")]
+mod zkvm;
+
 use core::any::Any;
 use core::panic::BoxMeUp;
 
@@ -33,6 +36,8 @@ pub unsafe fn __rust_start_panic(_payload: &mut dyn BoxMeUp) -> u32 {
     // Android has the ability to attach a message as part of the abort.
     #[cfg(target_os = "android")]
     android::android_set_abort_message(_payload);
+    #[cfg(target_os = "zkvm")]
+    zkvm::zkvm_set_abort_message(_payload);
 
     abort();
 

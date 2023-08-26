@@ -129,7 +129,8 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &'static str, Option<&[&'static str]>)]
     (Some(Mode::Std), "backtrace_in_libstd", None),
     /* Extra values not defined in the built-in targets yet, but used in std */
     (Some(Mode::Std), "target_env", Some(&["libnx"])),
-    // (Some(Mode::Std), "target_os", Some(&[])),
+    (Some(Mode::Std), "target_os", Some(&["zkvm"])),
+    (Some(Mode::Std), "target_vendor", Some(&["risc0"])),
     // #[cfg(bootstrap)] loongarch64
     (Some(Mode::Std), "target_arch", Some(&["asmjs", "spirv", "nvptx", "xtensa", "loongarch64"])),
     /* Extra names used by dependencies */
@@ -747,6 +748,11 @@ impl Build {
         }
         if self.config.profiler_enabled(target) {
             features.push_str(" profiler");
+        }
+        // Generate memcpy, etc.  FIXME: Remove this once compiler-builtins
+        // automatically detects this target.
+        if target.contains("zkvm") {
+            features.push_str(" compiler-builtins-mem");
         }
         features
     }
