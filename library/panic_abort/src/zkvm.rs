@@ -10,8 +10,8 @@ use core::panic::BoxMeUp;
 //
 // Weakly resolve the symbol for android_set_abort_message. This function is only available
 // for API >= 21.
-pub(crate) unsafe fn zkvm_set_abort_message(payload: *mut &mut dyn BoxMeUp) {
-    let payload = (*payload).get();
+pub(crate) unsafe fn zkvm_set_abort_message(payload: &mut dyn BoxMeUp) {
+    let payload = payload.get();
     let msg = match payload.downcast_ref::<&'static str>() {
         Some(msg) => msg.as_bytes(),
         None => match payload.downcast_ref::<String>() {
