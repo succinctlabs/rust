@@ -2,20 +2,20 @@
 
 use crate::mir::{Body, ConstantKind, Promoted};
 use crate::ty::{self, OpaqueHiddenType, Ty, TyCtxt};
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::vec_map::VecMap;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::BitMatrix;
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::fmt::{self, Debug};
 
-use super::{Field, SourceInfo};
+use super::SourceInfo;
 
 #[derive(Copy, Clone, PartialEq, TyEncodable, TyDecodable, HashStable, Debug)]
 pub enum UnsafetyViolationKind {
@@ -123,7 +123,7 @@ pub struct UnsafetyCheckResult {
     pub violations: Vec<UnsafetyViolation>,
 
     /// Used `unsafe` blocks in this function. This is used for the "unused_unsafe" lint.
-    pub used_unsafe_blocks: FxHashSet<hir::HirId>,
+    pub used_unsafe_blocks: UnordSet<hir::HirId>,
 
     /// This is `Some` iff the item is not a closure.
     pub unused_unsafes: Option<Vec<(hir::HirId, UnusedUnsafe)>>,
@@ -152,7 +152,7 @@ pub struct GeneratorLayout<'tcx> {
 
     /// Which of the above fields are in each variant. Note that one field may
     /// be stored in multiple variants.
-    pub variant_fields: IndexVec<VariantIdx, IndexVec<Field, GeneratorSavedLocal>>,
+    pub variant_fields: IndexVec<VariantIdx, IndexVec<FieldIdx, GeneratorSavedLocal>>,
 
     /// The source that led to each variant being created (usually, a yield or
     /// await).
@@ -227,9 +227,9 @@ pub struct BorrowCheckResult<'tcx> {
     /// All the opaque types that are restricted to concrete types
     /// by this function. Unlike the value in `TypeckResults`, this has
     /// unerased regions.
-    pub concrete_opaque_types: VecMap<LocalDefId, OpaqueHiddenType<'tcx>>,
+    pub concrete_opaque_types: FxIndexMap<LocalDefId, OpaqueHiddenType<'tcx>>,
     pub closure_requirements: Option<ClosureRegionRequirements<'tcx>>,
-    pub used_mut_upvars: SmallVec<[Field; 8]>,
+    pub used_mut_upvars: SmallVec<[FieldIdx; 8]>,
     pub tainted_by_errors: Option<ErrorGuaranteed>,
 }
 
@@ -353,7 +353,7 @@ pub enum ConstraintCategory<'tcx> {
     /// like `Foo { field: my_val }`)
     Usage,
     OpaqueType,
-    ClosureUpvar(Field),
+    ClosureUpvar(FieldIdx),
 
     /// A constraint from a user-written predicate
     /// with the provided span, written on the item
@@ -375,7 +375,7 @@ pub enum ConstraintCategory<'tcx> {
 #[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
 pub enum ReturnConstraint {
     Normal,
-    ClosureUpvar(Field),
+    ClosureUpvar(FieldIdx),
 }
 
 /// The subject of a `ClosureOutlivesRequirement` -- that is, the thing
@@ -411,10 +411,8 @@ impl<'tcx> ClosureOutlivesSubjectTy<'tcx> {
     pub fn bind(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
         let inner = tcx.fold_regions(ty, |r, depth| match r.kind() {
             ty::ReVar(vid) => {
-                let br = ty::BoundRegion {
-                    var: ty::BoundVar::new(vid.index()),
-                    kind: ty::BrAnon(vid.as_u32(), None),
-                };
+                let br =
+                    ty::BoundRegion { var: ty::BoundVar::new(vid.index()), kind: ty::BrAnon(None) };
                 tcx.mk_re_late_bound(depth, br)
             }
             _ => bug!("unexpected region in ClosureOutlivesSubjectTy: {r:?}"),

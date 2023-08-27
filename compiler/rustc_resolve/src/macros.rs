@@ -1,14 +1,14 @@
 //! A bunch of methods and structures more or less related to resolving macros and
 //! interface provided by `Resolver` to macro expander.
 
+use crate::errors::{AddAsNonDerive, MacroExpectedFound, RemoveSurroundingDerive};
 use crate::Namespace::*;
 use crate::{BuiltinMacroState, Determinacy};
 use crate::{DeriveData, Finalize, ParentScope, ResolutionError, Resolver, ScopeSet};
 use crate::{ModuleKind, ModuleOrUniformRoot, NameBinding, PathResult, Segment};
-use rustc_ast::{self as ast, Inline, ItemKind, ModKind, NodeId};
+use rustc_ast::{self as ast, attr, Inline, ItemKind, ModKind, NodeId};
 use rustc_ast_pretty::pprust;
 use rustc_attr::StabilityLevel;
-use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{struct_span_err, Applicability};
@@ -20,11 +20,11 @@ use rustc_hir::def::{self, DefKind, NonMacroAttrKind};
 use rustc_hir::def_id::{CrateNum, LocalDefId};
 use rustc_middle::middle::stability;
 use rustc_middle::ty::RegisteredTools;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::lint::builtin::{LEGACY_DERIVE_HELPERS, SOFT_UNSTABLE};
 use rustc_session::lint::builtin::{UNUSED_MACROS, UNUSED_MACRO_RULES};
 use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_session::parse::feature_err;
-use rustc_session::Session;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{self, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::hygiene::{AstPass, MacroKind};
@@ -111,15 +111,17 @@ fn fast_print_path(path: &ast::Path) -> Symbol {
     }
 }
 
-pub(crate) fn registered_tools(sess: &Session, attrs: &[ast::Attribute]) -> FxHashSet<Ident> {
-    let mut registered_tools = FxHashSet::default();
-    for attr in sess.filter_by_name(attrs, sym::register_tool) {
+pub(crate) fn registered_tools(tcx: TyCtxt<'_>, (): ()) -> RegisteredTools {
+    let mut registered_tools = RegisteredTools::default();
+    let (_, pre_configured_attrs) = &*tcx.crate_for_resolver(()).borrow();
+    for attr in attr::filter_by_name(pre_configured_attrs, sym::register_tool) {
         for nested_meta in attr.meta_item_list().unwrap_or_default() {
             match nested_meta.ident() {
                 Some(ident) => {
                     if let Some(old_ident) = registered_tools.replace(ident) {
                         let msg = format!("{} `{}` was already registered", "tool", ident);
-                        sess.struct_span_err(ident.span, &msg)
+                        tcx.sess
+                            .struct_span_err(ident.span, &msg)
                             .span_label(old_ident.span, "already registered here")
                             .emit();
                     }
@@ -127,7 +129,10 @@ pub(crate) fn registered_tools(sess: &Session, attrs: &[ast::Attribute]) -> FxHa
                 None => {
                     let msg = format!("`{}` only accepts identifiers", sym::register_tool);
                     let span = nested_meta.span();
-                    sess.struct_span_err(span, &msg).span_label(span, "not an identifier").emit();
+                    tcx.sess
+                        .struct_span_err(span, &msg)
+                        .span_label(span, "not an identifier")
+                        .emit();
                 }
             }
         }
@@ -539,12 +544,29 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         };
         if let Some((article, expected)) = unexpected_res {
             let path_str = pprust::path_to_string(path);
-            let msg = format!("expected {}, found {} `{}`", expected, res.descr(), path_str);
-            self.tcx
-                .sess
-                .struct_span_err(path.span, &msg)
-                .span_label(path.span, format!("not {} {}", article, expected))
-                .emit();
+
+            let mut err = MacroExpectedFound {
+                span: path.span,
+                expected,
+                found: res.descr(),
+                macro_path: &path_str,
+                ..Default::default() // Subdiagnostics default to None
+            };
+
+            // Suggest moving the macro out of the derive() if the macro isn't Derive
+            if !path.span.from_expansion()
+                && kind == MacroKind::Derive
+                && ext.macro_kind() != MacroKind::Derive
+            {
+                err.remove_surrounding_derive = Some(RemoveSurroundingDerive { span: path.span });
+                err.add_as_non_derive = Some(AddAsNonDerive { macro_path: &path_str });
+            }
+
+            let mut err = self.tcx.sess.create_err(err);
+            err.span_label(path.span, format!("not {} {}", article, expected));
+
+            err.emit();
+
             return Ok((self.dummy_ext(kind), Res::Err));
         }
 
@@ -699,7 +721,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 PathResult::NonModule(path_res) if let Some(res) = path_res.full_res() => {
                     check_consistency(self, &path, path_span, kind, initial_res, res)
                 }
-                path_res @ PathResult::NonModule(..) | path_res @ PathResult::Failed { .. } => {
+                path_res @ (PathResult::NonModule(..) | PathResult::Failed { .. }) => {
                     let mut suggestion = None;
                     let (span, label) = if let PathResult::Failed { span, label, .. } = path_res {
                         // try to suggest if it's not a macro, maybe a function

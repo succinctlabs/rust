@@ -34,6 +34,7 @@ use rustc_attr as attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::steal::Steal;
 use rustc_data_structures::tagged_ptr::CopyTaggedPtr;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
@@ -44,10 +45,12 @@ use rustc_index::vec::IndexVec;
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_serialize::{Decodable, Encodable};
+use rustc_session::lint::LintBuffer;
+pub use rustc_session::lint::RegisteredTools;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{ExpnId, ExpnKind, Span};
-use rustc_target::abi::{Align, Integer, IntegerType, VariantIdx};
+use rustc_target::abi::{Align, FieldIdx, Integer, IntegerType, VariantIdx};
 pub use rustc_target::abi::{ReprFlags, ReprOptions};
 use rustc_type_ir::WithCachedTypeInfo;
 pub use subst::*;
@@ -148,8 +151,6 @@ mod typeck_results;
 
 // Data types
 
-pub type RegisteredTools = FxHashSet<Ident>;
-
 pub struct ResolverOutputs {
     pub global_ctxt: ResolverGlobalCtxt,
     pub ast_lowering: ResolverAstLowering,
@@ -165,7 +166,8 @@ pub struct ResolverGlobalCtxt {
     pub effective_visibilities: EffectiveVisibilities,
     pub extern_crate_map: FxHashMap<LocalDefId, CrateNum>,
     pub maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
-    pub reexport_map: FxHashMap<LocalDefId, Vec<ModChild>>,
+    pub module_children_non_reexports: LocalDefIdMap<Vec<LocalDefId>>,
+    pub module_children_reexports: LocalDefIdMap<Vec<ModChild>>,
     pub glob_map: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
     pub main_def: Option<MainDefinition>,
     pub trait_impls: FxIndexMap<DefId, Vec<LocalDefId>>,
@@ -175,7 +177,6 @@ pub struct ResolverGlobalCtxt {
     /// Mapping from ident span to path span for paths that don't exist as written, but that
     /// exist under `std`. For example, wrote `str::from_utf8` instead of `std::str::from_utf8`.
     pub confused_type_with_std_module: FxHashMap<Span, Span>,
-    pub registered_tools: RegisteredTools,
     pub doc_link_resolutions: FxHashMap<LocalDefId, DocLinkResMap>,
     pub doc_link_traits_in_scope: FxHashMap<LocalDefId, Vec<DefId>>,
     pub all_macro_rules: FxHashMap<Symbol, Res<ast::NodeId>>,
@@ -209,6 +210,9 @@ pub struct ResolverAstLowering {
     pub builtin_macro_kinds: FxHashMap<LocalDefId, MacroKind>,
     /// List functions and methods for which lifetime elision was successful.
     pub lifetime_elision_allowed: FxHashSet<ast::NodeId>,
+
+    /// Lints that were emitted by the resolver and early lints.
+    pub lint_buffer: Steal<LintBuffer>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,12 +329,15 @@ pub struct ClosureSizeProfileData<'tcx> {
     pub after_feature_tys: Ty<'tcx>,
 }
 
-pub trait DefIdTree: Copy {
-    fn opt_parent(self, id: DefId) -> Option<DefId>;
+impl TyCtxt<'_> {
+    #[inline]
+    pub fn opt_parent(self, id: DefId) -> Option<DefId> {
+        self.def_key(id).parent.map(|index| DefId { index, ..id })
+    }
 
     #[inline]
     #[track_caller]
-    fn parent(self, id: DefId) -> DefId {
+    pub fn parent(self, id: DefId) -> DefId {
         match self.opt_parent(id) {
             Some(id) => id,
             // not `unwrap_or_else` to avoid breaking caller tracking
@@ -340,17 +347,17 @@ pub trait DefIdTree: Copy {
 
     #[inline]
     #[track_caller]
-    fn opt_local_parent(self, id: LocalDefId) -> Option<LocalDefId> {
+    pub fn opt_local_parent(self, id: LocalDefId) -> Option<LocalDefId> {
         self.opt_parent(id.to_def_id()).map(DefId::expect_local)
     }
 
     #[inline]
     #[track_caller]
-    fn local_parent(self, id: LocalDefId) -> LocalDefId {
+    pub fn local_parent(self, id: LocalDefId) -> LocalDefId {
         self.parent(id.to_def_id()).expect_local()
     }
 
-    fn is_descendant_of(self, mut descendant: DefId, ancestor: DefId) -> bool {
+    pub fn is_descendant_of(self, mut descendant: DefId, ancestor: DefId) -> bool {
         if descendant.krate != ancestor.krate {
             return false;
         }
@@ -362,13 +369,6 @@ pub trait DefIdTree: Copy {
             }
         }
         true
-    }
-}
-
-impl<'tcx> DefIdTree for TyCtxt<'tcx> {
-    #[inline]
-    fn opt_parent(self, id: DefId) -> Option<DefId> {
-        self.def_key(id).parent.map(|index| DefId { index, ..id })
     }
 }
 
@@ -391,19 +391,19 @@ impl<Id: Into<DefId>> Visibility<Id> {
     }
 
     /// Returns `true` if an item with this visibility is accessible from the given module.
-    pub fn is_accessible_from(self, module: impl Into<DefId>, tree: impl DefIdTree) -> bool {
+    pub fn is_accessible_from(self, module: impl Into<DefId>, tcx: TyCtxt<'_>) -> bool {
         match self {
             // Public items are visible everywhere.
             Visibility::Public => true,
-            Visibility::Restricted(id) => tree.is_descendant_of(module.into(), id.into()),
+            Visibility::Restricted(id) => tcx.is_descendant_of(module.into(), id.into()),
         }
     }
 
     /// Returns `true` if this visibility is at least as accessible as the given visibility
-    pub fn is_at_least(self, vis: Visibility<impl Into<DefId>>, tree: impl DefIdTree) -> bool {
+    pub fn is_at_least(self, vis: Visibility<impl Into<DefId>>, tcx: TyCtxt<'_>) -> bool {
         match vis {
             Visibility::Public => self.is_public(),
-            Visibility::Restricted(id) => self.is_accessible_from(id, tree),
+            Visibility::Restricted(id) => self.is_accessible_from(id, tcx),
         }
     }
 }
@@ -544,7 +544,7 @@ impl<'tcx> Predicate<'tcx> {
             | PredicateKind::Clause(Clause::TypeOutlives(_))
             | PredicateKind::Clause(Clause::Projection(_))
             | PredicateKind::Clause(Clause::ConstArgHasType(..))
-            | PredicateKind::AliasEq(..)
+            | PredicateKind::AliasRelate(..)
             | PredicateKind::ObjectSafe(_)
             | PredicateKind::ClosureKind(_, _, _)
             | PredicateKind::Subtype(_)
@@ -641,7 +641,23 @@ pub enum PredicateKind<'tcx> {
     /// This predicate requires two terms to be equal to eachother.
     ///
     /// Only used for new solver
-    AliasEq(Term<'tcx>, Term<'tcx>),
+    AliasRelate(Term<'tcx>, Term<'tcx>, AliasRelationDirection),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
+#[derive(HashStable, Debug)]
+pub enum AliasRelationDirection {
+    Equate,
+    Subtype,
+}
+
+impl std::fmt::Display for AliasRelationDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AliasRelationDirection::Equate => write!(f, "=="),
+            AliasRelationDirection::Subtype => write!(f, "<:"),
+        }
+    }
 }
 
 /// The crate outlives map is computed during typeck and contains the
@@ -977,11 +993,11 @@ impl<'tcx> Term<'tcx> {
         }
     }
 
-    /// This function returns `None` for `AliasKind::Opaque`.
+    /// This function returns the inner `AliasTy` if this term is a projection.
     ///
     /// FIXME: rename `AliasTy` to `AliasTerm` and make sure we correctly
     /// deal with constants.
-    pub fn to_alias_term_no_opaque(&self, tcx: TyCtxt<'tcx>) -> Option<AliasTy<'tcx>> {
+    pub fn to_projection_term(&self, tcx: TyCtxt<'tcx>) -> Option<AliasTy<'tcx>> {
         match self.unpack() {
             TermKind::Ty(ty) => match ty.kind() {
                 ty::Alias(kind, alias_ty) => match kind {
@@ -999,7 +1015,7 @@ impl<'tcx> Term<'tcx> {
 
     pub fn is_infer(&self) -> bool {
         match self.unpack() {
-            TermKind::Ty(ty) => ty.is_ty_or_numeric_infer(),
+            TermKind::Ty(ty) => ty.is_ty_var(),
             TermKind::Const(ct) => ct.is_ct_infer(),
         }
     }
@@ -1033,6 +1049,21 @@ impl<'tcx> TermKind<'tcx> {
         };
 
         Term { ptr: unsafe { NonZeroUsize::new_unchecked(ptr | tag) }, marker: PhantomData }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ParamTerm {
+    Ty(ParamTy),
+    Const(ParamConst),
+}
+
+impl ParamTerm {
+    pub fn index(self) -> usize {
+        match self {
+            ParamTerm::Ty(ty) => ty.index as usize,
+            ParamTerm::Const(ct) => ct.index as usize,
+        }
     }
 }
 
@@ -1129,6 +1160,13 @@ impl<'tcx, T> ToPredicate<'tcx, T> for T {
     }
 }
 
+impl<'tcx> ToPredicate<'tcx> for PredicateKind<'tcx> {
+    #[inline(always)]
+    fn to_predicate(self, tcx: TyCtxt<'tcx>) -> Predicate<'tcx> {
+        ty::Binder::dummy(self).to_predicate(tcx)
+    }
+}
+
 impl<'tcx> ToPredicate<'tcx> for Binder<'tcx, PredicateKind<'tcx>> {
     #[inline(always)]
     fn to_predicate(self, tcx: TyCtxt<'tcx>) -> Predicate<'tcx> {
@@ -1140,6 +1178,13 @@ impl<'tcx> ToPredicate<'tcx> for Clause<'tcx> {
     #[inline(always)]
     fn to_predicate(self, tcx: TyCtxt<'tcx>) -> Predicate<'tcx> {
         tcx.mk_predicate(ty::Binder::dummy(ty::PredicateKind::Clause(self)))
+    }
+}
+
+impl<'tcx> ToPredicate<'tcx> for TraitRef<'tcx> {
+    #[inline(always)]
+    fn to_predicate(self, tcx: TyCtxt<'tcx>) -> Predicate<'tcx> {
+        ty::Binder::dummy(self).to_predicate(tcx)
     }
 }
 
@@ -1193,7 +1238,7 @@ impl<'tcx> Predicate<'tcx> {
             PredicateKind::Clause(Clause::Trait(t)) => Some(predicate.rebind(t)),
             PredicateKind::Clause(Clause::Projection(..))
             | PredicateKind::Clause(Clause::ConstArgHasType(..))
-            | PredicateKind::AliasEq(..)
+            | PredicateKind::AliasRelate(..)
             | PredicateKind::Subtype(..)
             | PredicateKind::Coerce(..)
             | PredicateKind::Clause(Clause::RegionOutlives(..))
@@ -1214,7 +1259,7 @@ impl<'tcx> Predicate<'tcx> {
             PredicateKind::Clause(Clause::Projection(t)) => Some(predicate.rebind(t)),
             PredicateKind::Clause(Clause::Trait(..))
             | PredicateKind::Clause(Clause::ConstArgHasType(..))
-            | PredicateKind::AliasEq(..)
+            | PredicateKind::AliasRelate(..)
             | PredicateKind::Subtype(..)
             | PredicateKind::Coerce(..)
             | PredicateKind::Clause(Clause::RegionOutlives(..))
@@ -1236,7 +1281,7 @@ impl<'tcx> Predicate<'tcx> {
             PredicateKind::Clause(Clause::Trait(..))
             | PredicateKind::Clause(Clause::ConstArgHasType(..))
             | PredicateKind::Clause(Clause::Projection(..))
-            | PredicateKind::AliasEq(..)
+            | PredicateKind::AliasRelate(..)
             | PredicateKind::Subtype(..)
             | PredicateKind::Coerce(..)
             | PredicateKind::Clause(Clause::RegionOutlives(..))
@@ -1386,7 +1431,7 @@ impl<'tcx> OpaqueHiddenType<'tcx> {
         // lifetimes with 'static and remapping only those used in the
         // `impl Trait` return type, resulting in the parameters
         // shifting.
-        let id_substs = InternalSubsts::identity_for_item(tcx, def_id.to_def_id());
+        let id_substs = InternalSubsts::identity_for_item(tcx, def_id);
         debug!(?id_substs);
 
         // This zip may have several times the same lifetime in `substs` paired with a different
@@ -1410,12 +1455,12 @@ impl<'tcx> OpaqueHiddenType<'tcx> {
 #[derive(HashStable, TyEncodable, TyDecodable)]
 pub struct Placeholder<T> {
     pub universe: UniverseIndex,
-    pub name: T,
+    pub bound: T,
 }
 
-pub type PlaceholderRegion = Placeholder<BoundRegionKind>;
+pub type PlaceholderRegion = Placeholder<BoundRegion>;
 
-pub type PlaceholderType = Placeholder<BoundTyKind>;
+pub type PlaceholderType = Placeholder<BoundTy>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable)]
 #[derive(TyEncodable, TyDecodable, PartialOrd, Ord)]
@@ -1847,7 +1892,7 @@ pub struct VariantDef {
     /// Discriminant of this variant.
     pub discr: VariantDiscr,
     /// Fields of this variant.
-    pub fields: Vec<FieldDef>,
+    pub fields: IndexVec<FieldIdx, FieldDef>,
     /// Flags of the variant (e.g. is field list non-exhaustive)?
     flags: VariantFlags,
 }
@@ -1874,7 +1919,7 @@ impl VariantDef {
         variant_did: Option<DefId>,
         ctor: Option<(CtorKind, DefId)>,
         discr: VariantDiscr,
-        fields: Vec<FieldDef>,
+        fields: IndexVec<FieldIdx, FieldDef>,
         adt_kind: AdtKind,
         parent_did: DefId,
         recovered: bool,
@@ -2028,7 +2073,6 @@ impl<'tcx> FieldDef {
     }
 }
 
-pub type Attributes<'tcx> = impl Iterator<Item = &'tcx ast::Attribute>;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ImplOverlapKind {
     /// These impls are always allowed to overlap.
@@ -2071,7 +2115,9 @@ pub enum ImplOverlapKind {
     Issue33140,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
+/// Useful source information about where a desugared associated type for an
+/// RPITIT originated from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encodable, Decodable, HashStable)]
 pub enum ImplTraitInTraitData {
     Trait { fn_def_id: DefId, opaque_def_id: DefId },
     Impl { fn_def_id: DefId },
@@ -2214,26 +2260,37 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    pub fn find_field_index(self, ident: Ident, variant: &VariantDef) -> Option<usize> {
-        variant
-            .fields
-            .iter()
-            .position(|field| self.hygienic_eq(ident, field.ident(self), variant.def_id))
+    /// If the def-id is an associated type that was desugared from a
+    /// return-position `impl Trait` from a trait, then provide the source info
+    /// about where that RPITIT came from.
+    pub fn opt_rpitit_info(self, def_id: DefId) -> Option<ImplTraitInTraitData> {
+        if let DefKind::AssocTy = self.def_kind(def_id) {
+            self.associated_item(def_id).opt_rpitit_info
+        } else {
+            None
+        }
+    }
+
+    pub fn find_field_index(self, ident: Ident, variant: &VariantDef) -> Option<FieldIdx> {
+        variant.fields.iter_enumerated().find_map(|(i, field)| {
+            self.hygienic_eq(ident, field.ident(self), variant.def_id).then_some(i)
+        })
     }
 
     /// Returns `true` if the impls are the same polarity and the trait either
     /// has no items or is annotated `#[marker]` and prevents item overrides.
+    #[instrument(level = "debug", skip(self), ret)]
     pub fn impls_are_allowed_to_overlap(
         self,
         def_id1: DefId,
         def_id2: DefId,
     ) -> Option<ImplOverlapKind> {
+        let impl_trait_ref1 = self.impl_trait_ref(def_id1);
+        let impl_trait_ref2 = self.impl_trait_ref(def_id2);
         // If either trait impl references an error, they're allowed to overlap,
         // as one of them essentially doesn't exist.
-        if self.impl_trait_ref(def_id1).map_or(false, |tr| tr.subst_identity().references_error())
-            || self
-                .impl_trait_ref(def_id2)
-                .map_or(false, |tr| tr.subst_identity().references_error())
+        if impl_trait_ref1.map_or(false, |tr| tr.subst_identity().references_error())
+            || impl_trait_ref2.map_or(false, |tr| tr.subst_identity().references_error())
         {
             return Some(ImplOverlapKind::Permitted { marker: false });
         }
@@ -2241,19 +2298,11 @@ impl<'tcx> TyCtxt<'tcx> {
         match (self.impl_polarity(def_id1), self.impl_polarity(def_id2)) {
             (ImplPolarity::Reservation, _) | (_, ImplPolarity::Reservation) => {
                 // `#[rustc_reservation_impl]` impls don't overlap with anything
-                debug!(
-                    "impls_are_allowed_to_overlap({:?}, {:?}) = Some(Permitted) (reservations)",
-                    def_id1, def_id2
-                );
                 return Some(ImplOverlapKind::Permitted { marker: false });
             }
             (ImplPolarity::Positive, ImplPolarity::Negative)
             | (ImplPolarity::Negative, ImplPolarity::Positive) => {
                 // `impl AutoTrait for Type` + `impl !AutoTrait for Type`
-                debug!(
-                    "impls_are_allowed_to_overlap({:?}, {:?}) - None (differing polarities)",
-                    def_id1, def_id2
-                );
                 return None;
             }
             (ImplPolarity::Positive, ImplPolarity::Positive)
@@ -2261,38 +2310,25 @@ impl<'tcx> TyCtxt<'tcx> {
         };
 
         let is_marker_overlap = {
-            let is_marker_impl = |def_id: DefId| -> bool {
-                let trait_ref = self.impl_trait_ref(def_id);
+            let is_marker_impl = |trait_ref: Option<EarlyBinder<TraitRef<'_>>>| -> bool {
                 trait_ref.map_or(false, |tr| self.trait_def(tr.skip_binder().def_id).is_marker)
             };
-            is_marker_impl(def_id1) && is_marker_impl(def_id2)
+            is_marker_impl(impl_trait_ref1) && is_marker_impl(impl_trait_ref2)
         };
 
         if is_marker_overlap {
-            debug!(
-                "impls_are_allowed_to_overlap({:?}, {:?}) = Some(Permitted) (marker overlap)",
-                def_id1, def_id2
-            );
             Some(ImplOverlapKind::Permitted { marker: true })
         } else {
             if let Some(self_ty1) = self.issue33140_self_ty(def_id1) {
                 if let Some(self_ty2) = self.issue33140_self_ty(def_id2) {
                     if self_ty1 == self_ty2 {
-                        debug!(
-                            "impls_are_allowed_to_overlap({:?}, {:?}) - issue #33140 HACK",
-                            def_id1, def_id2
-                        );
                         return Some(ImplOverlapKind::Issue33140);
                     } else {
-                        debug!(
-                            "impls_are_allowed_to_overlap({:?}, {:?}) - found {:?} != {:?}",
-                            def_id1, def_id2, self_ty1, self_ty2
-                        );
+                        debug!("found {self_ty1:?} != {self_ty2:?}");
                     }
                 }
             }
 
-            debug!("impls_are_allowed_to_overlap({:?}, {:?}) = None", def_id1, def_id2);
             None
         }
     }
@@ -2349,7 +2385,9 @@ impl<'tcx> TyCtxt<'tcx> {
             | ty::InstanceDef::Virtual(..)
             | ty::InstanceDef::ClosureOnceShim { .. }
             | ty::InstanceDef::DropGlue(..)
-            | ty::InstanceDef::CloneShim(..) => self.mir_shims(instance),
+            | ty::InstanceDef::CloneShim(..)
+            | ty::InstanceDef::ThreadLocalShim(..)
+            | ty::InstanceDef::FnPtrAddrShim(..) => self.mir_shims(instance),
         }
     }
 
@@ -2363,7 +2401,12 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Gets all attributes with the given name.
-    pub fn get_attrs(self, did: DefId, attr: Symbol) -> ty::Attributes<'tcx> {
+    pub fn get_attrs(
+        self,
+        did: impl Into<DefId>,
+        attr: Symbol,
+    ) -> impl Iterator<Item = &'tcx ast::Attribute> {
+        let did: DefId = did.into();
         let filter_fn = move |a: &&ast::Attribute| a.has_name(attr);
         if let Some(did) = did.as_local() {
             self.hir().attrs(self.hir().local_def_id_to_hir_id(did)).iter().filter(filter_fn)
@@ -2374,8 +2417,9 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    pub fn get_attr(self, did: DefId, attr: Symbol) -> Option<&'tcx ast::Attribute> {
+    pub fn get_attr(self, did: impl Into<DefId>, attr: Symbol) -> Option<&'tcx ast::Attribute> {
         if cfg!(debug_assertions) && !rustc_feature::is_valid_for_get_attr(attr) {
+            let did: DefId = did.into();
             bug!("get_attr: unexpected called with DefId `{:?}`, attr `{:?}`", did, attr);
         } else {
             self.get_attrs(did, attr).next()
@@ -2383,7 +2427,8 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Determines whether an item is annotated with an attribute.
-    pub fn has_attr(self, did: DefId, attr: Symbol) -> bool {
+    pub fn has_attr(self, did: impl Into<DefId>, attr: Symbol) -> bool {
+        let did: DefId = did.into();
         if cfg!(debug_assertions) && !did.is_local() && rustc_feature::is_builtin_only_local(attr) {
             bug!("tried to access the `only_local` attribute `{}` from an extern crate", attr);
         } else {
@@ -2493,7 +2538,7 @@ impl<'tcx> TyCtxt<'tcx> {
         ident
     }
 
-    // FIXME(vincenzoapalzzo): move the HirId to a LocalDefId
+    // FIXME(vincenzopalazzo): move the HirId to a LocalDefId
     pub fn adjust_ident_and_get_scope(
         self,
         mut ident: Ident,
@@ -2540,12 +2585,18 @@ impl<'tcx> TyCtxt<'tcx> {
         matches!(self.trait_of_item(def_id), Some(trait_id) if self.has_attr(trait_id, sym::const_trait))
     }
 
-    pub fn impl_trait_in_trait_parent(self, mut def_id: DefId) -> DefId {
-        while let def_kind = self.def_kind(def_id) && def_kind != DefKind::AssocFn {
-            debug_assert_eq!(def_kind, DefKind::ImplTraitPlaceholder);
-            def_id = self.parent(def_id);
+    pub fn impl_trait_in_trait_parent_fn(self, mut def_id: DefId) -> DefId {
+        match self.opt_rpitit_info(def_id) {
+            Some(ImplTraitInTraitData::Trait { fn_def_id, .. })
+            | Some(ImplTraitInTraitData::Impl { fn_def_id, .. }) => fn_def_id,
+            None => {
+                while let def_kind = self.def_kind(def_id) && def_kind != DefKind::AssocFn {
+                    debug_assert_eq!(def_kind, DefKind::ImplTraitPlaceholder);
+                    def_id = self.parent(def_id);
+                }
+                def_id
+            }
         }
-        def_id
     }
 
     pub fn impl_method_has_trait_impl_trait_tys(self, def_id: DefId) -> bool {
@@ -2559,6 +2610,12 @@ impl<'tcx> TyCtxt<'tcx> {
         }
 
         let Some(trait_item_def_id) = item.trait_item_def_id else { return false; };
+
+        if self.lower_impl_trait_in_trait_to_assoc_ty() {
+            return !self
+                .associated_types_for_impl_traits_in_associated_fn(trait_item_def_id)
+                .is_empty();
+        }
 
         // FIXME(RPITIT): This does a somewhat manual walk through the signature
         // of the trait fn to look for any RPITITs, but that's kinda doing a lot

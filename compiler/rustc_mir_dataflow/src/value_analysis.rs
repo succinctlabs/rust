@@ -36,11 +36,11 @@ use std::fmt::{Debug, Formatter};
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_index::bit_set::BitSet;
-use rustc_index::vec::IndexVec;
+use rustc_index::vec::{IndexSlice, IndexVec};
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use crate::lattice::{HasBottom, HasTop};
 use crate::{
@@ -86,6 +86,7 @@ pub trait ValueAnalysis<'tcx> {
             StatementKind::ConstEvalCounter
             | StatementKind::Nop
             | StatementKind::FakeRead(..)
+            | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::AscribeUserType(..) => (),
         }
@@ -230,14 +231,14 @@ pub trait ValueAnalysis<'tcx> {
             TerminatorKind::Drop { place, .. } => {
                 state.flood_with(place.as_ref(), self.map(), Self::Value::bottom());
             }
-            TerminatorKind::DropAndReplace { .. } | TerminatorKind::Yield { .. } => {
+            TerminatorKind::Yield { .. } => {
                 // They would have an effect, but are not allowed in this phase.
                 bug!("encountered disallowed terminator");
             }
             TerminatorKind::Goto { .. }
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Resume
-            | TerminatorKind::Abort
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::Assert { .. }
@@ -690,7 +691,7 @@ impl Map {
         }
 
         // Recurse with all fields of this place.
-        iter_fields(ty, tcx, |variant, field, ty| {
+        iter_fields(ty, tcx, ty::ParamEnv::reveal_all(), |variant, field, ty| {
             if let Some(variant) = variant {
                 projection.push(PlaceElem::Downcast(None, variant));
                 let _ = self.make_place(local, projection);
@@ -918,7 +919,7 @@ impl<V: HasTop> ValueOrPlace<V> {
 /// Although only field projections are currently allowed, this could change in the future.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TrackElem {
-    Field(Field),
+    Field(FieldIdx),
     Variant(VariantIdx),
     Discriminant,
 }
@@ -939,7 +940,8 @@ impl<V, T> TryFrom<ProjectionElem<V, T>> for TrackElem {
 pub fn iter_fields<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    mut f: impl FnMut(Option<VariantIdx>, Field, Ty<'tcx>),
+    param_env: ty::ParamEnv<'tcx>,
+    mut f: impl FnMut(Option<VariantIdx>, FieldIdx, Ty<'tcx>),
 ) {
     match ty.kind() {
         ty::Tuple(list) => {
@@ -956,14 +958,14 @@ pub fn iter_fields<'tcx>(
                 for (f_index, f_def) in v_def.fields.iter().enumerate() {
                     let field_ty = f_def.ty(tcx, substs);
                     let field_ty = tcx
-                        .try_normalize_erasing_regions(ty::ParamEnv::reveal_all(), field_ty)
-                        .unwrap_or(field_ty);
+                        .try_normalize_erasing_regions(param_env, field_ty)
+                        .unwrap_or_else(|_| tcx.erase_regions(field_ty));
                     f(variant, f_index.into(), field_ty);
                 }
             }
         }
         ty::Closure(_, substs) => {
-            iter_fields(substs.as_closure().tupled_upvars_ty(), tcx, f);
+            iter_fields(substs.as_closure().tupled_upvars_ty(), tcx, param_env, f);
         }
         _ => (),
     }
@@ -1026,8 +1028,8 @@ where
 fn debug_with_context_rec<V: Debug + Eq>(
     place: PlaceIndex,
     place_str: &str,
-    new: &IndexVec<ValueIndex, V>,
-    old: Option<&IndexVec<ValueIndex, V>>,
+    new: &IndexSlice<ValueIndex, V>,
+    old: Option<&IndexSlice<ValueIndex, V>>,
     map: &Map,
     f: &mut Formatter<'_>,
 ) -> std::fmt::Result {
@@ -1067,8 +1069,8 @@ fn debug_with_context_rec<V: Debug + Eq>(
 }
 
 fn debug_with_context<V: Debug + Eq>(
-    new: &IndexVec<ValueIndex, V>,
-    old: Option<&IndexVec<ValueIndex, V>>,
+    new: &IndexSlice<ValueIndex, V>,
+    old: Option<&IndexSlice<ValueIndex, V>>,
     map: &Map,
     f: &mut Formatter<'_>,
 ) -> std::fmt::Result {

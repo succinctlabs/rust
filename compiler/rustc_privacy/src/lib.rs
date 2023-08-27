@@ -29,7 +29,7 @@ use rustc_middle::middle::privacy::{EffectiveVisibilities, Level};
 use rustc_middle::span_bug;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::subst::InternalSubsts;
-use rustc_middle::ty::{self, Const, DefIdTree, GenericParamDefKind};
+use rustc_middle::ty::{self, Const, GenericParamDefKind};
 use rustc_middle::ty::{TraitRef, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
 use rustc_session::lint;
 use rustc_span::hygiene::Transparency;
@@ -46,7 +46,7 @@ use errors::{
     UnnamedItemIsPrivate,
 };
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 ////////////////////////////////////////////////////////////////////////////////
 /// Generic infrastructure used to implement specific visitors below.
@@ -132,7 +132,7 @@ where
                 projection.trait_ref_and_own_substs(tcx)
             } else {
                 // HACK(RPITIT): Remove this when RPITITs are lowered to regular assoc tys
-                let def_id = tcx.impl_trait_in_trait_parent(projection.def_id);
+                let def_id = tcx.impl_trait_in_trait_parent_fn(projection.def_id);
                 let trait_generics = tcx.generics_of(def_id);
                 (
                     tcx.mk_trait_ref(def_id, projection.substs.truncate_to(tcx, trait_generics)),
@@ -180,7 +180,7 @@ where
             | ty::PredicateKind::ConstEquate(_, _)
             | ty::PredicateKind::TypeWellFormedFromEnv(_)
             | ty::PredicateKind::Ambiguous
-            | ty::PredicateKind::AliasEq(_, _) => bug!("unexpected predicate: {:?}", predicate),
+            | ty::PredicateKind::AliasRelate(..) => bug!("unexpected predicate: {:?}", predicate),
         }
     }
 
@@ -515,16 +515,12 @@ impl<'tcx> EmbargoVisitor<'tcx> {
             let vis = self.tcx.local_visibility(item_id.owner_id.def_id);
             self.update_macro_reachable_def(item_id.owner_id.def_id, def_kind, vis, defining_mod);
         }
-        if let Some(exports) = self.tcx.module_reexports(module_def_id) {
-            for export in exports {
-                if export.vis.is_accessible_from(defining_mod, self.tcx) {
-                    if let Res::Def(def_kind, def_id) = export.res {
-                        if let Some(def_id) = def_id.as_local() {
-                            let vis = self.tcx.local_visibility(def_id);
-                            self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod);
-                        }
-                    }
-                }
+        for export in self.tcx.module_children_reexports(module_def_id) {
+            if export.vis.is_accessible_from(defining_mod, self.tcx)
+                && let Res::Def(def_kind, def_id) = export.res
+                && let Some(def_id) = def_id.as_local() {
+                let vis = self.tcx.local_visibility(def_id);
+                self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod);
             }
         }
     }
@@ -920,7 +916,7 @@ pub struct TestReachabilityVisitor<'tcx, 'a> {
 
 impl<'tcx, 'a> TestReachabilityVisitor<'tcx, 'a> {
     fn effective_visibility_diagnostic(&mut self, def_id: LocalDefId) {
-        if self.tcx.has_attr(def_id.to_def_id(), sym::rustc_effective_visibility) {
+        if self.tcx.has_attr(def_id, sym::rustc_effective_visibility) {
             let mut error_msg = String::new();
             let span = self.tcx.def_span(def_id.to_def_id());
             if let Some(effective_vis) = self.effective_visibilities.effective_vis(def_id) {
@@ -1082,7 +1078,7 @@ impl<'tcx> Visitor<'tcx> for NamePrivacyVisitor<'tcx> {
                 // If the expression uses FRU we need to make sure all the unmentioned fields
                 // are checked for privacy (RFC 736). Rather than computing the set of
                 // unmentioned fields, just check them all.
-                for (vf_index, variant_field) in variant.fields.iter().enumerate() {
+                for (vf_index, variant_field) in variant.fields.iter_enumerated() {
                     let field = fields
                         .iter()
                         .find(|f| self.typeck_results().field_index(f.hir_id) == vf_index);
@@ -2060,8 +2056,8 @@ pub fn provide(providers: &mut Providers) {
     };
 }
 
-fn visibility(tcx: TyCtxt<'_>, def_id: DefId) -> ty::Visibility<DefId> {
-    local_visibility(tcx, def_id.expect_local()).to_def_id()
+fn visibility(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Visibility<DefId> {
+    local_visibility(tcx, def_id).to_def_id()
 }
 
 fn local_visibility(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Visibility {
@@ -2149,6 +2145,7 @@ fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {
 
     let mut check_visitor =
         TestReachabilityVisitor { tcx, effective_visibilities: &visitor.effective_visibilities };
+    check_visitor.effective_visibility_diagnostic(CRATE_DEF_ID);
     tcx.hir().visit_all_item_likes_in_crate(&mut check_visitor);
 
     tcx.arena.alloc(visitor.effective_visibilities)

@@ -1,5 +1,5 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::default::Default;
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -22,7 +22,7 @@ use rustc_hir::{BodyId, Mutability};
 use rustc_hir_analysis::check::intrinsic::intrinsic_operation_unsafety;
 use rustc_index::vec::IndexVec;
 use rustc_middle::ty::fast_reject::SimplifiedType;
-use rustc_middle::ty::{self, DefIdTree, TyCtxt, Visibility};
+use rustc_middle::ty::{self, TyCtxt, Visibility};
 use rustc_resolve::rustdoc::{add_doc_fragment, attrs_to_doc_fragments, inner_docs, DocFragment};
 use rustc_session::Session;
 use rustc_span::hygiene::MacroKind;
@@ -231,14 +231,6 @@ impl ExternalCrate {
                         hir::ItemKind::Mod(_) => {
                             as_keyword(Res::Def(DefKind::Mod, id.owner_id.to_def_id()))
                         }
-                        hir::ItemKind::Use(path, hir::UseKind::Single)
-                            if tcx.visibility(id.owner_id).is_public() =>
-                        {
-                            path.res
-                                .iter()
-                                .find_map(|res| as_keyword(res.expect_non_local()))
-                                .map(|(_, prim)| (id.owner_id.to_def_id(), prim))
-                        }
                         _ => None,
                     }
                 })
@@ -256,38 +248,24 @@ impl ExternalCrate {
         //
         // Note that this loop only searches the top-level items of the crate,
         // and this is intentional. If we were to search the entire crate for an
-        // item tagged with `#[doc(primitive)]` then we would also have to
+        // item tagged with `#[rustc_doc_primitive]` then we would also have to
         // search the entirety of external modules for items tagged
-        // `#[doc(primitive)]`, which is a pretty inefficient process (decoding
+        // `#[rustc_doc_primitive]`, which is a pretty inefficient process (decoding
         // all that metadata unconditionally).
         //
         // In order to keep the metadata load under control, the
-        // `#[doc(primitive)]` feature is explicitly designed to only allow the
+        // `#[rustc_doc_primitive]` feature is explicitly designed to only allow the
         // primitive tags to show up as the top level items in a crate.
         //
         // Also note that this does not attempt to deal with modules tagged
         // duplicately for the same primitive. This is handled later on when
         // rendering by delegating everything to a hash map.
         let as_primitive = |res: Res<!>| {
-            if let Res::Def(DefKind::Mod, def_id) = res {
-                let mut prim = None;
-                let meta_items = tcx
-                    .get_attrs(def_id, sym::doc)
-                    .flat_map(|attr| attr.meta_item_list().unwrap_or_default());
-                for meta in meta_items {
-                    if let Some(v) = meta.value_str() {
-                        if meta.has_name(sym::primitive) {
-                            prim = PrimitiveType::from_symbol(v);
-                            if prim.is_some() {
-                                break;
-                            }
-                            // FIXME: should warn on unknown primitives?
-                        }
-                    }
-                }
-                return prim.map(|p| (def_id, p));
-            }
-            None
+            let Res::Def(DefKind::Mod, def_id) = res else { return None };
+            tcx.get_attrs(def_id, sym::rustc_doc_primitive).find_map(|attr| {
+                // FIXME: should warn on unknown primitives?
+                Some((def_id, PrimitiveType::from_symbol(attr.value_str()?)?))
+            })
         };
 
         if root.is_local() {
@@ -300,15 +278,6 @@ impl ExternalCrate {
                     match item.kind {
                         hir::ItemKind::Mod(_) => {
                             as_primitive(Res::Def(DefKind::Mod, id.owner_id.to_def_id()))
-                        }
-                        hir::ItemKind::Use(path, hir::UseKind::Single)
-                            if tcx.visibility(id.owner_id).is_public() =>
-                        {
-                            path.res
-                                .iter()
-                                .find_map(|res| as_primitive(res.expect_non_local()))
-                                // Pretend the primitive is local.
-                                .map(|(_, prim)| (id.owner_id.to_def_id(), prim))
                         }
                         _ => None,
                     }
@@ -482,10 +451,12 @@ impl Item {
     pub(crate) fn links(&self, cx: &Context<'_>) -> Vec<RenderedLink> {
         use crate::html::format::{href, link_tooltip};
 
-        cx.cache()
+        let Some(links) = cx.cache()
             .intra_doc_links
-            .get(&self.item_id)
-            .map_or(&[][..], |v| v.as_slice())
+            .get(&self.item_id) else {
+                return vec![]
+            };
+        links
             .iter()
             .filter_map(|ItemLink { link: s, link_text, page_id: id, ref fragment }| {
                 debug!(?id);
@@ -513,10 +484,12 @@ impl Item {
     /// the link text, but does need to know which `[]`-bracketed names
     /// are actually links.
     pub(crate) fn link_names(&self, cache: &Cache) -> Vec<RenderedLink> {
-        cache
+        let Some(links) = cache
             .intra_doc_links
-            .get(&self.item_id)
-            .map_or(&[][..], |v| v.as_slice())
+            .get(&self.item_id) else {
+                return vec![];
+            };
+        links
             .iter()
             .map(|ItemLink { link: s, link_text, .. }| RenderedLink {
                 original_text: s.clone(),
@@ -713,7 +686,7 @@ impl Item {
                 return None;
             }
             // Variants always inherit visibility
-            VariantItem(..) => return None,
+            VariantItem(..) | ImplItem(..) => return None,
             // Trait items inherit the trait's visibility
             AssocConstItem(..) | TyAssocConstItem(..) | AssocTypeItem(..) | TyAssocTypeItem(..)
             | TyMethodItem(..) | MethodItem(..) => {
@@ -869,28 +842,13 @@ pub(crate) trait AttributesExt {
     type AttributeIterator<'a>: Iterator<Item = ast::NestedMetaItem>
     where
         Self: 'a;
+    type Attributes<'a>: Iterator<Item = &'a ast::Attribute>
+    where
+        Self: 'a;
 
     fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a>;
 
-    fn span(&self) -> Option<rustc_span::Span>;
-
-    fn cfg(&self, tcx: TyCtxt<'_>, hidden_cfg: &FxHashSet<Cfg>) -> Option<Arc<Cfg>>;
-}
-
-impl AttributesExt for [ast::Attribute] {
-    type AttributeIterator<'a> = impl Iterator<Item = ast::NestedMetaItem> + 'a;
-
-    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a> {
-        self.iter()
-            .filter(move |attr| attr.has_name(name))
-            .filter_map(ast::Attribute::meta_item_list)
-            .flatten()
-    }
-
-    /// Return the span of the first doc-comment, if it exists.
-    fn span(&self) -> Option<rustc_span::Span> {
-        self.iter().find(|attr| attr.doc_str().is_some()).map(|attr| attr.span)
-    }
+    fn iter<'a>(&'a self) -> Self::Attributes<'a>;
 
     fn cfg(&self, tcx: TyCtxt<'_>, hidden_cfg: &FxHashSet<Cfg>) -> Option<Arc<Cfg>> {
         let sess = tcx.sess;
@@ -980,11 +938,48 @@ impl AttributesExt for [ast::Attribute] {
     }
 }
 
+impl AttributesExt for [ast::Attribute] {
+    type AttributeIterator<'a> = impl Iterator<Item = ast::NestedMetaItem> + 'a;
+    type Attributes<'a> = impl Iterator<Item = &'a ast::Attribute> + 'a;
+
+    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a> {
+        self.iter()
+            .filter(move |attr| attr.has_name(name))
+            .filter_map(ast::Attribute::meta_item_list)
+            .flatten()
+    }
+
+    fn iter<'a>(&'a self) -> Self::Attributes<'a> {
+        self.into_iter()
+    }
+}
+
+impl AttributesExt for [(Cow<'_, ast::Attribute>, Option<DefId>)] {
+    type AttributeIterator<'a> = impl Iterator<Item = ast::NestedMetaItem> + 'a
+        where Self: 'a;
+    type Attributes<'a> = impl Iterator<Item = &'a ast::Attribute> + 'a
+        where Self: 'a;
+
+    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a> {
+        AttributesExt::iter(self)
+            .filter(move |attr| attr.has_name(name))
+            .filter_map(ast::Attribute::meta_item_list)
+            .flatten()
+    }
+
+    fn iter<'a>(&'a self) -> Self::Attributes<'a> {
+        self.into_iter().map(move |(attr, _)| match attr {
+            Cow::Borrowed(attr) => *attr,
+            Cow::Owned(attr) => attr,
+        })
+    }
+}
+
 pub(crate) trait NestedAttributesExt {
     /// Returns `true` if the attribute list contains a specific `word`
     fn has_word(self, word: Symbol) -> bool
     where
-        Self: std::marker::Sized,
+        Self: Sized,
     {
         <Self as NestedAttributesExt>::get_word_attr(self, word).is_some()
     }
@@ -1014,7 +1009,7 @@ pub(crate) fn collapse_doc_fragments(doc_strings: &[DocFragment]) -> String {
 /// A link that has not yet been rendered.
 ///
 /// This link will be turned into a rendered link by [`Item::links`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ItemLink {
     /// The original link written in the markdown
     pub(crate) link: Box<str>,
@@ -1213,9 +1208,9 @@ impl Lifetime {
 
 #[derive(Clone, Debug)]
 pub(crate) enum WherePredicate {
-    BoundPredicate { ty: Type, bounds: Vec<GenericBound>, bound_params: Vec<Lifetime> },
+    BoundPredicate { ty: Type, bounds: Vec<GenericBound>, bound_params: Vec<GenericParamDef> },
     RegionPredicate { lifetime: Lifetime, bounds: Vec<GenericBound> },
-    EqPredicate { lhs: Box<Type>, rhs: Box<Term>, bound_params: Vec<Lifetime> },
+    EqPredicate { lhs: Box<Type>, rhs: Box<Term>, bound_params: Vec<GenericParamDef> },
 }
 
 impl WherePredicate {
@@ -1227,7 +1222,7 @@ impl WherePredicate {
         }
     }
 
-    pub(crate) fn get_bound_params(&self) -> Option<&[Lifetime]> {
+    pub(crate) fn get_bound_params(&self) -> Option<&[GenericParamDef]> {
         match self {
             Self::BoundPredicate { bound_params, .. } | Self::EqPredicate { bound_params, .. } => {
                 Some(bound_params)
@@ -1241,7 +1236,7 @@ impl WherePredicate {
 pub(crate) enum GenericParamDefKind {
     Lifetime { outlives: Vec<Lifetime> },
     Type { did: DefId, bounds: Vec<GenericBound>, default: Option<Box<Type>>, synthetic: bool },
-    Const { did: DefId, ty: Box<Type>, default: Option<Box<String>> },
+    Const { ty: Box<Type>, default: Option<Box<String>> },
 }
 
 impl GenericParamDefKind {
@@ -1471,27 +1466,68 @@ impl Type {
         result
     }
 
-    /// Check if two types are "potentially the same".
+    pub(crate) fn is_borrowed_ref(&self) -> bool {
+        matches!(self, Type::BorrowedRef { .. })
+    }
+
+    /// Check if two types are "the same" for documentation purposes.
+    ///
     /// This is different from `Eq`, because it knows that things like
     /// `Placeholder` are possible matches for everything.
-    pub(crate) fn is_same(&self, other: &Self, cache: &Cache) -> bool {
-        match (self, other) {
+    ///
+    /// This relation is not commutative when generics are involved:
+    ///
+    /// ```ignore(private)
+    /// # // see types/tests.rs:is_same_generic for the real test
+    /// use rustdoc::format::cache::Cache;
+    /// use rustdoc::clean::types::{Type, PrimitiveType};
+    /// let cache = Cache::new(false);
+    /// let generic = Type::Generic(rustc_span::symbol::sym::Any);
+    /// let unit = Type::Primitive(PrimitiveType::Unit);
+    /// assert!(!generic.is_same(&unit, &cache));
+    /// assert!(unit.is_same(&generic, &cache));
+    /// ```
+    ///
+    /// An owned type is also the same as its borrowed variants (this is commutative),
+    /// but `&T` is not the same as `&mut T`.
+    pub(crate) fn is_doc_subtype_of(&self, other: &Self, cache: &Cache) -> bool {
+        // Strip the references so that it can compare the actual types, unless both are references.
+        // If both are references, leave them alone and compare the mutabilities later.
+        let (self_cleared, other_cleared) = if !self.is_borrowed_ref() || !other.is_borrowed_ref() {
+            (self.without_borrowed_ref(), other.without_borrowed_ref())
+        } else {
+            (self, other)
+        };
+        match (self_cleared, other_cleared) {
             // Recursive cases.
             (Type::Tuple(a), Type::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.is_same(b, cache))
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.is_doc_subtype_of(b, cache))
             }
-            (Type::Slice(a), Type::Slice(b)) => a.is_same(b, cache),
-            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && a.is_same(b, cache),
+            (Type::Slice(a), Type::Slice(b)) => a.is_doc_subtype_of(b, cache),
+            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && a.is_doc_subtype_of(b, cache),
             (Type::RawPointer(mutability, type_), Type::RawPointer(b_mutability, b_type_)) => {
-                mutability == b_mutability && type_.is_same(b_type_, cache)
+                mutability == b_mutability && type_.is_doc_subtype_of(b_type_, cache)
             }
             (
                 Type::BorrowedRef { mutability, type_, .. },
                 Type::BorrowedRef { mutability: b_mutability, type_: b_type_, .. },
-            ) => mutability == b_mutability && type_.is_same(b_type_, cache),
-            // Placeholders and generics are equal to all other types.
+            ) => mutability == b_mutability && type_.is_doc_subtype_of(b_type_, cache),
+            // Placeholders are equal to all other types.
             (Type::Infer, _) | (_, Type::Infer) => true,
-            (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
+            // Generics match everything on the right, but not on the left.
+            // If both sides are generic, this returns true.
+            (_, Type::Generic(_)) => true,
+            (Type::Generic(_), _) => false,
+            // Paths account for both the path itself and its generics.
+            (Type::Path { path: a }, Type::Path { path: b }) => {
+                a.def_id() == b.def_id()
+                    && a.generics()
+                        .zip(b.generics())
+                        .map(|(ag, bg)| {
+                            ag.iter().zip(bg.iter()).all(|(at, bt)| at.is_doc_subtype_of(bt, cache))
+                        })
+                        .unwrap_or(true)
+            }
             // Other cases, such as primitives, just use recursion.
             (a, b) => a
                 .def_id(cache)
@@ -1782,13 +1818,17 @@ impl PrimitiveType {
         }
     }
 
-    /// Returns the DefId of the module with `doc(primitive)` for this primitive type.
+    /// Returns the DefId of the module with `rustc_doc_primitive` for this primitive type.
     /// Panics if there is no such module.
     ///
-    /// This gives precedence to primitives defined in the current crate, and deprioritizes primitives defined in `core`,
-    /// but otherwise, if multiple crates define the same primitive, there is no guarantee of which will be picked.
-    /// In particular, if a crate depends on both `std` and another crate that also defines `doc(primitive)`, then
-    /// it's entirely random whether `std` or the other crate is picked. (no_std crates are usually fine unless multiple dependencies define a primitive.)
+    /// This gives precedence to primitives defined in the current crate, and deprioritizes
+    /// primitives defined in `core`,
+    /// but otherwise, if multiple crates define the same primitive, there is no guarantee of which
+    /// will be picked.
+    ///
+    /// In particular, if a crate depends on both `std` and another crate that also defines
+    /// `rustc_doc_primitive`, then it's entirely random whether `std` or the other crate is picked.
+    /// (no_std crates are usually fine unless multiple dependencies define a primitive.)
     pub(crate) fn primitive_locations(tcx: TyCtxt<'_>) -> &FxHashMap<PrimitiveType, DefId> {
         static PRIMITIVE_LOCATIONS: OnceCell<FxHashMap<PrimitiveType, DefId>> = OnceCell::new();
         PRIMITIVE_LOCATIONS.get_or_init(|| {
@@ -1978,7 +2018,7 @@ impl Variant {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Discriminant {
-    // In the case of cross crate re-exports, we don't have the nessesary information
+    // In the case of cross crate re-exports, we don't have the necessary information
     // to reconstruct the expression of the discriminant, only the value.
     pub(super) expr: Option<BodyId>,
     pub(super) value: DefId,

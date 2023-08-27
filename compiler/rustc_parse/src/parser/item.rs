@@ -3,6 +3,7 @@ use crate::errors;
 use super::diagnostics::{dummy_arg, ConsumeClosingDelim};
 use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
 use super::{AttrWrapper, FollowedByType, ForceCollect, Parser, PathStyle, TrailingToken};
+use ast::StaticItem;
 use rustc_ast::ast::*;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Delimiter, TokenKind};
@@ -125,16 +126,13 @@ impl<'a> Parser<'a> {
             return Ok(Some(item.into_inner()));
         };
 
-        let mut unclosed_delims = vec![];
         let item =
             self.collect_tokens_trailing_token(attrs, force_collect, |this: &mut Self, attrs| {
                 let item =
                     this.parse_item_common_(attrs, mac_allowed, attrs_allowed, fn_parse_mode);
-                unclosed_delims.append(&mut this.unclosed_delims);
                 Ok((item?, TrailingToken::None))
             })?;
 
-        self.unclosed_delims.append(&mut unclosed_delims);
         Ok(item)
     }
 
@@ -230,7 +228,7 @@ impl<'a> Parser<'a> {
             self.bump(); // `static`
             let m = self.parse_mutability();
             let (ident, ty, expr) = self.parse_item_global(Some(m))?;
-            (ident, ItemKind::Static(ty, m, expr))
+            (ident, ItemKind::Static(Box::new(StaticItem { ty, mutability: m, expr })))
         } else if let Const::Yes(const_span) = self.parse_constness(Case::Sensitive) {
             // CONST ITEM
             if self.token.is_keyword(kw::Impl) {
@@ -239,7 +237,7 @@ impl<'a> Parser<'a> {
             } else {
                 self.recover_const_mut(const_span);
                 let (ident, ty, expr) = self.parse_item_global(None)?;
-                (ident, ItemKind::Const(def_(), ty, expr))
+                (ident, ItemKind::Const(Box::new(ConstItem { defaultness: def_(), ty, expr })))
             }
         } else if self.check_keyword(kw::Trait) || self.check_auto_or_unsafe_trait_item() {
             // TRAIT ITEM
@@ -865,9 +863,13 @@ impl<'a> Parser<'a> {
                 let kind = match AssocItemKind::try_from(kind) {
                     Ok(kind) => kind,
                     Err(kind) => match kind {
-                        ItemKind::Static(a, _, b) => {
+                        ItemKind::Static(box StaticItem { ty, mutability: _, expr }) => {
                             self.sess.emit_err(errors::AssociatedStaticItemNotAllowed { span });
-                            AssocItemKind::Const(Defaultness::Final, a, b)
+                            AssocItemKind::Const(Box::new(ConstItem {
+                                defaultness: Defaultness::Final,
+                                ty,
+                                expr,
+                            }))
                         }
                         _ => return self.error_bad_item_kind(span, &kind, "`trait`s or `impl`s"),
                     },
@@ -1117,12 +1119,12 @@ impl<'a> Parser<'a> {
                 let kind = match ForeignItemKind::try_from(kind) {
                     Ok(kind) => kind,
                     Err(kind) => match kind {
-                        ItemKind::Const(_, a, b) => {
+                        ItemKind::Const(box ConstItem { ty, expr, .. }) => {
                             self.sess.emit_err(errors::ExternItemCannotBeConst {
                                 ident_span: ident.span,
                                 const_span: span.with_hi(ident.span.lo()),
                             });
-                            ForeignItemKind::Static(a, Mutability::Not, b)
+                            ForeignItemKind::Static(ty, Mutability::Not, expr)
                         }
                         _ => return self.error_bad_item_kind(span, &kind, "`extern` blocks"),
                     },
@@ -1184,7 +1186,7 @@ impl<'a> Parser<'a> {
         defaultness: Defaultness,
     ) -> PResult<'a, ItemInfo> {
         let impl_span = self.token.span;
-        let mut err = self.expected_ident_found();
+        let mut err = self.expected_ident_found_err();
 
         // Only try to recover if this is implementing a trait for a type
         let mut impl_info = match self.parse_item_impl(attrs, defaultness) {
@@ -1747,7 +1749,7 @@ impl<'a> Parser<'a> {
     /// Parses a field identifier. Specialized version of `parse_ident_common`
     /// for better diagnostics and suggestions.
     fn parse_field_ident(&mut self, adt_ty: &str, lo: Span) -> PResult<'a, Ident> {
-        let (ident, is_raw) = self.ident_or_err()?;
+        let (ident, is_raw) = self.ident_or_err(true)?;
         if !is_raw && ident.is_reserved() {
             let snapshot = self.create_snapshot_for_diagnostic();
             let err = if self.check_fn_front_matter(false, Case::Sensitive) {
@@ -1779,7 +1781,7 @@ impl<'a> Parser<'a> {
                     Err(err) => {
                         err.cancel();
                         self.restore_snapshot(snapshot);
-                        self.expected_ident_found()
+                        self.expected_ident_found_err()
                     }
                 }
             } else if self.eat_keyword(kw::Struct) {
@@ -1795,11 +1797,11 @@ impl<'a> Parser<'a> {
                     Err(err) => {
                         err.cancel();
                         self.restore_snapshot(snapshot);
-                        self.expected_ident_found()
+                        self.expected_ident_found_err()
                     }
                 }
             } else {
-                let mut err = self.expected_ident_found();
+                let mut err = self.expected_ident_found_err();
                 if self.eat_keyword_noexpect(kw::Let)
                     && let removal_span = self.prev_token.span.until(self.token.span)
                     && let Ok(ident) = self.parse_ident_common(false)
@@ -1960,21 +1962,12 @@ impl<'a> Parser<'a> {
         // FIXME: This will make us not emit the help even for declarative
         // macros within the same crate (that we can fix), which is sad.
         if !span.from_expansion() {
-            if self.unclosed_delims.is_empty() {
-                let DelimSpan { open, close } = args.dspan;
-                err.multipart_suggestion(
-                    "change the delimiters to curly braces",
-                    vec![(open, "{".to_string()), (close, '}'.to_string())],
-                    Applicability::MaybeIncorrect,
-                );
-            } else {
-                err.span_suggestion(
-                    span,
-                    "change the delimiters to curly braces",
-                    " { /* items */ }",
-                    Applicability::HasPlaceholders,
-                );
-            }
+            let DelimSpan { open, close } = args.dspan;
+            err.multipart_suggestion(
+                "change the delimiters to curly braces",
+                vec![(open, "{".to_string()), (close, '}'.to_string())],
+                Applicability::MaybeIncorrect,
+            );
             err.span_suggestion(
                 span.shrink_to_hi(),
                 "add a semicolon",

@@ -83,7 +83,7 @@ pub trait CollectAndApply<T, R>: Sized {
     /// Produce a result of type `Self::Output` from `iter`. The result will
     /// typically be produced by applying `f` on the elements produced by
     /// `iter`, though this may not happen in some impls, e.g. if an error
-    /// occured during iteration.
+    /// occurred during iteration.
     fn collect_and_apply<I, F>(iter: I, f: F) -> Self::Output
     where
         I: Iterator<Item = Self>,
@@ -432,6 +432,17 @@ impl IntTy {
             _ => *self,
         }
     }
+
+    pub fn to_unsigned(self) -> UintTy {
+        match self {
+            IntTy::Isize => UintTy::Usize,
+            IntTy::I8 => UintTy::U8,
+            IntTy::I16 => UintTy::U16,
+            IntTy::I32 => UintTy::U32,
+            IntTy::I64 => UintTy::U64,
+            IntTy::I128 => UintTy::U128,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Debug)]
@@ -477,6 +488,17 @@ impl UintTy {
                 _ => unreachable!(),
             },
             _ => *self,
+        }
+    }
+
+    pub fn to_signed(self) -> IntTy {
+        match self {
+            UintTy::Usize => IntTy::Isize,
+            UintTy::U8 => IntTy::I8,
+            UintTy::U16 => IntTy::I16,
+            UintTy::U32 => IntTy::I32,
+            UintTy::U64 => IntTy::I64,
+            UintTy::U128 => IntTy::I128,
         }
     }
 }

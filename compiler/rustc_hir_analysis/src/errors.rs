@@ -5,7 +5,7 @@ use rustc_errors::{
     error_code, Applicability, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
     MultiSpan,
 };
-use rustc_macros::Diagnostic;
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::Ty;
 use rustc_span::{symbol::Ident, Span, Symbol};
 
@@ -129,6 +129,18 @@ pub struct AssocTypeBindingNotAllowed {
     #[primary_span]
     #[label]
     pub span: Span,
+
+    #[subdiagnostic]
+    pub fn_trait_expansion: Option<ParenthesizedFnTraitExpansion>,
+}
+
+#[derive(Subdiagnostic)]
+#[help(hir_analysis_parenthesized_fn_trait_expansion)]
+pub struct ParenthesizedFnTraitExpansion {
+    #[primary_span]
+    pub span: Span,
+
+    pub expanded_type: String,
 }
 
 #[derive(Diagnostic)]
@@ -316,8 +328,25 @@ pub(crate) struct TrackCallerOnMain {
 }
 
 #[derive(Diagnostic)]
+#[diag(hir_analysis_target_feature_on_main)]
+pub(crate) struct TargetFeatureOnMain {
+    #[primary_span]
+    #[label(hir_analysis_target_feature_on_main)]
+    pub main: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(hir_analysis_start_not_track_caller)]
 pub(crate) struct StartTrackCaller {
+    #[primary_span]
+    pub span: Span,
+    #[label]
+    pub start: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_start_not_target_feature)]
+pub(crate) struct StartTargetFeature {
     #[primary_span]
     pub span: Span,
     #[label]
@@ -398,4 +427,207 @@ pub(crate) enum CannotCaptureLateBoundInAnonConst {
         #[label]
         def_span: Span,
     },
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_variances_of)]
+pub(crate) struct VariancesOf {
+    #[primary_span]
+    pub span: Span,
+    pub variances_of: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_pass_to_variadic_function, code = "E0617")]
+pub(crate) struct PassToVariadicFunction<'tcx, 'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    pub cast_ty: &'a str,
+    #[suggestion(code = "{replace}", applicability = "machine-applicable")]
+    pub sugg_span: Option<Span>,
+    pub replace: String,
+    #[help]
+    pub help: Option<()>,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_cast_thin_pointer_to_fat_pointer, code = "E0607")]
+pub(crate) struct CastThinPointerToFatPointer<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub expr_ty: Ty<'tcx>,
+    pub cast_ty: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_invalid_union_field, code = "E0740")]
+pub(crate) struct InvalidUnionField {
+    #[primary_span]
+    pub field_span: Span,
+    #[subdiagnostic]
+    pub sugg: InvalidUnionFieldSuggestion,
+    #[note]
+    pub note: (),
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_return_type_notation_on_non_rpitit)]
+pub(crate) struct ReturnTypeNotationOnNonRpitit<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    #[label]
+    pub fn_span: Option<Span>,
+    #[note]
+    pub note: (),
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(hir_analysis_invalid_union_field_sugg, applicability = "machine-applicable")]
+pub(crate) struct InvalidUnionFieldSuggestion {
+    #[suggestion_part(code = "std::mem::ManuallyDrop<")]
+    pub lo: Span,
+    #[suggestion_part(code = ">")]
+    pub hi: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_return_type_notation_equality_bound)]
+pub(crate) struct ReturnTypeNotationEqualityBound {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_return_type_notation_missing_method)]
+pub(crate) struct ReturnTypeNotationMissingMethod {
+    #[primary_span]
+    pub span: Span,
+    pub trait_name: Symbol,
+    pub assoc_name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_placeholder_not_allowed_item_signatures, code = "E0121")]
+pub(crate) struct PlaceholderNotAllowedItemSignatures {
+    #[primary_span]
+    #[label]
+    pub spans: Vec<Span>,
+    pub kind: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_associated_type_trait_uninferred_generic_params, code = "E0212")]
+pub(crate) struct AssociatedTypeTraitUninferredGenericParams {
+    #[primary_span]
+    pub span: Span,
+    #[suggestion(style = "verbose", applicability = "maybe-incorrect", code = "{bound}")]
+    pub inferred_sugg: Option<Span>,
+    pub bound: String,
+    #[subdiagnostic]
+    pub mpart_sugg: Option<AssociatedTypeTraitUninferredGenericParamsMultipartSuggestion>,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    hir_analysis_associated_type_trait_uninferred_generic_params_multipart_suggestion,
+    applicability = "maybe-incorrect"
+)]
+pub(crate) struct AssociatedTypeTraitUninferredGenericParamsMultipartSuggestion {
+    #[suggestion_part(code = "{first}")]
+    pub fspan: Span,
+    pub first: String,
+    #[suggestion_part(code = "{second}")]
+    pub sspan: Span,
+    pub second: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_enum_discriminant_overflowed, code = "E0370")]
+#[note]
+pub(crate) struct EnumDiscriminantOverflowed {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    pub discr: String,
+    pub item_name: Symbol,
+    pub wrapped_discr: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_paren_sugar_attribute)]
+#[help]
+pub(crate) struct ParenSugarAttribute {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_must_implement_one_of_attribute)]
+pub(crate) struct MustImplementOneOfAttribute {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_must_be_name_of_associated_function)]
+pub(crate) struct MustBeNameOfAssociatedFunction {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_function_not_have_default_implementation)]
+pub(crate) struct FunctionNotHaveDefaultImplementation {
+    #[primary_span]
+    pub span: Span,
+    #[note]
+    pub note_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_must_implement_not_function)]
+pub(crate) struct MustImplementNotFunction {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub span_note: MustImplementNotFunctionSpanNote,
+    #[subdiagnostic]
+    pub note: MustImplementNotFunctionNote,
+}
+
+#[derive(Subdiagnostic)]
+#[note(hir_analysis_must_implement_not_function_span_note)]
+pub(crate) struct MustImplementNotFunctionSpanNote {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Subdiagnostic)]
+#[note(hir_analysis_must_implement_not_function_note)]
+pub(crate) struct MustImplementNotFunctionNote {}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_function_not_found_in_trait)]
+pub(crate) struct FunctionNotFoundInTrait {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_functions_names_duplicated)]
+#[note]
+pub(crate) struct FunctionNamesDuplicated {
+    #[primary_span]
+    pub spans: Vec<Span>,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_analysis_simd_ffi_highly_experimental)]
+#[help]
+pub(crate) struct SIMDFFIHighlyExperimental {
+    #[primary_span]
+    pub span: Span,
+    pub snip: String,
 }

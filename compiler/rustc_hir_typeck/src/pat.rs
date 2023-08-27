@@ -19,6 +19,7 @@ use rustc_span::hygiene::DesugaringKind;
 use rustc_span::source_map::{Span, Spanned};
 use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::{BytePos, DUMMY_SP};
+use rustc_target::abi::FieldIdx;
 use rustc_trait_selection::traits::{ObligationCause, Pattern};
 use ty::VariantDef;
 
@@ -35,6 +36,10 @@ pointers. If you encounter this error you should try to avoid dereferencing the 
 
 You can read more about trait objects in the Trait Objects section of the Reference: \
 https://doc.rust-lang.org/reference/types.html#trait-objects";
+
+fn is_number(text: &str) -> bool {
+    text.chars().all(|c: char| c.is_digit(10))
+}
 
 /// Information about the expected type at the top level of type checking a pattern.
 ///
@@ -238,15 +243,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Note that there are two tests to check that this remains true
         // (`regions-reassign-{match,let}-bound-pointer.rs`).
         //
-        // 2. Things go horribly wrong if we use subtype. The reason for
-        // THIS is a fairly subtle case involving bound regions. See the
-        // `givens` field in `region_constraints`, as well as the test
+        // 2. An outdated issue related to the old HIR borrowck. See the test
         // `regions-relate-bound-regions-on-closures-to-inference-variables.rs`,
-        // for details. Short version is that we must sometimes detect
-        // relationships between specific region variables and regions
-        // bound in a closure signature, and that detection gets thrown
-        // off when we substitute fresh region variables here to enable
-        // subtyping.
     }
 
     /// Compute the new expected type and default binding mode from the old ones
@@ -1098,11 +1096,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 bug!("unexpected pattern type {:?}", pat_ty);
             };
             for (i, subpat) in subpats.iter().enumerate_and_adjust(variant.fields.len(), ddpos) {
-                let field_ty = self.field_ty(subpat.span, &variant.fields[i], substs);
+                let field = &variant.fields[FieldIdx::from_usize(i)];
+                let field_ty = self.field_ty(subpat.span, field, substs);
                 self.check_pat(subpat, field_ty, def_bm, ti);
 
                 self.tcx.check_stability(
-                    variant.fields[i].did,
+                    variant.fields[FieldIdx::from_usize(i)].did,
                     Some(pat.hir_id),
                     subpat.span,
                     None,
@@ -1110,7 +1109,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         } else {
             // Pattern has wrong number of fields.
-            let e = self.e0023(pat.span, res, qpath, subpats, &variant.fields, expected, had_err);
+            let e =
+                self.e0023(pat.span, res, qpath, subpats, &variant.fields.raw, expected, had_err);
             on_error(e);
             return tcx.ty_error(e);
         }
@@ -1340,8 +1340,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Index the struct fields' types.
         let field_map = variant
             .fields
-            .iter()
-            .enumerate()
+            .iter_enumerated()
             .map(|(i, field)| (field.ident(self.tcx).normalize_to_macros_2_0(), (i, field)))
             .collect::<FxHashMap<_, _>>();
 
@@ -1678,7 +1677,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         fields: &'tcx [hir::PatField<'tcx>],
         variant: &ty::VariantDef,
     ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
-        if let (Some(CtorKind::Fn), PatKind::Struct(qpath, ..)) = (variant.ctor_kind(), &pat.kind) {
+        if let (Some(CtorKind::Fn), PatKind::Struct(qpath, pattern_fields, ..)) =
+            (variant.ctor_kind(), &pat.kind)
+        {
+            let is_tuple_struct_match = !pattern_fields.is_empty()
+                && pattern_fields.iter().map(|field| field.ident.name.as_str()).all(is_number);
+            if is_tuple_struct_match {
+                return None;
+            }
+
             let path = rustc_hir_pretty::to_string(rustc_hir_pretty::NO_ANN, |s| {
                 s.print_qpath(qpath, false)
             });
@@ -1900,7 +1907,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 prefix,
                 unmentioned_fields
                     .iter()
-                    .map(|(_, name)| name.to_string())
+                    .map(|(_, name)| {
+                        let field_name = name.to_string();
+                        if is_number(&field_name) {
+                            format!("{}: _", field_name)
+                        } else {
+                            field_name
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
                 if have_inaccessible_fields { ", .." } else { "" },

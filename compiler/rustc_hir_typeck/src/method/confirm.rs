@@ -8,7 +8,7 @@ use rustc_hir_analysis::astconv::generics::{
     check_generic_arg_count_for_call, create_substs_for_generic_args,
 };
 use rustc_hir_analysis::astconv::{AstConv, CreateSubstsForGenericArgsCtxt, IsMethodCall};
-use rustc_infer::infer::{self, InferOk};
+use rustc_infer::infer::{self, DefineOpaqueTypes, InferOk};
 use rustc_middle::traits::{ObligationCauseCode, UnifyReceiverContext};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCast};
 use rustc_middle::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
@@ -478,7 +478,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 substs,
             })),
         );
-        match self.at(&cause, self.param_env).sup(method_self_ty, self_ty) {
+        match self.at(&cause, self.param_env).sup(DefineOpaqueTypes::No, method_self_ty, self_ty) {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
             }
@@ -574,19 +574,15 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     ) -> Option<Span> {
         let sized_def_id = self.tcx.lang_items().sized_trait()?;
 
-        traits::elaborate_predicates(self.tcx, predicates.predicates.iter().copied())
+        traits::elaborate(self.tcx, predicates.predicates.iter().copied())
             // We don't care about regions here.
-            .filter_map(|obligation| match obligation.predicate.kind().skip_binder() {
+            .filter_map(|pred| match pred.kind().skip_binder() {
                 ty::PredicateKind::Clause(ty::Clause::Trait(trait_pred))
                     if trait_pred.def_id() == sized_def_id =>
                 {
                     let span = predicates
                         .iter()
-                        .find_map(
-                            |(p, span)| {
-                                if p == obligation.predicate { Some(span) } else { None }
-                            },
-                        )
+                        .find_map(|(p, span)| if p == pred { Some(span) } else { None })
                         .unwrap_or(rustc_span::DUMMY_SP);
                     Some((trait_pred, span))
                 }

@@ -160,6 +160,8 @@ declare_features! (
     (active, intrinsics, "1.0.0", None, None),
     /// Allows using `#[lang = ".."]` attribute for linking items to special compiler logic.
     (active, lang_items, "1.0.0", None, None),
+    /// Allows `#[link(..., cfg(..))]`; perma-unstable per #37406
+    (active, link_cfg, "1.14.0", None, None),
     /// Allows the `multiple_supertrait_upcastable` lint.
     (active, multiple_supertrait_upcastable, "1.69.0", None, None),
     /// Allows using `#[omit_gdb_pretty_printer_section]`.
@@ -200,8 +202,6 @@ declare_features! (
     (active, auto_traits, "1.50.0", Some(13231), None),
     /// Allows using `box` in patterns (RFC 469).
     (active, box_patterns, "1.0.0", Some(29641), None),
-    /// Allows using the `box $expr` syntax.
-    (active, box_syntax, "1.0.0", Some(49733), None),
     /// Allows `#[doc(notable_trait)]`.
     /// Renamed from `doc_spotlight`.
     (active, doc_notable_trait, "1.52.0", Some(45040), None),
@@ -225,7 +225,7 @@ declare_features! (
     (active, rustc_allow_const_fn_unstable, "1.49.0", Some(69399), None),
     /// Allows using compiler's own crates.
     (active, rustc_private, "1.0.0", Some(27812), None),
-    /// Allows using internal rustdoc features like `doc(primitive)` or `doc(keyword)`.
+    /// Allows using internal rustdoc features like `doc(keyword)`.
     (active, rustdoc_internals, "1.58.0", Some(90418), None),
     /// Allows using the `rustdoc::missing_doc_code_examples` lint
     (active, rustdoc_missing_doc_code_examples, "1.31.0", Some(101730), None),
@@ -259,7 +259,6 @@ declare_features! (
     (active, ermsb_target_feature, "1.49.0", Some(44839), None),
     (active, hexagon_target_feature, "1.27.0", Some(44839), None),
     (active, mips_target_feature, "1.27.0", Some(44839), None),
-    (active, movbe_target_feature, "1.34.0", Some(44839), None),
     (active, powerpc_target_feature, "1.27.0", Some(44839), None),
     (active, riscv_target_feature, "1.45.0", Some(44839), None),
     (active, rtm_target_feature, "1.35.0", Some(44839), None),
@@ -310,7 +309,7 @@ declare_features! (
     (active, associated_type_defaults, "1.2.0", Some(29661), None),
     /// Allows `async || body` closures.
     (active, async_closure, "1.37.0", Some(62290), None),
-    /// Alows async functions to be declared, implemented, and used in traits.
+    /// Allows async functions to be declared, implemented, and used in traits.
     (incomplete, async_fn_in_trait, "1.66.0", Some(91611), None),
     /// Allows `extern "C-unwind" fn` to enable unwinding across ABI boundaries.
     (active, c_unwind, "1.52.0", Some(74990), None),
@@ -417,6 +416,8 @@ declare_features! (
     (active, half_open_range_patterns_in_slices, "1.66.0", Some(67264), None),
     /// Allows `if let` guard in match arms.
     (active, if_let_guard, "1.47.0", Some(51114), None),
+    /// Allows `impl Trait` to be used inside associated types (RFC 2515).
+    (active, impl_trait_in_assoc_type, "1.70.0", Some(63063), None),
     /// Allows `impl Trait` as output type in `Fn` traits in return position of functions.
     (active, impl_trait_in_fn_trait_return, "1.64.0", Some(99697), None),
     /// Allows referencing `Self` and projections in impl-trait.
@@ -435,8 +436,6 @@ declare_features! (
     (active, large_assignments, "1.52.0", Some(83518), None),
     /// Allows `if/while p && let q = r && ...` chains.
     (active, let_chains, "1.37.0", Some(53667), None),
-    /// Allows `#[link(..., cfg(..))]`.
-    (active, link_cfg, "1.14.0", Some(37406), None),
     /// Allows using `reason` in lint attributes and the `#[expect(lint)]` lint check.
     (active, lint_reasons, "1.31.0", Some(54503), None),
     /// Give access to additional metadata about declarative macro meta-variables.
@@ -498,6 +497,8 @@ declare_features! (
     (active, repr_simd, "1.4.0", Some(27731), None),
     /// Allows return-position `impl Trait` in traits.
     (incomplete, return_position_impl_trait_in_trait, "1.65.0", Some(91611), None),
+    /// Allows bounding the return type of AFIT/RPITIT.
+    (incomplete, return_type_notation, "1.70.0", Some(109417), None),
     /// Allows `extern "rust-cold"`.
     (active, rust_cold_cc, "1.63.0", Some(97544), None),
     /// Allows the use of SIMD types in functions declared in `extern` blocks.
@@ -519,6 +520,8 @@ declare_features! (
     /// Allows dyn upcasting trait objects via supertraits.
     /// Dyn upcasting is casting, e.g., `dyn Foo -> dyn Bar` where `Foo: Bar`.
     (active, trait_upcasting, "1.56.0", Some(65991), None),
+    /// Allows for transmuting between arrays with sizes that contain generic consts.
+    (active, transmute_generic_consts, "1.70.0", Some(109929), None),
     /// Allows #[repr(transparent)] on unions (RFC 2645).
     (active, transparent_unions, "1.37.0", Some(60405), None),
     /// Allows inconsistent bounds in where clauses.

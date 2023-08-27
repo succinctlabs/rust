@@ -2,7 +2,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::{LangItem, CRATE_HIR_ID};
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::PointerArithmetic;
-use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::layout::{FnAbiOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::lint::builtin::INVALID_ALIGNMENT;
 use std::borrow::Borrow;
@@ -23,7 +23,7 @@ use rustc_target::spec::abi::Abi as CallAbi;
 
 use crate::interpret::{
     self, compile_time_machine, AllocId, ConstAllocation, FnVal, Frame, ImmTy, InterpCx,
-    InterpResult, OpTy, PlaceTy, Pointer, Scalar, StackPopUnwind,
+    InterpResult, OpTy, PlaceTy, Pointer, Scalar,
 };
 
 use super::error::*;
@@ -271,7 +271,7 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
                         /* with_caller_location = */ false,
                         dest,
                         ret,
-                        StackPopUnwind::NotAllowed,
+                        mir::UnwindAction::Unreachable,
                     )?;
                     Ok(ControlFlow::Break(()))
                 } else {
@@ -335,8 +335,8 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     }
 
     #[inline(always)]
-    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
-        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks
+    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>, layout: TyAndLayout<'tcx>) -> bool {
+        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks || layout.abi.is_uninhabited()
     }
 
     fn alignment_check_failed(
@@ -401,7 +401,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         args: &[OpTy<'tcx>],
         dest: &PlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind, // unwinding is not supported in consts
+        _unwind: mir::UnwindAction, // unwinding is not supported in consts
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         debug!("find_mir_or_eval_fn: {:?}", instance);
 
@@ -450,7 +450,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         args: &[OpTy<'tcx>],
         dest: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         // Shared intrinsics.
         if ecx.emulate_intrinsic(instance, args, dest, target)? {
@@ -526,7 +526,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     fn assert_panic(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         msg: &AssertMessage<'tcx>,
-        _unwind: Option<mir::BasicBlock>,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         use rustc_middle::mir::AssertKind::*;
         // Convert `AssertKind<Operand>` to `AssertKind<Scalar>`.
@@ -544,6 +544,12 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             RemainderByZero(op) => RemainderByZero(eval_to_int(op)?),
             ResumedAfterReturn(generator_kind) => ResumedAfterReturn(*generator_kind),
             ResumedAfterPanic(generator_kind) => ResumedAfterPanic(*generator_kind),
+            MisalignedPointerDereference { ref required, ref found } => {
+                MisalignedPointerDereference {
+                    required: eval_to_int(required)?,
+                    found: eval_to_int(found)?,
+                }
+            }
         };
         Err(ConstEvalErrKind::AssertFailure(err).into())
     }

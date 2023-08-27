@@ -222,7 +222,7 @@ impl LinkerPluginLto {
 }
 
 /// The different settings that can be enabled via the `-Z location-detail` flag.
-#[derive(Clone, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Hash, Debug)]
 pub struct LocationDetail {
     pub file: bool,
     pub line: bool,
@@ -260,6 +260,8 @@ pub enum SymbolManglingVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
 pub enum DebugInfo {
     None,
+    LineDirectivesOnly,
+    LineTablesOnly,
     Limited,
     Full,
 }
@@ -580,6 +582,7 @@ pub enum PrintRequest {
     CodeModels,
     TlsModels,
     TargetSpec,
+    AllTargetSpecs,
     NativeStaticLibs,
     StackProtectorStrategies,
     LinkArgs,
@@ -1137,7 +1140,7 @@ impl CrateCheckConfig {
     }
 
     /// Fills a `CrateCheckConfig` with well-known configuration values.
-    fn fill_well_known_values(&mut self) {
+    fn fill_well_known_values(&mut self, current_target: &Target) {
         if !self.well_known_values {
             return;
         }
@@ -1229,6 +1232,7 @@ impl CrateCheckConfig {
             for target in TARGETS
                 .iter()
                 .map(|target| Target::expect_builtin(&TargetTriple::from_triple(target)))
+                .chain(iter::once(current_target.clone()))
             {
                 values_target_os.insert(Symbol::intern(&target.options.os));
                 values_target_family
@@ -1243,9 +1247,9 @@ impl CrateCheckConfig {
         }
     }
 
-    pub fn fill_well_known(&mut self) {
+    pub fn fill_well_known(&mut self, current_target: &Target) {
         self.fill_well_known_names();
-        self.fill_well_known_values();
+        self.fill_well_known_values(current_target);
     }
 }
 
@@ -1254,7 +1258,7 @@ pub fn build_configuration(sess: &Session, mut user_cfg: CrateConfig) -> CrateCo
     // some default and generated configuration items.
     let default_cfg = default_configuration(sess);
     // If the user wants a test runner, then add the test cfg.
-    if sess.opts.test {
+    if sess.is_test_crate() {
         user_cfg.insert((sym::test, None));
     }
     user_cfg.extend(default_cfg.iter().cloned());
@@ -1422,7 +1426,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
         opt::opt_s(
             "",
             "edition",
-            &*EDITION_STRING,
+            &EDITION_STRING,
             EDITION_NAME_LIST,
         ),
         opt::multi_s(
@@ -1438,8 +1442,8 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
             "Compiler information to print on stdout",
             "[crate-name|file-names|sysroot|target-libdir|cfg|calling-conventions|\
              target-list|target-cpus|target-features|relocation-models|code-models|\
-             tls-models|target-spec-json|native-static-libs|stack-protector-strategies|\
-             link-args]",
+             tls-models|target-spec-json|all-target-specs-json|native-static-libs|\
+             stack-protector-strategies|link-args]",
         ),
         opt::flagmulti_s("g", "", "Equivalent to -C debuginfo=2"),
         opt::flagmulti_s("O", "", "Equivalent to -C opt-level=2"),
@@ -1886,6 +1890,7 @@ fn collect_print_requests(
         ("native-static-libs", PrintRequest::NativeStaticLibs),
         ("stack-protector-strategies", PrintRequest::StackProtectorStrategies),
         ("target-spec-json", PrintRequest::TargetSpec),
+        ("all-target-specs-json", PrintRequest::AllTargetSpecs),
         ("link-args", PrintRequest::LinkArgs),
         ("split-debuginfo", PrintRequest::SplitDebuginfo),
     ];
@@ -1899,7 +1904,18 @@ fn collect_print_requests(
                     early_error(
                         error_format,
                         "the `-Z unstable-options` flag must also be passed to \
-                     enable the target-spec-json print option",
+                         enable the target-spec-json print option",
+                    );
+                }
+            }
+            Some((_, PrintRequest::AllTargetSpecs)) => {
+                if unstable_opts.unstable_options {
+                    PrintRequest::AllTargetSpecs
+                } else {
+                    early_error(
+                        error_format,
+                        "the `-Z unstable-options` flag must also be passed to \
+                         enable the all-target-specs-json print option",
                     );
                 }
             }
@@ -1978,11 +1994,7 @@ fn parse_opt_level(
     }
 }
 
-fn select_debuginfo(
-    matches: &getopts::Matches,
-    cg: &CodegenOptions,
-    error_format: ErrorOutputType,
-) -> DebugInfo {
+fn select_debuginfo(matches: &getopts::Matches, cg: &CodegenOptions) -> DebugInfo {
     let max_g = matches.opt_positions("g").into_iter().max();
     let max_c = matches
         .opt_strs_pos("C")
@@ -1992,24 +2004,7 @@ fn select_debuginfo(
             if let Some("debuginfo") = s.split('=').next() { Some(i) } else { None }
         })
         .max();
-    if max_g > max_c {
-        DebugInfo::Full
-    } else {
-        match cg.debuginfo {
-            0 => DebugInfo::None,
-            1 => DebugInfo::Limited,
-            2 => DebugInfo::Full,
-            arg => {
-                early_error(
-                    error_format,
-                    &format!(
-                        "debug info level needs to be between \
-                         0-2 (instead was `{arg}`)"
-                    ),
-                );
-            }
-        }
-    }
+    if max_g > max_c { DebugInfo::Full } else { cg.debuginfo }
 }
 
 pub(crate) fn parse_assert_incr_state(
@@ -2497,7 +2492,7 @@ pub fn build_session_options(matches: &getopts::Matches) -> Options {
     // to use them interchangeably. See the note above (regarding `-O` and `-C opt-level`)
     // for more details.
     let debug_assertions = cg.debug_assertions.unwrap_or(opt_level == OptLevel::No);
-    let debuginfo = select_debuginfo(matches, &cg, error_format);
+    let debuginfo = select_debuginfo(matches, &cg);
 
     let mut search_paths = vec![];
     for s in &matches.opt_strs("L") {

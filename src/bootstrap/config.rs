@@ -55,9 +55,8 @@ pub enum DryRun {
 /// Note that this structure is not decoded directly into, but rather it is
 /// filled out from the decoded forms of the structs below. For documentation
 /// each field, see the corresponding fields in
-/// `config.toml.example`.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone))]
+/// `config.example.toml`.
+#[derive(Default, Clone)]
 pub struct Config {
     pub changelog_seen: Option<usize>,
     pub ccache: Option<String>,
@@ -77,7 +76,7 @@ pub struct Config {
     pub tools: Option<HashSet<String>>,
     pub sanitizers: bool,
     pub profiler: bool,
-    pub ignore_git: bool,
+    pub omit_git_hash: bool,
     pub exclude: Vec<TaskPath>,
     pub include_default_paths: bool,
     pub rustc_error_format: Option<String>,
@@ -86,6 +85,9 @@ pub struct Config {
     pub color: Color,
     pub patch_binaries_for_nix: bool,
     pub stage0_metadata: Stage0Metadata,
+
+    pub stdout_is_tty: bool,
+    pub stderr_is_tty: bool,
 
     pub on_fail: Option<String>,
     pub stage: u32,
@@ -112,14 +114,12 @@ pub struct Config {
     pub backtrace_on_ice: bool,
 
     // llvm codegen options
-    pub llvm_skip_rebuild: bool,
     pub llvm_assertions: bool,
     pub llvm_tests: bool,
     pub llvm_plugins: bool,
     pub llvm_optimize: bool,
     pub llvm_thin_lto: bool,
     pub llvm_release_debuginfo: bool,
-    pub llvm_version_check: bool,
     pub llvm_static_stdcpp: bool,
     /// `None` if `llvm_from_ci` is true and we haven't yet downloaded llvm.
     #[cfg(not(test))]
@@ -135,6 +135,7 @@ pub struct Config {
     pub llvm_allow_old_toolchain: bool,
     pub llvm_polly: bool,
     pub llvm_clang: bool,
+    pub llvm_enable_warnings: bool,
     pub llvm_from_ci: bool,
     pub llvm_build_config: HashMap<String, String>,
 
@@ -192,6 +193,8 @@ pub struct Config {
     pub dist_sign_folder: Option<PathBuf>,
     pub dist_upload_addr: Option<String>,
     pub dist_compression_formats: Option<Vec<String>>,
+    pub dist_compression_profile: String,
+    pub dist_include_mingw_linker: bool,
 
     // libstd features
     pub backtrace: bool, // support for RUST_BACKTRACE
@@ -223,27 +226,33 @@ pub struct Config {
     pub reuse: Option<PathBuf>,
     pub cargo_native_static: bool,
     pub configure_args: Vec<String>,
+    pub out: PathBuf,
+    pub rust_info: channel::GitInfo,
 
     // These are either the stage0 downloaded binaries or the locally installed ones.
     pub initial_cargo: PathBuf,
     pub initial_rustc: PathBuf,
+
     #[cfg(not(test))]
     initial_rustfmt: RefCell<RustfmtState>,
     #[cfg(test)]
     pub initial_rustfmt: RefCell<RustfmtState>,
-    pub out: PathBuf,
-    pub rust_info: channel::GitInfo,
 }
 
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
 pub struct Stage0Metadata {
+    pub compiler: CompilerMetadata,
     pub config: Stage0Config,
     pub checksums_sha256: HashMap<String, String>,
     pub rustfmt: Option<RustfmtMetadata>,
 }
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
+pub struct CompilerMetadata {
+    pub date: String,
+    pub version: String,
+}
+
+#[derive(Default, Deserialize, Clone)]
 pub struct Stage0Config {
     pub dist_server: String,
     pub artifacts_server: String,
@@ -251,8 +260,7 @@ pub struct Stage0Config {
     pub git_merge_commit_email: String,
     pub nightly_branch: String,
 }
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
 pub struct RustfmtMetadata {
     pub date: String,
     pub version: String,
@@ -326,7 +334,7 @@ impl std::str::FromStr for SplitDebuginfo {
 
 impl SplitDebuginfo {
     /// Returns the default `-Csplit-debuginfo` value for the current target. See the comment for
-    /// `rust.split-debuginfo` in `config.toml.example`.
+    /// `rust.split-debuginfo` in `config.example.toml`.
     fn default_for_platform(target: &str) -> Self {
         if target.contains("apple") {
             SplitDebuginfo::Unpacked
@@ -430,8 +438,7 @@ impl PartialEq<&str> for TargetSelection {
 }
 
 /// Per-target configuration stored in the global configuration structure.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Clone)]
 pub struct Target {
     /// Some(path to llvm-config) if using an external LLVM.
     pub llvm_config: Option<PathBuf>,
@@ -666,7 +673,6 @@ define_config! {
 define_config! {
     /// TOML representation of how the LLVM build is configured.
     struct Llvm {
-        skip_rebuild: Option<bool> = "skip-rebuild",
         optimize: Option<bool> = "optimize",
         thin_lto: Option<bool> = "thin-lto",
         release_debuginfo: Option<bool> = "release-debuginfo",
@@ -674,7 +680,6 @@ define_config! {
         tests: Option<bool> = "tests",
         plugins: Option<bool> = "plugins",
         ccache: Option<StringOrBool> = "ccache",
-        version_check: Option<bool> = "version-check",
         static_libstdcpp: Option<bool> = "static-libstdcpp",
         ninja: Option<bool> = "ninja",
         targets: Option<String> = "targets",
@@ -691,6 +696,7 @@ define_config! {
         allow_old_toolchain: Option<bool> = "allow-old-toolchain",
         polly: Option<bool> = "polly",
         clang: Option<bool> = "clang",
+        enable_warnings: Option<bool> = "enable-warnings",
         download_ci_llvm: Option<StringOrBool> = "download-ci-llvm",
         build_config: Option<HashMap<String, String>> = "build-config",
     }
@@ -704,6 +710,8 @@ define_config! {
         src_tarball: Option<bool> = "src-tarball",
         missing_tools: Option<bool> = "missing-tools",
         compression_formats: Option<Vec<String>> = "compression-formats",
+        compression_profile: Option<String> = "compression-profile",
+        include_mingw_linker: Option<bool> = "include-mingw-linker",
     }
 }
 
@@ -750,7 +758,7 @@ define_config! {
         verbose_tests: Option<bool> = "verbose-tests",
         optimize_tests: Option<bool> = "optimize-tests",
         codegen_tests: Option<bool> = "codegen-tests",
-        ignore_git: Option<bool> = "ignore-git",
+        omit_git_hash: Option<bool> = "omit-git-hash",
         dist_src: Option<bool> = "dist-src",
         save_toolstates: Option<String> = "save-toolstates",
         codegen_backends: Option<Vec<String>> = "codegen-backends",
@@ -803,10 +811,11 @@ define_config! {
 
 impl Config {
     pub fn default_opts() -> Config {
+        use is_terminal::IsTerminal;
+
         let mut config = Config::default();
         config.llvm_optimize = true;
         config.ninja_in_file = true;
-        config.llvm_version_check = true;
         config.llvm_static_stdcpp = false;
         config.backtrace = true;
         config.rust_optimize = true;
@@ -821,6 +830,11 @@ impl Config {
         config.rust_codegen_backends = vec![INTERNER.intern_str("llvm")];
         config.deny_warnings = true;
         config.bindir = "bin".into();
+        config.dist_include_mingw_linker = true;
+        config.dist_compression_profile = "fast".into();
+
+        config.stdout_is_tty = std::io::stdout().is_terminal();
+        config.stderr_is_tty = std::io::stderr().is_terminal();
 
         // set by build.rs
         config.build = TargetSelection::from_user(&env!("BUILD_TRIPLE"));
@@ -989,10 +1003,10 @@ impl Config {
             config.out = crate::util::absolute(&config.out);
         }
 
-        config.initial_rustc = build
-            .rustc
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.out.join(config.build.triple).join("stage0/bin/rustc"));
+        config.initial_rustc = build.rustc.map(PathBuf::from).unwrap_or_else(|| {
+            config.download_beta_toolchain();
+            config.out.join(config.build.triple).join("stage0/bin/rustc")
+        });
         config.initial_cargo = build
             .cargo
             .map(PathBuf::from)
@@ -1060,11 +1074,6 @@ impl Config {
             config.mandir = install.mandir.map(PathBuf::from);
         }
 
-        // We want the llvm-skip-rebuild flag to take precedence over the
-        // skip-rebuild config.toml option so we store it separately
-        // so that we can infer the right value
-        let mut llvm_skip_rebuild = flags.llvm_skip_rebuild;
-
         // Store off these values as options because if they're not provided
         // we'll infer default values for them later
         let mut llvm_assertions = None;
@@ -1082,7 +1091,7 @@ impl Config {
         let mut debuginfo_level_tools = None;
         let mut debuginfo_level_tests = None;
         let mut optimize = None;
-        let mut ignore_git = None;
+        let mut omit_git_hash = None;
 
         if let Some(rust) = toml.rust {
             debug = rust.debug;
@@ -1103,7 +1112,7 @@ impl Config {
                 .map(|v| v.expect("invalid value for rust.split_debuginfo"))
                 .unwrap_or(SplitDebuginfo::default_for_platform(&config.build.triple));
             optimize = rust.optimize;
-            ignore_git = rust.ignore_git;
+            omit_git_hash = rust.omit_git_hash;
             config.rust_new_symbol_mangling = rust.new_symbol_mangling;
             set(&mut config.rust_optimize_tests, rust.optimize_tests);
             set(&mut config.codegen_tests, rust.codegen_tests);
@@ -1158,6 +1167,11 @@ impl Config {
             config.rust_profile_generate = flags.rust_profile_generate;
         }
 
+        // rust_info must be set before is_ci_llvm_available() is called.
+        let default = config.channel == "dev";
+        config.omit_git_hash = omit_git_hash.unwrap_or(default);
+        config.rust_info = GitInfo::new(config.omit_git_hash, &config.src);
+
         if let Some(llvm) = toml.llvm {
             match llvm.ccache {
                 Some(StringOrBool::String(ref s)) => config.ccache = Some(s.to_string()),
@@ -1170,11 +1184,9 @@ impl Config {
             llvm_assertions = llvm.assertions;
             llvm_tests = llvm.tests;
             llvm_plugins = llvm.plugins;
-            llvm_skip_rebuild = llvm_skip_rebuild.or(llvm.skip_rebuild);
             set(&mut config.llvm_optimize, llvm.optimize);
             set(&mut config.llvm_thin_lto, llvm.thin_lto);
             set(&mut config.llvm_release_debuginfo, llvm.release_debuginfo);
-            set(&mut config.llvm_version_check, llvm.version_check);
             set(&mut config.llvm_static_stdcpp, llvm.static_libstdcpp);
             if let Some(v) = llvm.link_shared {
                 config.llvm_link_shared.set(Some(v));
@@ -1193,17 +1205,18 @@ impl Config {
             config.llvm_allow_old_toolchain = llvm.allow_old_toolchain.unwrap_or(false);
             config.llvm_polly = llvm.polly.unwrap_or(false);
             config.llvm_clang = llvm.clang.unwrap_or(false);
+            config.llvm_enable_warnings = llvm.enable_warnings.unwrap_or(false);
             config.llvm_build_config = llvm.build_config.clone().unwrap_or(Default::default());
 
             let asserts = llvm_assertions.unwrap_or(false);
             config.llvm_from_ci = match llvm.download_ci_llvm {
                 Some(StringOrBool::String(s)) => {
                     assert!(s == "if-available", "unknown option `{}` for download-ci-llvm", s);
-                    crate::native::is_ci_llvm_available(&config, asserts)
+                    crate::llvm::is_ci_llvm_available(&config, asserts)
                 }
                 Some(StringOrBool::Bool(b)) => b,
                 None => {
-                    config.channel == "dev" && crate::native::is_ci_llvm_available(&config, asserts)
+                    config.channel == "dev" && crate::llvm::is_ci_llvm_available(&config, asserts)
                 }
             };
 
@@ -1246,7 +1259,7 @@ impl Config {
             }
         } else {
             config.llvm_from_ci =
-                config.channel == "dev" && crate::native::is_ci_llvm_available(&config, false);
+                config.channel == "dev" && crate::llvm::is_ci_llvm_available(&config, false);
         }
 
         if let Some(t) = toml.target {
@@ -1309,8 +1322,10 @@ impl Config {
             config.dist_sign_folder = t.sign_folder.map(PathBuf::from);
             config.dist_upload_addr = t.upload_addr;
             config.dist_compression_formats = t.compression_formats;
+            set(&mut config.dist_compression_profile, t.compression_profile);
             set(&mut config.rust_dist_src, t.src_tarball);
             set(&mut config.missing_tools, t.missing_tools);
+            set(&mut config.dist_include_mingw_linker, t.include_mingw_linker)
         }
 
         if let Some(r) = build.rustfmt {
@@ -1324,7 +1339,6 @@ impl Config {
         // Now that we've reached the end of our configuration, infer the
         // default values for all options that we haven't otherwise stored yet.
 
-        config.llvm_skip_rebuild = llvm_skip_rebuild.unwrap_or(false);
         config.llvm_assertions = llvm_assertions.unwrap_or(false);
         config.llvm_tests = llvm_tests.unwrap_or(false);
         config.llvm_plugins = llvm_plugins.unwrap_or(false);
@@ -1352,10 +1366,6 @@ impl Config {
         config.rust_debuginfo_level_tools = with_defaults(debuginfo_level_tools);
         config.rust_debuginfo_level_tests = debuginfo_level_tests.unwrap_or(0);
 
-        let default = config.channel == "dev";
-        config.ignore_git = ignore_git.unwrap_or(default);
-        config.rust_info = GitInfo::new(config.ignore_git, &config.src);
-
         let download_rustc = config.download_rustc_commit.is_some();
         // See https://github.com/rust-lang/compiler-team/issues/326
         config.stage = match config.cmd {
@@ -1380,7 +1390,8 @@ impl Config {
             | Subcommand::Fix { .. }
             | Subcommand::Run { .. }
             | Subcommand::Setup { .. }
-            | Subcommand::Format { .. } => flags.stage.unwrap_or(0),
+            | Subcommand::Format { .. }
+            | Subcommand::Suggest { .. } => flags.stage.unwrap_or(0),
         };
 
         // CI should always run stage 2 builds, unless it specifically states otherwise
@@ -1405,7 +1416,8 @@ impl Config {
                 | Subcommand::Fix { .. }
                 | Subcommand::Run { .. }
                 | Subcommand::Setup { .. }
-                | Subcommand::Format { .. } => {}
+                | Subcommand::Format { .. }
+                | Subcommand::Suggest { .. } => {}
             }
         }
 

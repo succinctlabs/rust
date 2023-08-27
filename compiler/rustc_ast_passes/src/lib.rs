@@ -4,7 +4,6 @@
 //!
 //! The crate also contains other misc AST visitors, e.g. `node_count` and `show_span`.
 
-#![allow(rustc::potential_query_instability)]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(iter_is_partitioned)]
@@ -22,4 +21,4 @@ pub mod feature_gate;
 pub mod node_count;
 pub mod show_span;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }

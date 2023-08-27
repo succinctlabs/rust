@@ -159,7 +159,9 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
             return;
         }
 
-        let (stab, const_stab, body_stab) = attr::find_stability(&self.tcx.sess, attrs, item_sp);
+        let stab = attr::find_stability(&self.tcx.sess, attrs, item_sp);
+        let const_stab = attr::find_const_stability(&self.tcx.sess, attrs, item_sp);
+        let body_stab = attr::find_body_stability(&self.tcx.sess, attrs);
         let mut const_span = None;
 
         let const_stab = const_stab.map(|(const_stab, const_span_node)| {
@@ -261,6 +263,15 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
 
             if let Stability { level: Unstable { implied_by: Some(implied_by), .. }, feature } =
                 stab
+            {
+                self.index.implications.insert(implied_by, feature);
+            }
+
+            if let Some(ConstStability {
+                level: Unstable { implied_by: Some(implied_by), .. },
+                feature,
+                ..
+            }) = const_stab
             {
                 self.index.implications.insert(implied_by, feature);
             }
@@ -519,7 +530,7 @@ struct MissingStabilityAnnotations<'tcx> {
 impl<'tcx> MissingStabilityAnnotations<'tcx> {
     fn check_missing_stability(&self, def_id: LocalDefId, span: Span) {
         let stab = self.tcx.stability().local_stability(def_id);
-        if !self.tcx.sess.opts.test
+        if !self.tcx.sess.is_test_crate()
             && stab.is_none()
             && self.effective_visibilities.is_reachable(def_id)
         {
@@ -682,14 +693,10 @@ pub(crate) fn provide(providers: &mut Providers) {
         check_mod_unstable_api_usage,
         stability_index,
         stability_implications: |tcx, _| tcx.stability().implications.clone(),
-        lookup_stability: |tcx, id| tcx.stability().local_stability(id.expect_local()),
-        lookup_const_stability: |tcx, id| tcx.stability().local_const_stability(id.expect_local()),
-        lookup_default_body_stability: |tcx, id| {
-            tcx.stability().local_default_body_stability(id.expect_local())
-        },
-        lookup_deprecation_entry: |tcx, id| {
-            tcx.stability().local_deprecation_entry(id.expect_local())
-        },
+        lookup_stability: |tcx, id| tcx.stability().local_stability(id),
+        lookup_const_stability: |tcx, id| tcx.stability().local_const_stability(id),
+        lookup_default_body_stability: |tcx, id| tcx.stability().local_default_body_stability(id),
+        lookup_deprecation_entry: |tcx, id| tcx.stability().local_deprecation_entry(id),
         ..*providers
     };
 }
@@ -737,8 +744,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
                 let features = self.tcx.features();
                 if features.staged_api {
                     let attrs = self.tcx.hir().attrs(item.hir_id());
-                    let (stab, const_stab, _) =
-                        attr::find_stability(&self.tcx.sess, attrs, item.span);
+                    let stab = attr::find_stability(&self.tcx.sess, attrs, item.span);
+                    let const_stab = attr::find_const_stability(&self.tcx.sess, attrs, item.span);
 
                     // If this impl block has an #[unstable] attribute, give an
                     // error if all involved types and traits are stable, because

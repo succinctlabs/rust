@@ -12,9 +12,9 @@ use rustc_errors::{pluralize, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_infer::traits::util::elaborate_predicates_with_span;
+use rustc_infer::traits::util::elaborate;
 use rustc_middle::ty::adjustment;
-use rustc_middle::ty::{self, DefIdTree, Ty};
+use rustc_middle::ty::{self, Ty};
 use rustc_span::symbol::Symbol;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::{BytePos, Span};
@@ -103,8 +103,10 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
             && let ty = cx.typeck_results().expr_ty(&await_expr)
             && let ty::Alias(ty::Opaque, ty::AliasTy { def_id: future_def_id, .. }) = ty.kind()
             && cx.tcx.ty_is_opaque_future(ty)
-            // FIXME: This also includes non-async fns that return `impl Future`.
             && let async_fn_def_id = cx.tcx.parent(*future_def_id)
+            && matches!(cx.tcx.def_kind(async_fn_def_id), DefKind::Fn | DefKind::AssocFn)
+            // Check that this `impl Future` actually comes from an `async fn`
+            && cx.tcx.asyncness(async_fn_def_id).is_async()
             && check_must_use_def(
                 cx,
                 async_fn_def_id,
@@ -123,7 +125,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
         let must_use_result = is_ty_must_use(cx, ty, &expr, expr.span);
         let type_lint_emitted_or_suppressed = match must_use_result {
             Some(path) => {
-                emit_must_use_untranslated(cx, &path, "", "", 1);
+                emit_must_use_untranslated(cx, &path, "", "", 1, false);
                 true
             }
             None => false,
@@ -254,24 +256,23 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                 }
                 ty::Adt(def, _) => is_def_must_use(cx, def.did(), span),
                 ty::Alias(ty::Opaque, ty::AliasTy { def_id: def, .. }) => {
-                    elaborate_predicates_with_span(
-                        cx.tcx,
-                        cx.tcx.explicit_item_bounds(def).iter().cloned(),
-                    )
-                    .find_map(|obligation| {
-                        // We only look at the `DefId`, so it is safe to skip the binder here.
-                        if let ty::PredicateKind::Clause(ty::Clause::Trait(
-                            ref poly_trait_predicate,
-                        )) = obligation.predicate.kind().skip_binder()
-                        {
-                            let def_id = poly_trait_predicate.trait_ref.def_id;
+                    elaborate(cx.tcx, cx.tcx.explicit_item_bounds(def).iter().cloned())
+                        // We only care about self bounds for the impl-trait
+                        .filter_only_self()
+                        .find_map(|(pred, _span)| {
+                            // We only look at the `DefId`, so it is safe to skip the binder here.
+                            if let ty::PredicateKind::Clause(ty::Clause::Trait(
+                                ref poly_trait_predicate,
+                            )) = pred.kind().skip_binder()
+                            {
+                                let def_id = poly_trait_predicate.trait_ref.def_id;
 
-                            is_def_must_use(cx, def_id, span)
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|inner| MustUsePath::Opaque(Box::new(inner)))
+                                is_def_must_use(cx, def_id, span)
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|inner| MustUsePath::Opaque(Box::new(inner)))
                 }
                 ty::Dynamic(binders, _, _) => binders.iter().find_map(|predicate| {
                     if let ty::ExistentialPredicate::Trait(ref trait_ref) = predicate.skip_binder()
@@ -358,6 +359,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                         descr_pre_path,
                         descr_post_path,
                         1,
+                        false,
                     )
                 })
                 .is_some()
@@ -370,6 +372,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
             descr_pre: &str,
             descr_post: &str,
             plural_len: usize,
+            is_inner: bool,
         ) {
             let plural_suffix = pluralize!(plural_len);
 
@@ -377,20 +380,22 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                 MustUsePath::Suppressed => {}
                 MustUsePath::Boxed(path) => {
                     let descr_pre = &format!("{}boxed ", descr_pre);
-                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len);
+                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len, true);
                 }
                 MustUsePath::Opaque(path) => {
                     let descr_pre = &format!("{}implementer{} of ", descr_pre, plural_suffix);
-                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len);
+                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len, true);
                 }
                 MustUsePath::TraitObject(path) => {
                     let descr_post = &format!(" trait object{}{}", plural_suffix, descr_post);
-                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len);
+                    emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len, true);
                 }
                 MustUsePath::TupleElement(elems) => {
                     for (index, path) in elems {
                         let descr_post = &format!(" in tuple element {}", index);
-                        emit_must_use_untranslated(cx, path, descr_pre, descr_post, plural_len);
+                        emit_must_use_untranslated(
+                            cx, path, descr_pre, descr_post, plural_len, true,
+                        );
                     }
                 }
                 MustUsePath::Array(path, len) => {
@@ -401,6 +406,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                         descr_pre,
                         descr_post,
                         plural_len.saturating_add(usize::try_from(*len).unwrap_or(usize::MAX)),
+                        true,
                     );
                 }
                 MustUsePath::Closure(span) => {
@@ -418,19 +424,6 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                     );
                 }
                 MustUsePath::Def(span, def_id, reason) => {
-                    let suggestion = if matches!(
-                        cx.tcx.get_diagnostic_name(*def_id),
-                        Some(sym::add)
-                            | Some(sym::sub)
-                            | Some(sym::mul)
-                            | Some(sym::div)
-                            | Some(sym::rem)
-                            | Some(sym::neg),
-                    ) {
-                        Some(UnusedDefSuggestion::Default { span: span.shrink_to_lo() })
-                    } else {
-                        None
-                    };
                     cx.emit_spanned_lint(
                         UNUSED_MUST_USE,
                         *span,
@@ -440,7 +433,8 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                             cx,
                             def_id: *def_id,
                             note: *reason,
-                            suggestion,
+                            suggestion: (!is_inner)
+                                .then_some(UnusedDefSuggestion { span: span.shrink_to_lo() }),
                         },
                     );
                 }
@@ -812,7 +806,9 @@ trait UnusedDelimLint {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
         use ast::ItemKind::*;
 
-        if let Const(.., Some(expr)) | Static(.., Some(expr)) = &item.kind {
+        if let Const(box ast::ConstItem { expr: Some(expr), .. })
+        | Static(box ast::StaticItem { expr: Some(expr), .. }) = &item.kind
+        {
             self.check_unused_delims_expr(
                 cx,
                 expr,
@@ -1349,9 +1345,8 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust
-    /// #![feature(box_syntax)]
     /// fn main() {
-    ///     let a = (box [1, 2, 3]).len();
+    ///     let a = Box::new([1, 2, 3]).len();
     /// }
     /// ```
     ///
@@ -1372,7 +1367,11 @@ declare_lint_pass!(UnusedAllocation => [UNUSED_ALLOCATION]);
 impl<'tcx> LateLintPass<'tcx> for UnusedAllocation {
     fn check_expr(&mut self, cx: &LateContext<'_>, e: &hir::Expr<'_>) {
         match e.kind {
-            hir::ExprKind::Box(_) => {}
+            hir::ExprKind::Call(path_expr, [_])
+                if let hir::ExprKind::Path(qpath) = &path_expr.kind
+                && let Some(did) = cx.qpath_res(qpath, path_expr.hir_id).opt_def_id()
+                && cx.tcx.is_diagnostic_item(sym::box_new, did)
+                => {}
             _ => return,
         }
 

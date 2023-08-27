@@ -37,7 +37,7 @@ pub fn is_min_const_fn<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, msrv: &Msrv) 
                 | ty::PredicateKind::ConstEvaluatable(..)
                 | ty::PredicateKind::ConstEquate(..)
                 | ty::PredicateKind::TypeWellFormedFromEnv(..) => continue,
-                ty::PredicateKind::AliasEq(..) => panic!("alias eq predicate on function: {predicate:#?}"),
+                ty::PredicateKind::AliasRelate(..) => panic!("alias relate predicate on function: {predicate:#?}"),
                 ty::PredicateKind::ObjectSafe(_) => panic!("object safe predicate on function: {predicate:#?}"),
                 ty::PredicateKind::ClosureKind(..) => panic!("closure kind predicate on function: {predicate:#?}"),
                 ty::PredicateKind::Subtype(_) => panic!("subtype predicate on function: {predicate:#?}"),
@@ -176,6 +176,10 @@ fn check_rvalue<'tcx>(
             // FIXME(dyn-star)
             unimplemented!()
         },
+        Rvalue::Cast(CastKind::Transmute, _, _) => Err((
+            span,
+            "transmute can attempt to turn pointers into integers, so is unstable in const fn".into(),
+        )),
         // binops are fine on integers
         Rvalue::BinaryOp(_, box (lhs, rhs)) | Rvalue::CheckedBinaryOp(_, box (lhs, rhs)) => {
             check_operand(tcx, lhs, span, body)?;
@@ -241,6 +245,7 @@ fn check_statement<'tcx>(
         | StatementKind::StorageDead(_)
         | StatementKind::Retag { .. }
         | StatementKind::AscribeUserType(..)
+        | StatementKind::PlaceMention(..)
         | StatementKind::Coverage(..)
         | StatementKind::ConstEvalCounter
         | StatementKind::Nop => Ok(()),
@@ -296,17 +301,13 @@ fn check_terminator<'tcx>(
         | TerminatorKind::Goto { .. }
         | TerminatorKind::Return
         | TerminatorKind::Resume
+        | TerminatorKind::Terminate
         | TerminatorKind::Unreachable => Ok(()),
 
         TerminatorKind::Drop { place, .. } => check_place(tcx, *place, span, body),
-        TerminatorKind::DropAndReplace { place, value, .. } => {
-            check_place(tcx, *place, span, body)?;
-            check_operand(tcx, value, span, body)
-        },
 
         TerminatorKind::SwitchInt { discr, targets: _ } => check_operand(tcx, discr, span, body),
 
-        TerminatorKind::Abort => Err((span, "abort is not stable in const fn".into())),
         TerminatorKind::GeneratorDrop | TerminatorKind::Yield { .. } => {
             Err((span, "const fn generators are unstable".into()))
         },
@@ -317,7 +318,7 @@ fn check_terminator<'tcx>(
             from_hir_call: _,
             destination: _,
             target: _,
-            cleanup: _,
+            unwind: _,
             fn_span: _,
         } => {
             let fn_ty = func.ty(body, tcx);
@@ -360,7 +361,7 @@ fn check_terminator<'tcx>(
             expected: _,
             msg: _,
             target: _,
-            cleanup: _,
+            unwind: _,
         } => check_operand(tcx, cond, span, body),
 
         TerminatorKind::InlineAsm { .. } => Err((span, "cannot use inline assembly in const fn".into())),

@@ -806,9 +806,9 @@ pub struct TyQualified {
 pub struct LintPassByHand;
 
 #[derive(LintDiagnostic)]
-#[diag(lint_non_existant_doc_keyword)]
+#[diag(lint_non_existent_doc_keyword)]
 #[help]
-pub struct NonExistantDocKeyword {
+pub struct NonExistentDocKeyword {
     pub keyword: Symbol,
 }
 
@@ -875,7 +875,7 @@ impl AddToDiagnostic for NonBindingLetSub {
 // levels.rs
 #[derive(LintDiagnostic)]
 #[diag(lint_overruled_attribute)]
-pub struct OverruledAtributeLint<'a> {
+pub struct OverruledAttributeLint<'a> {
     #[label]
     pub overruled: Span,
     pub lint_level: &'a str,
@@ -947,7 +947,7 @@ pub struct CStringPtr {
 
 // multiple_supertrait_upcastable.rs
 #[derive(LintDiagnostic)]
-#[diag(lint_multple_supertrait_upcastable)]
+#[diag(lint_multiple_supertrait_upcastable)]
 pub struct MultipleSupertraitUpcastable {
     pub ident: Ident,
 }
@@ -1210,11 +1210,33 @@ impl<'a> DecorateLint<'a, ()> for DropGlue<'_> {
 #[diag(lint_range_endpoint_out_of_range)]
 pub struct RangeEndpointOutOfRange<'a> {
     pub ty: &'a str,
-    #[suggestion(code = "{start}..={literal}{suffix}", applicability = "machine-applicable")]
-    pub suggestion: Span,
-    pub start: String,
-    pub literal: u128,
-    pub suffix: &'a str,
+    #[subdiagnostic]
+    pub sub: UseInclusiveRange<'a>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum UseInclusiveRange<'a> {
+    #[suggestion(
+        lint_range_use_inclusive_range,
+        code = "{start}..={literal}{suffix}",
+        applicability = "machine-applicable"
+    )]
+    WithoutParen {
+        #[primary_span]
+        sugg: Span,
+        start: String,
+        literal: u128,
+        suffix: &'a str,
+    },
+    #[multipart_suggestion(lint_range_use_inclusive_range, applicability = "machine-applicable")]
+    WithParen {
+        #[suggestion_part(code = "=")]
+        eq_sugg: Span,
+        #[suggestion_part(code = "{literal}{suffix}")]
+        lit_sugg: Span,
+        literal: u128,
+        suffix: &'a str,
+    },
 }
 
 #[derive(LintDiagnostic)]
@@ -1390,7 +1412,7 @@ pub struct UnusedOp<'a> {
     pub op: &'a str,
     #[label]
     pub label: Span,
-    #[suggestion(style = "verbose", code = "let _ = ", applicability = "machine-applicable")]
+    #[suggestion(style = "verbose", code = "let _ = ", applicability = "maybe-incorrect")]
     pub suggestion: Span,
 }
 
@@ -1400,7 +1422,7 @@ pub struct UnusedResult<'a> {
     pub ty: Ty<'a>,
 }
 
-// FIXME(davidtwco): this isn't properly translatable becauses of the
+// FIXME(davidtwco): this isn't properly translatable because of the
 // pre/post strings
 #[derive(LintDiagnostic)]
 #[diag(lint_unused_closure)]
@@ -1411,7 +1433,7 @@ pub struct UnusedClosure<'a> {
     pub post: &'a str,
 }
 
-// FIXME(davidtwco): this isn't properly translatable becauses of the
+// FIXME(davidtwco): this isn't properly translatable because of the
 // pre/post strings
 #[derive(LintDiagnostic)]
 #[diag(lint_unused_generator)]
@@ -1422,7 +1444,7 @@ pub struct UnusedGenerator<'a> {
     pub post: &'a str,
 }
 
-// FIXME(davidtwco): this isn't properly translatable becauses of the pre/post
+// FIXME(davidtwco): this isn't properly translatable because of the pre/post
 // strings
 pub struct UnusedDef<'a, 'b> {
     pub pre: &'a str,
@@ -1434,17 +1456,15 @@ pub struct UnusedDef<'a, 'b> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum UnusedDefSuggestion {
-    #[suggestion(
-        lint_suggestion,
-        style = "verbose",
-        code = "let _ = ",
-        applicability = "machine-applicable"
-    )]
-    Default {
-        #[primary_span]
-        span: Span,
-    },
+#[suggestion(
+    lint_suggestion,
+    style = "verbose",
+    code = "let _ = ",
+    applicability = "maybe-incorrect"
+)]
+pub struct UnusedDefSuggestion {
+    #[primary_span]
+    pub span: Span,
 }
 
 // Needed because of def_path_str

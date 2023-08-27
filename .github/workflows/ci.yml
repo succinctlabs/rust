@@ -29,6 +29,7 @@ jobs:
         uses: risc0/actions-rs-toolchain@v1
         with:
             toolchain: stable
+      - uses: lukka/get-cmake@v3.27.4
 
       - name: Check out risc0/rust
         uses: actions/checkout@v3

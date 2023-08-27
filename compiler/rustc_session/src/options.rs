@@ -4,6 +4,7 @@ use crate::early_error;
 use crate::lint;
 use crate::search_paths::SearchPath;
 use crate::utils::NativeLib;
+use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::{LanguageIdentifier, TerminalUrl};
 use rustc_target::spec::{CodeModel, LinkerFlavorCli, MergeFunctions, PanicStrategy, SanitizerSet};
 use rustc_target::spec::{
@@ -365,6 +366,7 @@ mod desc {
     pub const parse_number: &str = "a number";
     pub const parse_opt_number: &str = parse_number;
     pub const parse_threads: &str = parse_number;
+    pub const parse_time_passes_format: &str = "`text` (default) or `json`";
     pub const parse_passes: &str = "a space-separated list of passes, or `all`";
     pub const parse_panic_strategy: &str = "either `unwind` or `abort`";
     pub const parse_opt_panic_strategy: &str = parse_panic_strategy;
@@ -375,6 +377,7 @@ mod desc {
     pub const parse_cfguard: &str =
         "either a boolean (`yes`, `no`, `on`, `off`, etc), `checks`, or `nochecks`";
     pub const parse_cfprotection: &str = "`none`|`no`|`n` (default), `branch`, `return`, or `full`|`yes`|`y` (equivalent to `branch` and `return`)";
+    pub const parse_debuginfo: &str = "either an integer (0, 1, 2), `none`, `line-directives-only`, `line-tables-only`, `limited`, or `full`";
     pub const parse_strip: &str = "either `none`, `debuginfo`, or `symbols`";
     pub const parse_linker_flavor: &str = ::rustc_target::spec::LinkerFlavorCli::one_of();
     pub const parse_optimization_fuel: &str = "crate=integer";
@@ -765,6 +768,18 @@ mod parse {
         true
     }
 
+    pub(crate) fn parse_debuginfo(slot: &mut DebugInfo, v: Option<&str>) -> bool {
+        match v {
+            Some("0") | Some("none") => *slot = DebugInfo::None,
+            Some("line-directives-only") => *slot = DebugInfo::LineDirectivesOnly,
+            Some("line-tables-only") => *slot = DebugInfo::LineTablesOnly,
+            Some("1") | Some("limited") => *slot = DebugInfo::Limited,
+            Some("2") | Some("full") => *slot = DebugInfo::Full,
+            _ => return false,
+        }
+        true
+    }
+
     pub(crate) fn parse_linker_flavor(slot: &mut Option<LinkerFlavorCli>, v: Option<&str>) -> bool {
         match v.and_then(LinkerFlavorCli::from_str) {
             Some(lf) => *slot = Some(lf),
@@ -827,6 +842,21 @@ mod parse {
             _ => return false,
         });
         true
+    }
+
+    pub(crate) fn parse_time_passes_format(slot: &mut TimePassesFormat, v: Option<&str>) -> bool {
+        match v {
+            None => true,
+            Some("json") => {
+                *slot = TimePassesFormat::Json;
+                true
+            }
+            Some("text") => {
+                *slot = TimePassesFormat::Text;
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     pub(crate) fn parse_dump_mono_stats(slot: &mut DumpMonoStatsFormat, v: Option<&str>) -> bool {
@@ -894,7 +924,7 @@ mod parse {
         let mut seen_instruction_threshold = false;
         let mut seen_skip_entry = false;
         let mut seen_skip_exit = false;
-        for option in v.into_iter().map(|v| v.split(',')).flatten() {
+        for option in v.into_iter().flat_map(|v| v.split(',')) {
             match option {
                 "always" if !seen_always && !seen_never => {
                     options.always = true;
@@ -1200,9 +1230,9 @@ options! {
         "use Windows Control Flow Guard (default: no)"),
     debug_assertions: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "explicitly enable the `cfg(debug_assertions)` directive"),
-    debuginfo: usize = (0, parse_number, [TRACKED],
-        "debug info emission level (0 = no debug info, 1 = line tables only, \
-        2 = full debug info with variable and type information; default: 0)"),
+    debuginfo: DebugInfo = (DebugInfo::None, parse_debuginfo, [TRACKED],
+        "debug info emission level (0-2, none, line-directives-only, \
+        line-tables-only, limited, or full; default: 0)"),
     default_linker_libraries: bool = (false, parse_bool, [UNTRACKED],
         "allow the linker to link its default libraries (default: no)"),
     embed_bitcode: bool = (true, parse_bool, [TRACKED],
@@ -1421,6 +1451,9 @@ options! {
     #[rustc_lint_opt_deny_field_access("use `Session::fewer_names` instead of this field")]
     fewer_names: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR) \
+        (default: no)"),
+    flatten_format_args: bool = (false, parse_bool, [TRACKED],
+        "flatten nested format_args!() and literals into a simplified format_args!() call \
         (default: no)"),
     force_unstable_if_unmarked: bool = (false, parse_bool, [TRACKED],
         "force all crates to be `rustc_private` unstable (default: no)"),
@@ -1706,6 +1739,8 @@ options! {
         "measure time of each LLVM pass (default: no)"),
     time_passes: bool = (false, parse_bool, [UNTRACKED],
         "measure time of each rustc pass (default: no)"),
+    time_passes_format: TimePassesFormat = (TimePassesFormat::Text, parse_time_passes_format, [UNTRACKED],
+        "the format to use for -Z time-passes (`text` (default) or `json`)"),
     tiny_const_eval_limit: bool = (false, parse_bool, [TRACKED],
         "sets a tiny, non-configurable limit for const eval; useful for compiler tests"),
     #[rustc_lint_opt_deny_field_access("use `Session::tls_model` instead of this field")]

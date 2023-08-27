@@ -1,13 +1,14 @@
 use crate::hir::{ModuleItems, Owner};
-use crate::ty::{DefIdTree, TyCtxt};
+use crate::query::LocalCrate;
+use crate::ty::TyCtxt;
 use rustc_ast as ast;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{par_for_each_in, Send, Sync};
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
-use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
+use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
+use rustc_hir::definitions::{DefKey, DefPath, DefPathData, DefPathHash};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::*;
 use rustc_index::vec::Idx;
@@ -73,18 +74,17 @@ impl<'hir> Iterator for ParentHirIterator<'hir> {
         if self.current_id == CRATE_HIR_ID {
             return None;
         }
-        loop {
-            // There are nodes that do not have entries, so we need to skip them.
-            let parent_id = self.map.parent_id(self.current_id);
 
-            if parent_id == self.current_id {
-                self.current_id = CRATE_HIR_ID;
-                return None;
-            }
+        // There are nodes that do not have entries, so we need to skip them.
+        let parent_id = self.map.parent_id(self.current_id);
 
-            self.current_id = parent_id;
-            return Some(parent_id);
+        if parent_id == self.current_id {
+            self.current_id = CRATE_HIR_ID;
+            return None;
         }
+
+        self.current_id = parent_id;
+        return Some(parent_id);
     }
 }
 
@@ -179,7 +179,19 @@ impl<'hir> Map<'hir> {
     /// Do not call this function directly. The query should be called.
     pub(super) fn opt_def_kind(self, local_def_id: LocalDefId) -> Option<DefKind> {
         let hir_id = self.local_def_id_to_hir_id(local_def_id);
-        let def_kind = match self.find(hir_id)? {
+        let node = match self.find(hir_id) {
+            Some(node) => node,
+            None => match self.def_key(local_def_id).disambiguated_data.data {
+                // FIXME: Some anonymous constants do not have corresponding HIR nodes,
+                // so many local queries will panic on their def ids. `None` is currently
+                // returned here instead of `DefKind::{Anon,Inline}Const` to avoid such panics.
+                // Ideally all def ids should have `DefKind`s, we need to create the missing
+                // HIR nodes or feed relevant query results to achieve that.
+                DefPathData::AnonConst => return None,
+                _ => bug!("no HIR node for def id {local_def_id:?}"),
+            },
+        };
+        let def_kind = match node {
             Node::Item(item) => match item.kind {
                 ItemKind::Static(_, mt, _) => DefKind::Static(mt),
                 ItemKind::Const(..) => DefKind::Const,
@@ -187,7 +199,7 @@ impl<'hir> Map<'hir> {
                 ItemKind::Macro(_, macro_kind) => DefKind::Macro(macro_kind),
                 ItemKind::Mod(..) => DefKind::Mod,
                 ItemKind::OpaqueTy(ref opaque) => {
-                    if opaque.in_trait {
+                    if opaque.in_trait && !self.tcx.lower_impl_trait_in_trait_to_assoc_ty() {
                         DefKind::ImplTraitPlaceholder
                     } else {
                         DefKind::OpaqueTy
@@ -266,7 +278,10 @@ impl<'hir> Map<'hir> {
             | Node::Param(_)
             | Node::Arm(_)
             | Node::Lifetime(_)
-            | Node::Block(_) => return None,
+            | Node::Block(_) => span_bug!(
+                self.span(hir_id),
+                "unexpected node with def id {local_def_id:?}: {node:?}"
+            ),
         };
         Some(def_kind)
     }
@@ -316,7 +331,7 @@ impl<'hir> Map<'hir> {
     /// Retrieves the `Node` corresponding to `id`, returning `None` if cannot be found.
     #[inline]
     pub fn find_by_def_id(self, id: LocalDefId) -> Option<Node<'hir>> {
-        self.find(self.local_def_id_to_hir_id(id))
+        self.find(self.tcx.opt_local_def_id_to_hir_id(id)?)
     }
 
     /// Retrieves the `Node` corresponding to `id`, panicking if it cannot be found.
@@ -333,7 +348,7 @@ impl<'hir> Map<'hir> {
     }
 
     pub fn get_if_local(self, id: DefId) -> Option<Node<'hir>> {
-        id.as_local().and_then(|id| self.find(self.local_def_id_to_hir_id(id)))
+        id.as_local().and_then(|id| self.find(self.tcx.opt_local_def_id_to_hir_id(id)?))
     }
 
     pub fn get_generics(self, id: LocalDefId) -> Option<&'hir Generics<'hir>> {
@@ -1131,10 +1146,9 @@ impl<'hir> intravisit::Map<'hir> for Map<'hir> {
     }
 }
 
-pub(super) fn crate_hash(tcx: TyCtxt<'_>, crate_num: CrateNum) -> Svh {
-    debug_assert_eq!(crate_num, LOCAL_CRATE);
+pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
     let krate = tcx.hir_crate(());
-    let hir_body_hash = krate.hir_hash;
+    let hir_body_hash = krate.opt_hir_hash.expect("HIR hash missing while computing crate hash");
 
     let upstream_crates = upstream_crates(tcx);
 

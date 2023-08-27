@@ -5,12 +5,14 @@
 //! candidates. See the [rustc dev guide] for more details.
 //!
 //! [rustc dev guide]:https://rustc-dev-guide.rust-lang.org/traits/resolution.html#candidate-assembly
+
+use hir::def_id::DefId;
 use hir::LangItem;
 use rustc_hir as hir;
 use rustc_infer::traits::ObligationCause;
 use rustc_infer::traits::{Obligation, SelectionError, TraitObligation};
+use rustc_middle::ty::fast_reject::{DeepRejectCtxt, TreatParams, TreatProjections};
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
-use rustc_target::spec::abi::Abi;
 
 use crate::traits;
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
@@ -95,7 +97,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             } else if lang_items.tuple_trait() == Some(def_id) {
                 self.assemble_candidate_for_tuple(obligation, &mut candidates);
             } else if lang_items.pointer_like() == Some(def_id) {
-                self.assemble_candidate_for_ptr_sized(obligation, &mut candidates);
+                self.assemble_candidate_for_pointer_like(obligation, &mut candidates);
+            } else if lang_items.fn_ptr_trait() == Some(def_id) {
+                self.assemble_candidates_for_fn_ptr_trait(obligation, &mut candidates);
             } else {
                 if lang_items.clone_trait() == Some(def_id) {
                     // Same builtin conditions as `Copy`, i.e., every type which has builtin support
@@ -290,6 +294,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return;
         }
 
+        // Keep this function in sync with extract_tupled_inputs_and_output_from_callable
+        // until the old solver (and thus this function) is removed.
+
         // Okay to skip binder because what we are inspecting doesn't involve bound regions.
         let self_ty = obligation.self_ty().skip_binder();
         match *self_ty.kind() {
@@ -298,31 +305,19 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 candidates.ambiguous = true; // Could wind up being a fn() type.
             }
             // Provide an impl, but only for suitable `fn` pointers.
-            ty::FnPtr(_) => {
-                if let ty::FnSig {
-                    unsafety: hir::Unsafety::Normal,
-                    abi: Abi::Rust,
-                    c_variadic: false,
-                    ..
-                } = self_ty.fn_sig(self.tcx()).skip_binder()
-                {
+            ty::FnPtr(sig) => {
+                if sig.is_fn_trait_compatible() {
                     candidates.vec.push(FnPointerCandidate { is_const: false });
                 }
             }
             // Provide an impl for suitable functions, rejecting `#[target_feature]` functions (RFC 2396).
             ty::FnDef(def_id, _) => {
-                if let ty::FnSig {
-                    unsafety: hir::Unsafety::Normal,
-                    abi: Abi::Rust,
-                    c_variadic: false,
-                    ..
-                } = self_ty.fn_sig(self.tcx()).skip_binder()
+                if self.tcx().fn_sig(def_id).skip_binder().is_fn_trait_compatible()
+                    && self.tcx().codegen_fn_attrs(def_id).target_features.is_empty()
                 {
-                    if self.tcx().codegen_fn_attrs(def_id).target_features.is_empty() {
-                        candidates
-                            .vec
-                            .push(FnPointerCandidate { is_const: self.tcx().is_const_fn(def_id) });
-                    }
+                    candidates
+                        .vec
+                        .push(FnPointerCandidate { is_const: self.tcx().is_const_fn(def_id) });
                 }
             }
             _ => {}
@@ -330,13 +325,12 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
     }
 
     /// Searches for impls that might apply to `obligation`.
+    #[instrument(level = "debug", skip(self, candidates))]
     fn assemble_candidates_from_impls(
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
-        debug!(?obligation, "assemble_candidates_from_impls");
-
         // Essentially any user-written impl will match with an error type,
         // so creating `ImplCandidates` isn't useful. However, we might
         // end up finding a candidate elsewhere (e.g. a `BuiltinCandidate` for `Sized`)
@@ -350,6 +344,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return;
         }
 
+        let drcx = DeepRejectCtxt { treat_obligation_params: TreatParams::ForLookup };
+        let obligation_substs = obligation.predicate.skip_binder().trait_ref.substs;
         self.tcx().for_each_relevant_impl(
             obligation.predicate.def_id(),
             obligation.predicate.skip_binder().trait_ref.self_ty(),
@@ -358,7 +354,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 // consider a "quick reject". This avoids creating more types
                 // and so forth that we need to.
                 let impl_trait_ref = self.tcx().impl_trait_ref(impl_def_id).unwrap();
-                if self.fast_reject_trait_refs(obligation, &impl_trait_ref.0) {
+                if !drcx.substs_refs_may_unify(obligation_substs, impl_trait_ref.0.substs) {
+                    return;
+                }
+                if self.reject_fn_ptr_impls(
+                    impl_def_id,
+                    obligation,
+                    impl_trait_ref.skip_binder().self_ty(),
+                ) {
                     return;
                 }
 
@@ -369,6 +372,99 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 });
             },
         );
+    }
+
+    /// The various `impl<T: FnPtr> Trait for T` in libcore are more like builtin impls for all function items
+    /// and function pointers and less like blanket impls. Rejecting them when they can't possibly apply (because
+    /// the obligation's self-type does not implement `FnPtr`) avoids reporting that the self type does not implement
+    /// `FnPtr`, when we wanted to report that it doesn't implement `Trait`.
+    #[instrument(level = "trace", skip(self), ret)]
+    fn reject_fn_ptr_impls(
+        &self,
+        impl_def_id: DefId,
+        obligation: &TraitObligation<'tcx>,
+        impl_self_ty: Ty<'tcx>,
+    ) -> bool {
+        // Let `impl<T: FnPtr> Trait for Vec<T>` go through the normal rejection path.
+        if !matches!(impl_self_ty.kind(), ty::Param(..)) {
+            return false;
+        }
+        let Some(fn_ptr_trait) = self.tcx().lang_items().fn_ptr_trait() else {
+            return false;
+        };
+
+        for &(predicate, _) in self.tcx().predicates_of(impl_def_id).predicates {
+            let ty::PredicateKind::Clause(ty::Clause::Trait(pred))
+                = predicate.kind().skip_binder() else { continue };
+            if fn_ptr_trait != pred.trait_ref.def_id {
+                continue;
+            }
+            trace!(?pred);
+            // Not the bound we're looking for
+            if pred.self_ty() != impl_self_ty {
+                continue;
+            }
+
+            match obligation.self_ty().skip_binder().kind() {
+                // Fast path to avoid evaluating an obligation that trivially holds.
+                // There may be more bounds, but these are checked by the regular path.
+                ty::FnPtr(..) => return false,
+                // These may potentially implement `FnPtr`
+                ty::Placeholder(..)
+                | ty::Dynamic(_, _, _)
+                | ty::Alias(_, _)
+                | ty::Infer(_)
+                | ty::Param(..) => {}
+
+                ty::Bound(_, _) => span_bug!(
+                    obligation.cause.span(),
+                    "cannot have escaping bound var in self type of {obligation:#?}"
+                ),
+                // These can't possibly implement `FnPtr` as they are concrete types
+                // and not `FnPtr`
+                ty::Bool
+                | ty::Char
+                | ty::Int(_)
+                | ty::Uint(_)
+                | ty::Float(_)
+                | ty::Adt(_, _)
+                | ty::Foreign(_)
+                | ty::Str
+                | ty::Array(_, _)
+                | ty::Slice(_)
+                | ty::RawPtr(_)
+                | ty::Ref(_, _, _)
+                | ty::Closure(_, _)
+                | ty::Generator(_, _, _)
+                | ty::GeneratorWitness(_)
+                | ty::GeneratorWitnessMIR(_, _)
+                | ty::Never
+                | ty::Tuple(_)
+                | ty::Error(_) => return true,
+                // FIXME: Function definitions could actually implement `FnPtr` by
+                // casting the ZST function def to a function pointer.
+                ty::FnDef(_, _) => return true,
+            }
+
+            // Generic params can implement `FnPtr` if the predicate
+            // holds within its own environment.
+            let obligation = Obligation::new(
+                self.tcx(),
+                obligation.cause.clone(),
+                obligation.param_env,
+                self.tcx().mk_predicate(obligation.predicate.map_bound(|mut pred| {
+                    pred.trait_ref =
+                        self.tcx().mk_trait_ref(fn_ptr_trait, [pred.trait_ref.self_ty()]);
+                    ty::PredicateKind::Clause(ty::Clause::Trait(pred))
+                })),
+            );
+            if let Ok(r) = self.infcx.evaluate_obligation(&obligation) {
+                if !r.may_apply() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn assemble_candidates_from_auto_impls(
@@ -783,6 +879,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let relevant_impl = self.tcx().find_map_relevant_impl(
                     self.tcx().require_lang_item(LangItem::Drop, None),
                     obligation.predicate.skip_binder().trait_ref.self_ty(),
+                    TreatProjections::ForLookup,
                     Some,
                 );
 
@@ -845,15 +942,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
     }
 
-    fn assemble_candidate_for_ptr_sized(
+    fn assemble_candidate_for_pointer_like(
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
         // The regions of a type don't affect the size of the type
-        let self_ty = self
-            .tcx()
-            .erase_regions(self.tcx().erase_late_bound_regions(obligation.predicate.self_ty()));
+        let tcx = self.tcx();
+        let self_ty =
+            tcx.erase_regions(tcx.erase_late_bound_regions(obligation.predicate.self_ty()));
 
         // But if there are inference variables, we have to wait until it's resolved.
         if self_ty.has_non_region_infer() {
@@ -861,13 +958,55 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return;
         }
 
-        let usize_layout =
-            self.tcx().layout_of(ty::ParamEnv::empty().and(self.tcx().types.usize)).unwrap().layout;
-        if let Ok(layout) = self.tcx().layout_of(obligation.param_env.and(self_ty))
-            && layout.layout.size() == usize_layout.size()
-            && layout.layout.align().abi == usize_layout.align().abi
+        if let Ok(layout) = tcx.layout_of(obligation.param_env.and(self_ty))
+            && layout.layout.is_pointer_like(&tcx.data_layout)
         {
             candidates.vec.push(BuiltinCandidate { has_nested: false });
+        }
+    }
+
+    fn assemble_candidates_for_fn_ptr_trait(
+        &mut self,
+        obligation: &TraitObligation<'tcx>,
+        candidates: &mut SelectionCandidateSet<'tcx>,
+    ) {
+        let self_ty = self.infcx.shallow_resolve(obligation.self_ty());
+        match self_ty.skip_binder().kind() {
+            ty::FnPtr(_) => candidates.vec.push(BuiltinCandidate { has_nested: false }),
+            ty::Bool
+            | ty::Char
+            | ty::Int(_)
+            | ty::Uint(_)
+            | ty::Float(_)
+            | ty::Adt(..)
+            | ty::Foreign(..)
+            | ty::Str
+            | ty::Array(..)
+            | ty::Slice(_)
+            | ty::RawPtr(_)
+            | ty::Ref(..)
+            | ty::FnDef(..)
+            | ty::Placeholder(..)
+            | ty::Dynamic(..)
+            | ty::Closure(..)
+            | ty::Generator(..)
+            | ty::GeneratorWitness(..)
+            | ty::GeneratorWitnessMIR(..)
+            | ty::Never
+            | ty::Tuple(..)
+            | ty::Alias(..)
+            | ty::Param(..)
+            | ty::Bound(..)
+            | ty::Error(_)
+            | ty::Infer(
+                ty::InferTy::IntVar(_)
+                | ty::InferTy::FloatVar(_)
+                | ty::InferTy::FreshIntTy(_)
+                | ty::InferTy::FreshFloatTy(_),
+            ) => {}
+            ty::Infer(ty::InferTy::TyVar(_) | ty::InferTy::FreshTy(_)) => {
+                candidates.ambiguous = true;
+            }
         }
     }
 }

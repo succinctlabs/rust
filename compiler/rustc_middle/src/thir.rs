@@ -17,14 +17,14 @@ use rustc_index::newtype_index;
 use rustc_index::vec::IndexVec;
 use rustc_middle::middle::region;
 use rustc_middle::mir::interpret::AllocId;
-use rustc_middle::mir::{self, BinOp, BorrowKind, FakeReadCause, Field, Mutability, UnOp};
+use rustc_middle::mir::{self, BinOp, BorrowKind, FakeReadCause, Mutability, UnOp};
 use rustc_middle::ty::adjustment::PointerCast;
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, AdtDef, FnSig, Ty, UpvarSubsts};
 use rustc_middle::ty::{CanonicalUserType, CanonicalUserTypeAnnotation};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{sym, Span, Symbol, DUMMY_SP};
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use std::fmt;
 use std::ops::Index;
@@ -227,6 +227,9 @@ pub enum StmtKind<'tcx> {
 
         /// The lint level for this `let` statement.
         lint_level: LintLevel,
+
+        /// Span of the `let <PAT> = <INIT>` part.
+        span: Span,
     },
 }
 
@@ -366,7 +369,7 @@ pub enum ExprKind<'tcx> {
         /// Variant containing the field.
         variant_index: VariantIdx,
         /// This can be a named (`.foo`) or unnamed (`.0`) field.
-        name: Field,
+        name: FieldIdx,
     },
     /// A *non-overloaded* indexing operation.
     Index {
@@ -491,7 +494,7 @@ pub enum ExprKind<'tcx> {
 /// This is used in struct constructors.
 #[derive(Clone, Debug, HashStable)]
 pub struct FieldExpr {
-    pub name: Field,
+    pub name: FieldIdx,
     pub expr: ExprId,
 }
 
@@ -570,7 +573,7 @@ pub enum BindingMode {
 
 #[derive(Clone, Debug, HashStable)]
 pub struct FieldPat<'tcx> {
-    pub field: Field,
+    pub field: FieldIdx,
     pub pattern: Box<Pat<'tcx>>,
 }
 
@@ -593,6 +596,55 @@ impl<'tcx> Pat<'tcx> {
             }
             _ => None,
         }
+    }
+
+    /// Call `f` on every "binding" in a pattern, e.g., on `a` in
+    /// `match foo() { Some(a) => (), None => () }`
+    pub fn each_binding(&self, mut f: impl FnMut(Symbol, BindingMode, Ty<'tcx>, Span)) {
+        self.walk_always(|p| {
+            if let PatKind::Binding { name, mode, ty, .. } = p.kind {
+                f(name, mode, ty, p.span);
+            }
+        });
+    }
+
+    /// Walk the pattern in left-to-right order.
+    ///
+    /// If `it(pat)` returns `false`, the children are not visited.
+    pub fn walk(&self, mut it: impl FnMut(&Pat<'tcx>) -> bool) {
+        self.walk_(&mut it)
+    }
+
+    fn walk_(&self, it: &mut impl FnMut(&Pat<'tcx>) -> bool) {
+        if !it(self) {
+            return;
+        }
+
+        use PatKind::*;
+        match &self.kind {
+            Wild | Range(..) | Binding { subpattern: None, .. } | Constant { .. } => {}
+            AscribeUserType { subpattern, .. }
+            | Binding { subpattern: Some(subpattern), .. }
+            | Deref { subpattern } => subpattern.walk_(it),
+            Leaf { subpatterns } | Variant { subpatterns, .. } => {
+                subpatterns.iter().for_each(|field| field.pattern.walk_(it))
+            }
+            Or { pats } => pats.iter().for_each(|p| p.walk_(it)),
+            Array { box ref prefix, ref slice, box ref suffix }
+            | Slice { box ref prefix, ref slice, box ref suffix } => {
+                prefix.iter().chain(slice.iter()).chain(suffix.iter()).for_each(|p| p.walk_(it))
+            }
+        }
+    }
+
+    /// Walk the pattern in left-to-right order.
+    ///
+    /// If you always want to recurse, prefer this method over `walk`.
+    pub fn walk_always(&self, mut it: impl FnMut(&Pat<'tcx>)) {
+        self.walk(|p| {
+            it(p);
+            true
+        })
     }
 }
 
@@ -784,7 +836,7 @@ impl<'tcx> fmt::Display for Pat<'tcx> {
                             if let PatKind::Wild = p.pattern.kind {
                                 continue;
                             }
-                            let name = variant.fields[p.field.index()].name;
+                            let name = variant.fields[p.field].name;
                             write!(f, "{}{}: {}", start_or_comma(), name, p.pattern)?;
                             printed += 1;
                         }
@@ -879,7 +931,7 @@ mod size_asserts {
     static_assert_size!(ExprKind<'_>, 40);
     static_assert_size!(Pat<'_>, 72);
     static_assert_size!(PatKind<'_>, 56);
-    static_assert_size!(Stmt<'_>, 48);
-    static_assert_size!(StmtKind<'_>, 40);
+    static_assert_size!(Stmt<'_>, 56);
+    static_assert_size!(StmtKind<'_>, 48);
     // tidy-alphabetical-end
 }

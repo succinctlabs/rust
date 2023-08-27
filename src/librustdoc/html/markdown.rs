@@ -36,7 +36,6 @@ use rustc_span::{Span, Symbol};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::default::Default;
 use std::fmt::Write;
 use std::ops::{ControlFlow, Range};
 use std::str;
@@ -556,7 +555,15 @@ fn check_if_allowed_tag(t: &Tag<'_>) -> bool {
 }
 
 fn is_forbidden_tag(t: &Tag<'_>) -> bool {
-    matches!(t, Tag::CodeBlock(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell)
+    matches!(
+        t,
+        Tag::CodeBlock(_)
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::FootnoteDefinition(_)
+    )
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SummaryLine<'a, I> {
@@ -588,6 +595,10 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SummaryLine<'a, I> {
                     self.depth -= 1;
                     is_start = false;
                     check_if_allowed_tag(c)
+                }
+                Event::FootnoteReference(_) => {
+                    self.skipped_tags += 1;
+                    false
                 }
                 _ => true,
             };

@@ -1,5 +1,5 @@
 use crate::errors::{
-    AmbigousImpl, AmbigousReturn, AnnotationRequired, InferenceBadError, NeedTypeInfoInGenerator,
+    AmbigousReturn, AmbiguousImpl, AnnotationRequired, InferenceBadError, NeedTypeInfoInGenerator,
     SourceKindMultiSuggestion, SourceKindSubdiag,
 };
 use crate::infer::error_reporting::TypeErrCtxt;
@@ -10,14 +10,14 @@ use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed, IntoDiagnosticArg};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def::{CtorOf, DefKind, Namespace};
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Body, Closure, Expr, ExprKind, FnRetTy, HirId, Local, LocalSource};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow};
 use rustc_middle::ty::print::{FmtPrinter, PrettyPrinter, Print, Printer};
-use rustc_middle::ty::{self, DefIdTree, InferConst};
+use rustc_middle::ty::{self, InferConst};
 use rustc_middle::ty::{GenericArg, GenericArgKind, SubstsRef};
 use rustc_middle::ty::{IsSuggestable, Ty, TyCtxt, TypeckResults};
 use rustc_span::symbol::{kw, sym, Ident};
@@ -358,7 +358,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 bad_label,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0283 => AmbigousImpl {
+            TypeAnnotationNeeded::E0283 => AmbiguousImpl {
                 span,
                 source_kind,
                 source_name,
@@ -386,7 +386,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
     #[instrument(level = "debug", skip(self, error_code))]
     pub fn emit_inference_failure_err(
         &self,
-        body_id: Option<hir::BodyId>,
+        body_def_id: LocalDefId,
         failure_span: Span,
         arg: GenericArg<'tcx>,
         error_code: TypeAnnotationNeeded,
@@ -403,8 +403,10 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         };
 
         let mut local_visitor = FindInferSourceVisitor::new(&self, typeck_results, arg);
-        if let Some(body_id) = body_id {
-            let expr = self.tcx.hir().expect_expr(body_id.hir_id);
+        if let Some(body_id) = self.tcx.hir().maybe_body_owned_by(
+            self.tcx.typeck_root_def_id(body_def_id.to_def_id()).expect_local(),
+        ) {
+            let expr = self.tcx.hir().body(body_id).value;
             local_visitor.visit_expr(expr);
         }
 
@@ -561,7 +563,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 bad_label: None,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0283 => AmbigousImpl {
+            TypeAnnotationNeeded::E0283 => AmbiguousImpl {
                 span,
                 source_kind,
                 source_name: &name,
@@ -1189,11 +1191,14 @@ impl<'a, 'tcx> Visitor<'tcx> for FindInferSourceVisitor<'a, 'tcx> {
                 have_turbofish,
             } = args;
             let generics = tcx.generics_of(generics_def_id);
-            if let Some(argument_index) = generics
+            if let Some(mut argument_index) = generics
                 .own_substs(substs)
                 .iter()
                 .position(|&arg| self.generic_arg_contains_target(arg))
             {
+                if generics.parent.is_none() && generics.has_self {
+                    argument_index += 1;
+                }
                 let substs = self.infcx.resolve_vars_if_possible(substs);
                 let generic_args = &generics.own_substs_no_defaults(tcx, substs)
                     [generics.own_counts().lifetimes..];

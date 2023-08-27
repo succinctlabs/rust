@@ -73,8 +73,8 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
     /// Cached unreachable block
     unreachable_block: Option<Bx::BasicBlock>,
 
-    /// Cached double unwind guarding block
-    double_unwind_guard: Option<Bx::BasicBlock>,
+    /// Cached terminate upon unwinding block
+    terminate_block: Option<Bx::BasicBlock>,
 
     /// The location where each MIR arg/var/tmp/ret is stored. This is
     /// usually an `PlaceRef` representing an alloca, but not always:
@@ -123,7 +123,10 @@ enum LocalRef<'tcx, V> {
     /// Every time it is initialized, we have to reallocate the place
     /// and update the fat pointer. That's the reason why it is indirect.
     UnsizedPlace(PlaceRef<'tcx, V>),
-    Operand(Option<OperandRef<'tcx, V>>),
+    /// The backend [`OperandValue`] has already been generated.
+    Operand(OperandRef<'tcx, V>),
+    /// Will be a `Self::Operand` once we get to its definition.
+    PendingOperand,
 }
 
 impl<'a, 'tcx, V: CodegenObject> LocalRef<'tcx, V> {
@@ -135,9 +138,9 @@ impl<'a, 'tcx, V: CodegenObject> LocalRef<'tcx, V> {
             // Zero-size temporaries aren't always initialized, which
             // doesn't matter because they don't contain data, but
             // we need something in the operand.
-            LocalRef::Operand(Some(OperandRef::new_zst(bx, layout)))
+            LocalRef::Operand(OperandRef::new_zst(bx, layout))
         } else {
-            LocalRef::Operand(None)
+            LocalRef::PendingOperand
         }
     }
 }
@@ -163,7 +166,9 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let start_llbb = Bx::append_block(cx, llfn, "start");
     let mut start_bx = Bx::build(cx, start_llbb);
 
-    if mir.basic_blocks.iter().any(|bb| bb.is_cleanup) {
+    if mir.basic_blocks.iter().any(|bb| {
+        bb.is_cleanup || matches!(bb.terminator().unwind(), Some(mir::UnwindAction::Terminate))
+    }) {
         start_bx.set_personality_fn(cx.eh_personality());
     }
 
@@ -186,7 +191,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         personality_slot: None,
         cached_llbbs,
         unreachable_block: None,
-        double_unwind_guard: None,
+        terminate_block: None,
         cleanup_kinds,
         landing_pads: IndexVec::from_elem(None, &mir.basic_blocks),
         funclets: IndexVec::from_fn_n(|_| None, mir.basic_blocks.len()),
@@ -257,6 +262,10 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
     // Apply debuginfo to the newly allocated locals.
     fx.debug_introduce_locals(&mut start_bx);
+
+    // The builders will be created separately for each basic block at `codegen_block`.
+    // So drop the builder of `start_llbb` to avoid having two at the same time.
+    drop(start_bx);
 
     // Codegen the body of each block using reverse postorder
     for (bb, _) in traversal::reverse_postorder(&mir) {
@@ -333,7 +342,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 // We don't have to cast or keep the argument in the alloca.
                 // FIXME(eddyb): We should figure out how to use llvm.dbg.value instead
                 // of putting everything in allocas just so we can use llvm.dbg.declare.
-                let local = |op| LocalRef::Operand(Some(op));
+                let local = |op| LocalRef::Operand(op);
                 match arg.mode {
                     PassMode::Ignore => {
                         return local(OperandRef::new_zst(bx, arg.layout));

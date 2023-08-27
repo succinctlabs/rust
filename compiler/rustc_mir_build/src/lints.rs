@@ -3,7 +3,7 @@ use rustc_data_structures::graph::iterate::{
     NodeStatus, TriColorDepthFirstSearch, TriColorVisitor,
 };
 use rustc_hir::def::DefKind;
-use rustc_middle::mir::{BasicBlock, BasicBlocks, Body, Operand, TerminatorKind};
+use rustc_middle::mir::{self, BasicBlock, BasicBlocks, Body, Operand, TerminatorKind};
 use rustc_middle::ty::subst::{GenericArg, InternalSubsts};
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::lint::builtin::UNCONDITIONAL_RECURSION;
@@ -18,7 +18,7 @@ pub(crate) fn check<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         let trait_substs = match tcx.trait_of_item(def_id.to_def_id()) {
             Some(trait_def_id) => {
                 let trait_substs_count = tcx.generics_of(trait_def_id).count();
-                &InternalSubsts::identity_for_item(tcx, def_id.to_def_id())[..trait_substs_count]
+                &InternalSubsts::identity_for_item(tcx, def_id)[..trait_substs_count]
             }
             _ => &[],
         };
@@ -108,7 +108,7 @@ impl<'mir, 'tcx> TriColorVisitor<BasicBlocks<'tcx>> for Search<'mir, 'tcx> {
 
         match self.body[bb].terminator().kind {
             // These terminators return control flow to the caller.
-            TerminatorKind::Abort
+            TerminatorKind::Terminate
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::Resume
             | TerminatorKind::Return
@@ -128,7 +128,6 @@ impl<'mir, 'tcx> TriColorVisitor<BasicBlocks<'tcx>> for Search<'mir, 'tcx> {
             TerminatorKind::Assert { .. }
             | TerminatorKind::Call { .. }
             | TerminatorKind::Drop { .. }
-            | TerminatorKind::DropAndReplace { .. }
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::Goto { .. }
@@ -150,7 +149,9 @@ impl<'mir, 'tcx> TriColorVisitor<BasicBlocks<'tcx>> for Search<'mir, 'tcx> {
 
     fn ignore_edge(&mut self, bb: BasicBlock, target: BasicBlock) -> bool {
         let terminator = self.body[bb].terminator();
-        if terminator.unwind() == Some(&Some(target)) && terminator.successors().count() > 1 {
+        if terminator.unwind() == Some(&mir::UnwindAction::Cleanup(target))
+            && terminator.successors().count() > 1
+        {
             return true;
         }
         // Don't traverse successors of recursive calls or false CFG edges.

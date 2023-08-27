@@ -70,10 +70,10 @@ use rustc_mir_dataflow::impls::{
 };
 use rustc_mir_dataflow::storage::always_storage_live_locals;
 use rustc_mir_dataflow::{self, Analysis};
-use rustc_span::def_id::DefId;
+use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::symbol::sym;
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_target::spec::PanicStrategy;
 use std::{iter, ops};
 
@@ -162,9 +162,10 @@ impl<'tcx> MutVisitor<'tcx> for PinArgVisitor<'tcx> {
                 place,
                 Place {
                     local: SELF_ARG,
-                    projection: self
-                        .tcx()
-                        .mk_place_elems(&[ProjectionElem::Field(Field::new(0), self.ref_gen_ty)]),
+                    projection: self.tcx().mk_place_elems(&[ProjectionElem::Field(
+                        FieldIdx::new(0),
+                        self.ref_gen_ty,
+                    )]),
                 },
                 self.tcx,
             );
@@ -273,7 +274,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             statements.push(Statement {
                 kind: StatementKind::Assign(Box::new((
                     Place::return_place(),
-                    Rvalue::Aggregate(Box::new(kind), vec![]),
+                    Rvalue::Aggregate(Box::new(kind), IndexVec::new()),
                 ))),
                 source_info,
             });
@@ -286,7 +287,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         statements.push(Statement {
             kind: StatementKind::Assign(Box::new((
                 Place::return_place(),
-                Rvalue::Aggregate(Box::new(kind), vec![val]),
+                Rvalue::Aggregate(Box::new(kind), [val].into()),
             ))),
             source_info,
         });
@@ -297,7 +298,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let self_place = Place::from(SELF_ARG);
         let base = self.tcx.mk_place_downcast_unnamed(self_place, variant_index);
         let mut projection = base.projection.to_vec();
-        projection.push(ProjectionElem::Field(Field::new(idx), ty));
+        projection.push(ProjectionElem::Field(FieldIdx::new(idx), ty));
 
         Place { local: base.local, projection: self.tcx.mk_place_elems(&projection) }
     }
@@ -924,13 +925,19 @@ fn compute_layout<'tcx>(
         debug!(?decl);
 
         let ignore_for_traits = if tcx.sess.opts.unstable_opts.drop_tracking_mir {
+            // Do not `assert_crate_local` here, as post-borrowck cleanup may have already cleared
+            // the information. This is alright, since `ignore_for_traits` is only relevant when
+            // this code runs on pre-cleanup MIR, and `ignore_for_traits = false` is the safer
+            // default.
             match decl.local_info {
                 // Do not include raw pointers created from accessing `static` items, as those could
                 // well be re-created by another access to the same static.
-                Some(box LocalInfo::StaticRef { is_thread_local, .. }) => !is_thread_local,
+                ClearCrossCrate::Set(box LocalInfo::StaticRef { is_thread_local, .. }) => {
+                    !is_thread_local
+                }
                 // Fake borrows are only read by fake reads, so do not have any reality in
                 // post-analysis MIR.
-                Some(box LocalInfo::FakeBorrow) => true,
+                ClearCrossCrate::Set(box LocalInfo::FakeBorrow) => true,
                 _ => false,
             }
         } else {
@@ -961,7 +968,7 @@ fn compute_layout<'tcx>(
 
     // Build the generator variant field list.
     // Create a map from local indices to generator struct indices.
-    let mut variant_fields: IndexVec<VariantIdx, IndexVec<Field, GeneratorSavedLocal>> =
+    let mut variant_fields: IndexVec<VariantIdx, IndexVec<FieldIdx, GeneratorSavedLocal>> =
         iter::repeat(IndexVec::new()).take(RESERVED_VARIANTS).collect();
     let mut remap = FxHashMap::default();
     for (suspension_point_idx, live_locals) in live_locals_at_suspension_points.iter().enumerate() {
@@ -1053,7 +1060,12 @@ fn elaborate_generator_drops<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let unwind = if block_data.is_cleanup {
             Unwind::InCleanup
         } else {
-            Unwind::To(unwind.unwrap_or_else(|| elaborator.patch.resume_block()))
+            Unwind::To(match *unwind {
+                UnwindAction::Cleanup(tgt) => tgt,
+                UnwindAction::Continue => elaborator.patch.resume_block(),
+                UnwindAction::Unreachable => elaborator.patch.unreachable_cleanup_block(),
+                UnwindAction::Terminate => elaborator.patch.terminate_block(),
+            })
         };
         elaborate_drop(
             &mut elaborator,
@@ -1140,7 +1152,7 @@ fn insert_panic_block<'tcx>(
         expected: true,
         msg: message,
         target: assert_block,
-        cleanup: None,
+        unwind: UnwindAction::Continue,
     };
 
     let source_info = SourceInfo::outermost(body.span);
@@ -1182,7 +1194,7 @@ fn can_unwind<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
             // These never unwind.
             TerminatorKind::Goto { .. }
             | TerminatorKind::SwitchInt { .. }
-            | TerminatorKind::Abort
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::GeneratorDrop
@@ -1199,7 +1211,6 @@ fn can_unwind<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
 
             // These may unwind.
             TerminatorKind::Drop { .. }
-            | TerminatorKind::DropAndReplace { .. }
             | TerminatorKind::Call { .. }
             | TerminatorKind::InlineAsm { .. }
             | TerminatorKind::Assert { .. } => return true,
@@ -1242,8 +1253,8 @@ fn create_generator_resume_function<'tcx>(
             } else if !block.is_cleanup {
                 // Any terminators that *can* unwind but don't have an unwind target set are also
                 // pointed at our poisoning block (unless they're part of the cleanup path).
-                if let Some(unwind @ None) = block.terminator_mut().unwind_mut() {
-                    *unwind = Some(poison_block);
+                if let Some(unwind @ UnwindAction::Continue) = block.terminator_mut().unwind_mut() {
+                    *unwind = UnwindAction::Cleanup(poison_block);
                 }
             }
         }
@@ -1288,8 +1299,11 @@ fn create_generator_resume_function<'tcx>(
 fn insert_clean_drop(body: &mut Body<'_>) -> BasicBlock {
     let return_block = insert_term_block(body, TerminatorKind::Return);
 
-    let term =
-        TerminatorKind::Drop { place: Place::from(SELF_ARG), target: return_block, unwind: None };
+    let term = TerminatorKind::Drop {
+        place: Place::from(SELF_ARG),
+        target: return_block,
+        unwind: UnwindAction::Continue,
+    };
     let source_info = SourceInfo::outermost(body.span);
 
     // Create a block to destroy an unresumed generators. This can only destroy upvars.
@@ -1381,10 +1395,9 @@ fn create_cases<'tcx>(
 #[instrument(level = "debug", skip(tcx), ret)]
 pub(crate) fn mir_generator_witnesses<'tcx>(
     tcx: TyCtxt<'tcx>,
-    def_id: DefId,
+    def_id: LocalDefId,
 ) -> GeneratorLayout<'tcx> {
     assert!(tcx.sess.opts.unstable_opts.drop_tracking_mir);
-    let def_id = def_id.expect_local();
 
     let (body, _) = tcx.mir_promoted(ty::WithOptConstParam::unknown(def_id));
     let body = body.borrow();
@@ -1543,6 +1556,13 @@ impl<'tcx> MirPass<'tcx> for StateTransform {
         body.arg_count = 2; // self, resume arg
         body.spread_arg = None;
 
+        // The original arguments to the function are no longer arguments, mark them as such.
+        // Otherwise they'll conflict with our new arguments, which although they don't have
+        // argument_index set, will get emitted as unnamed arguments.
+        for var in &mut body.var_debug_info {
+            var.argument_index = None;
+        }
+
         body.generator.as_mut().unwrap().yield_ty = None;
         body.generator.as_mut().unwrap().generator_layout = Some(layout);
 
@@ -1648,6 +1668,7 @@ impl<'tcx> Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
             | StatementKind::StorageDead(_)
             | StatementKind::Retag(..)
             | StatementKind::AscribeUserType(..)
+            | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)
             | StatementKind::ConstEvalCounter
@@ -1664,7 +1685,7 @@ impl<'tcx> Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
                 args,
                 destination,
                 target: Some(_),
-                cleanup: _,
+                unwind: _,
                 from_hir_call: _,
                 fn_span: _,
             } => {
@@ -1687,11 +1708,10 @@ impl<'tcx> Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
             | TerminatorKind::Goto { .. }
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Resume
-            | TerminatorKind::Abort
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::Drop { .. }
-            | TerminatorKind::DropAndReplace { .. }
             | TerminatorKind::Assert { .. }
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::FalseEdge { .. }
@@ -1872,12 +1892,14 @@ fn check_must_not_suspend_def(
     data: SuspendCheckData<'_>,
 ) -> bool {
     if let Some(attr) = tcx.get_attr(def_id, sym::must_not_suspend) {
-        let msg = format!(
-            "{}`{}`{} held across a suspend point, but should not be",
-            data.descr_pre,
-            tcx.def_path_str(def_id),
-            data.descr_post,
-        );
+        let msg = rustc_errors::DelayDm(|| {
+            format!(
+                "{}`{}`{} held across a suspend point, but should not be",
+                data.descr_pre,
+                tcx.def_path_str(def_id),
+                data.descr_post,
+            )
+        });
         tcx.struct_span_lint_hir(
             rustc_session::lint::builtin::MUST_NOT_SUSPEND,
             hir_id,

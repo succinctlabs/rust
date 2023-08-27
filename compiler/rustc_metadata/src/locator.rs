@@ -218,10 +218,11 @@ use crate::rmeta::{rustc_version, MetadataBlob, METADATA_HEADER};
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::memmap::Mmap;
-use rustc_data_structures::owning_ref::OwningRef;
+use rustc_data_structures::owned_slice::slice_owned;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::MetadataRef;
 use rustc_errors::{DiagnosticArgValue, FatalError, IntoDiagnosticArg};
+use rustc_fs_util::try_canonicalize;
 use rustc_session::config::{self, CrateType};
 use rustc_session::cstore::{CrateSource, MetadataLoader};
 use rustc_session::filesearch::FileSearch;
@@ -235,8 +236,9 @@ use rustc_target::spec::{Target, TargetTriple};
 use snap::read::FrameDecoder;
 use std::borrow::Cow;
 use std::io::{Read, Result as IoResult, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::{cmp, fmt, fs};
+use std::{cmp, fmt};
 
 #[derive(Clone)]
 pub(crate) struct CrateLocator<'a> {
@@ -441,7 +443,7 @@ impl<'a> CrateLocator<'a> {
                 info!("lib candidate: {}", spf.path.display());
 
                 let (rlibs, rmetas, dylibs) = candidates.entry(hash.to_string()).or_default();
-                let path = fs::canonicalize(&spf.path).unwrap_or_else(|_| spf.path.clone());
+                let path = try_canonicalize(&spf.path).unwrap_or_else(|_| spf.path.clone());
                 if seen_paths.contains(&path) {
                     continue;
                 };
@@ -636,7 +638,7 @@ impl<'a> CrateLocator<'a> {
             // as well.
             if let Some((prev, _)) = &ret {
                 let sysroot = self.sysroot;
-                let sysroot = sysroot.canonicalize().unwrap_or_else(|_| sysroot.to_path_buf());
+                let sysroot = try_canonicalize(sysroot).unwrap_or_else(|_| sysroot.to_path_buf());
                 if prev.starts_with(&sysroot) {
                     continue;
                 }
@@ -760,14 +762,14 @@ impl<'a> CrateLocator<'a> {
     }
 
     pub(crate) fn into_error(self, root: Option<CratePaths>) -> CrateError {
-        CrateError::LocatorCombined(CombinedLocatorError {
+        CrateError::LocatorCombined(Box::new(CombinedLocatorError {
             crate_name: self.crate_name,
             root,
             triple: self.triple,
             dll_prefix: self.target.dll_prefix.to_string(),
             dll_suffix: self.target.dll_suffix.to_string(),
             crate_rejections: self.crate_rejections,
-        })
+        }))
     }
 }
 
@@ -789,6 +791,9 @@ fn get_metadata_section<'p>(
                 loader.get_dylib_metadata(target, filename).map_err(MetadataError::LoadFailure)?;
             // The header is uncompressed
             let header_len = METADATA_HEADER.len();
+            // header + u32 length of data
+            let data_start = header_len + 4;
+
             debug!("checking {} bytes of metadata-version stamp", header_len);
             let header = &buf[..cmp::min(header_len, buf.len())];
             if header != METADATA_HEADER {
@@ -798,21 +803,26 @@ fn get_metadata_section<'p>(
                 )));
             }
 
+            // Length of the compressed stream - this allows linkers to pad the section if they want
+            let Ok(len_bytes) = <[u8; 4]>::try_from(&buf[header_len..cmp::min(data_start, buf.len())]) else {
+                return Err(MetadataError::LoadFailure("invalid metadata length found".to_string()));
+            };
+            let compressed_len = u32::from_be_bytes(len_bytes) as usize;
+
             // Header is okay -> inflate the actual metadata
-            let compressed_bytes = &buf[header_len..];
+            let compressed_bytes = &buf[data_start..(data_start + compressed_len)];
             debug!("inflating {} bytes of compressed metadata", compressed_bytes.len());
             // Assume the decompressed data will be at least the size of the compressed data, so we
             // don't have to grow the buffer as much.
             let mut inflated = Vec::with_capacity(compressed_bytes.len());
-            match FrameDecoder::new(compressed_bytes).read_to_end(&mut inflated) {
-                Ok(_) => rustc_erase_owner!(OwningRef::new(inflated).map_owner_box()),
-                Err(_) => {
-                    return Err(MetadataError::LoadFailure(format!(
-                        "failed to decompress metadata: {}",
-                        filename.display()
-                    )));
-                }
-            }
+            FrameDecoder::new(compressed_bytes).read_to_end(&mut inflated).map_err(|_| {
+                MetadataError::LoadFailure(format!(
+                    "failed to decompress metadata: {}",
+                    filename.display()
+                ))
+            })?;
+
+            slice_owned(inflated, Deref::deref)
         }
         CrateFlavor::Rmeta => {
             // mmap the file, because only a small fraction of it is read.
@@ -830,7 +840,7 @@ fn get_metadata_section<'p>(
                 ))
             })?;
 
-            rustc_erase_owner!(OwningRef::new(mmap).map_owner_box())
+            slice_owned(mmap, Deref::deref)
         }
     };
     let blob = MetadataBlob::new(raw_bytes);
@@ -948,7 +958,7 @@ pub(crate) enum CrateError {
     StableCrateIdCollision(Symbol, Symbol),
     DlOpen(String),
     DlSym(String),
-    LocatorCombined(CombinedLocatorError),
+    LocatorCombined(Box<CombinedLocatorError>),
     NonDylibPlugin(Symbol),
 }
 

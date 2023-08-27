@@ -137,7 +137,7 @@ pub struct AsyncNonMoveClosureNotSupported {
 
 #[derive(Diagnostic, Clone, Copy)]
 #[diag(ast_lowering_functional_record_update_destructuring_assignment)]
-pub struct FunctionalRecordUpdateDestructuringAssignemnt {
+pub struct FunctionalRecordUpdateDestructuringAssignment {
     #[primary_span]
     #[suggestion(code = "", applicability = "machine-applicable")]
     pub span: Span,
@@ -346,4 +346,20 @@ pub struct TraitFnAsync {
     pub fn_span: Span,
     #[label]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+pub enum BadReturnTypeNotation {
+    #[diag(ast_lowering_bad_return_type_notation_inputs)]
+    Inputs {
+        #[primary_span]
+        #[suggestion(code = "()", applicability = "maybe-incorrect")]
+        span: Span,
+    },
+    #[diag(ast_lowering_bad_return_type_notation_output)]
+    Output {
+        #[primary_span]
+        #[suggestion(code = "", applicability = "maybe-incorrect")]
+        span: Span,
+    },
 }

@@ -54,12 +54,22 @@ pub(crate) fn codegen_tls_ref<'tcx>(
     def_id: DefId,
     layout: TyAndLayout<'tcx>,
 ) -> CValue<'tcx> {
-    let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
-    let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
-    if fx.clif_comments.enabled() {
-        fx.add_comment(local_data_id, format!("tls {:?}", def_id));
-    }
-    let tls_ptr = fx.bcx.ins().tls_value(fx.pointer_type, local_data_id);
+    let tls_ptr = if !def_id.is_local() && fx.tcx.needs_thread_local_shim(def_id) {
+        let instance = ty::Instance {
+            def: ty::InstanceDef::ThreadLocalShim(def_id),
+            substs: ty::InternalSubsts::empty(),
+        };
+        let func_ref = fx.get_function_ref(instance);
+        let call = fx.bcx.ins().call(func_ref, &[]);
+        fx.bcx.func.dfg.first_result(call)
+    } else {
+        let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
+        let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+        if fx.clif_comments.enabled() {
+            fx.add_comment(local_data_id, format!("tls {:?}", def_id));
+        }
+        fx.bcx.ins().tls_value(fx.pointer_type, local_data_id)
+    };
     CValue::by_val(tls_ptr, layout)
 }
 
@@ -290,7 +300,7 @@ fn data_id_for_static(
         };
 
         let data_id = match module.declare_data(
-            &*symbol_name,
+            symbol_name,
             linkage,
             is_mutable,
             attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
@@ -338,7 +348,7 @@ fn data_id_for_static(
     };
 
     let data_id = match module.declare_data(
-        &*symbol_name,
+        symbol_name,
         linkage,
         is_mutable,
         attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
@@ -529,6 +539,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                         | StatementKind::StorageDead(_)
                         | StatementKind::Retag(_, _)
                         | StatementKind::AscribeUserType(_, _)
+                        | StatementKind::PlaceMention(..)
                         | StatementKind::Coverage(_)
                         | StatementKind::ConstEvalCounter
                         | StatementKind::Nop => {}
@@ -538,13 +549,12 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                     TerminatorKind::Goto { .. }
                     | TerminatorKind::SwitchInt { .. }
                     | TerminatorKind::Resume
-                    | TerminatorKind::Abort
+                    | TerminatorKind::Terminate
                     | TerminatorKind::Return
                     | TerminatorKind::Unreachable
                     | TerminatorKind::Drop { .. }
                     | TerminatorKind::Assert { .. } => {}
-                    TerminatorKind::DropAndReplace { .. }
-                    | TerminatorKind::Yield { .. }
+                    TerminatorKind::Yield { .. }
                     | TerminatorKind::GeneratorDrop
                     | TerminatorKind::FalseEdge { .. }
                     | TerminatorKind::FalseUnwind { .. } => unreachable!(),

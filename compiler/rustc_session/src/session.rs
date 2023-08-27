@@ -11,7 +11,7 @@ use crate::{filesearch, lint};
 pub use rustc_ast::attr::MarkedAttrs;
 pub use rustc_ast::Attribute;
 use rustc_data_structures::flock;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::jobserver::{self, Client};
 use rustc_data_structures::profiling::{duration_to_secs_str, SelfProfiler, SelfProfilerRef};
 use rustc_data_structures::sync::{
@@ -30,7 +30,7 @@ use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMap, Span};
-use rustc_span::{sym, SourceFileHashAlgorithm, Symbol};
+use rustc_span::{SourceFileHashAlgorithm, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
 use rustc_target::spec::{
@@ -207,10 +207,10 @@ pub struct Session {
     pub asm_arch: Option<InlineAsmArch>,
 
     /// Set of enabled features for the current target.
-    pub target_features: FxHashSet<Symbol>,
+    pub target_features: FxIndexSet<Symbol>,
 
     /// Set of enabled features for the current target, including unstable ones.
-    pub unstable_target_features: FxHashSet<Symbol>,
+    pub unstable_target_features: FxIndexSet<Symbol>,
 }
 
 pub struct PerfStats {
@@ -222,6 +222,13 @@ pub struct PerfStats {
     pub normalize_generic_arg_after_erasing_regions: AtomicUsize,
     /// Number of times this query is invoked.
     pub normalize_projection_ty: AtomicUsize,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataKind {
+    None,
+    Uncompressed,
+    Compressed,
 }
 
 impl Session {
@@ -285,6 +292,43 @@ impl Session {
 
     pub fn crate_types(&self) -> &[CrateType] {
         self.crate_types.get().unwrap().as_slice()
+    }
+
+    /// Returns true if the crate is a testing one.
+    pub fn is_test_crate(&self) -> bool {
+        self.opts.test
+    }
+
+    pub fn needs_crate_hash(&self) -> bool {
+        // Why is the crate hash needed for these configurations?
+        // - debug_assertions: for the "fingerprint the result" check in
+        //   `rustc_query_system::query::plumbing::execute_job`.
+        // - incremental: for query lookups.
+        // - needs_metadata: for putting into crate metadata.
+        // - instrument_coverage: for putting into coverage data (see
+        //   `hash_mir_source`).
+        cfg!(debug_assertions)
+            || self.opts.incremental.is_some()
+            || self.needs_metadata()
+            || self.instrument_coverage()
+    }
+
+    pub fn metadata_kind(&self) -> MetadataKind {
+        self.crate_types()
+            .iter()
+            .map(|ty| match *ty {
+                CrateType::Executable | CrateType::Staticlib | CrateType::Cdylib => {
+                    MetadataKind::None
+                }
+                CrateType::Rlib => MetadataKind::Uncompressed,
+                CrateType::Dylib | CrateType::ProcMacro => MetadataKind::Compressed,
+            })
+            .max()
+            .unwrap_or(MetadataKind::None)
+    }
+
+    pub fn needs_metadata(&self) -> bool {
+        self.metadata_kind() != MetadataKind::None
     }
 
     pub fn init_crate_types(&self, crate_types: Vec<CrateType>) {
@@ -964,40 +1008,6 @@ impl Session {
         || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
     }
 
-    pub fn is_proc_macro_attr(&self, attr: &Attribute) -> bool {
-        [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
-            .iter()
-            .any(|kind| attr.has_name(*kind))
-    }
-
-    pub fn contains_name(&self, attrs: &[Attribute], name: Symbol) -> bool {
-        attrs.iter().any(|item| item.has_name(name))
-    }
-
-    pub fn find_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> Option<&'a Attribute> {
-        attrs.iter().find(|attr| attr.has_name(name))
-    }
-
-    pub fn filter_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> impl Iterator<Item = &'a Attribute> {
-        attrs.iter().filter(move |attr| attr.has_name(name))
-    }
-
-    pub fn first_attr_value_str_by_name(
-        &self,
-        attrs: &[Attribute],
-        name: Symbol,
-    ) -> Option<Symbol> {
-        attrs.iter().find(|at| at.has_name(name)).and_then(|at| at.value_str())
-    }
-
     pub fn diagnostic_width(&self) -> usize {
         let default_column_width = 140;
         if let Some(width) = self.opts.diagnostic_width {
@@ -1448,7 +1458,10 @@ pub fn build_session(
         CguReuseTracker::new_disabled()
     };
 
-    let prof = SelfProfilerRef::new(self_profiler, sopts.unstable_opts.time_passes);
+    let prof = SelfProfilerRef::new(
+        self_profiler,
+        sopts.unstable_opts.time_passes.then(|| sopts.unstable_opts.time_passes_format),
+    );
 
     let ctfe_backtrace = Lock::new(match env::var("RUSTC_CTFE_BACKTRACE") {
         Ok(ref val) if val == "immediate" => CtfeBacktrace::Immediate,
@@ -1488,8 +1501,8 @@ pub fn build_session(
         ctfe_backtrace,
         miri_unleashed_features: Lock::new(Default::default()),
         asm_arch,
-        target_features: FxHashSet::default(),
-        unstable_target_features: FxHashSet::default(),
+        target_features: Default::default(),
+        unstable_target_features: Default::default(),
     };
 
     validate_commandline_args_with_session_available(&sess);

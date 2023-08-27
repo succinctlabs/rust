@@ -6,7 +6,6 @@
 #![feature(array_windows)]
 #![feature(drain_filter)]
 #![feature(if_let_guard)]
-#![feature(is_terminal)]
 #![feature(adt_const_params)]
 #![feature(let_chains)]
 #![feature(never_type)]
@@ -76,7 +75,7 @@ pub use snippet::Style;
 pub type PErr<'a> = DiagnosticBuilder<'a, ErrorGuaranteed>;
 pub type PResult<'a, T> = Result<T, PErr<'a>>;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 // `PResult` is used a lot. Make sure it doesn't unintentionally get bigger.
 // (See also the comment on `DiagnosticBuilderInner`'s `diagnostic` field.)
@@ -331,7 +330,7 @@ impl CodeSuggestion {
                     });
                     buf.push_str(&part.snippet);
                     let cur_hi = sm.lookup_char_pos(part.span.hi());
-                    if prev_hi.line == cur_lo.line && cur_hi.line == cur_lo.line {
+                    if cur_hi.line == cur_lo.line && !part.snippet.is_empty() {
                         // Account for the difference between the width of the current code and the
                         // snippet being suggested, so that the *later* suggestions are correctly
                         // aligned on the screen.
@@ -383,7 +382,9 @@ pub use diagnostic::{
     DiagnosticStyledString, IntoDiagnosticArg, SubDiagnostic,
 };
 pub use diagnostic_builder::{DiagnosticBuilder, EmissionGuarantee, Noted};
-pub use diagnostic_impls::{DiagnosticArgFromDisplay, DiagnosticSymbolList};
+pub use diagnostic_impls::{
+    DiagnosticArgFromDisplay, DiagnosticSymbolList, LabelKind, SingleLabelManySpans,
+};
 use std::backtrace::Backtrace;
 
 /// A handler deals with errors and other compiler output.

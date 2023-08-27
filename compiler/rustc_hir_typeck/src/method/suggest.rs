@@ -27,7 +27,7 @@ use rustc_middle::traits::util::supertraits;
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
 use rustc_middle::ty::fast_reject::{simplify_type, TreatParams};
 use rustc_middle::ty::print::{with_crate_prefix, with_forced_trimmed_paths};
-use rustc_middle::ty::{self, DefIdTree, GenericArgKind, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, GenericArgKind, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::ty::{IsSuggestable, ToPolyTraitRef};
 use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::Symbol;
@@ -42,7 +42,7 @@ use rustc_trait_selection::traits::{
 use super::probe::{AutorefOrPtrAdjustment, IsSuggestion, Mode, ProbeScope};
 use super::{CandidateSource, MethodError, NoMatchData};
 use rustc_hir::intravisit::Visitor;
-use std::cmp::Ordering;
+use std::cmp::{self, Ordering};
 use std::iter;
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
@@ -245,6 +245,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         None
     }
 
+    fn suggest_missing_writer(
+        &self,
+        rcvr_ty: Ty<'tcx>,
+        args: (&'tcx hir::Expr<'tcx>, &'tcx [hir::Expr<'tcx>]),
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
+        let (ty_str, _ty_file) = self.tcx.short_ty_string(rcvr_ty);
+        let mut err =
+            struct_span_err!(self.tcx.sess, args.0.span, E0599, "cannot write into `{}`", ty_str);
+        err.span_note(
+            args.0.span,
+            "must implement `io::Write`, `fmt::Write`, or have a `write_fmt` method",
+        );
+        if let ExprKind::Lit(_) = args.0.kind {
+            err.span_help(
+                args.0.span.shrink_to_lo(),
+                "a writer is needed before this format string",
+            );
+        };
+
+        err
+    }
+
     pub fn report_no_match_method_error(
         &self,
         mut span: Span,
@@ -278,7 +300,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         // We could pass the file for long types into these two, but it isn't strictly necessary
-        // given how targetted they are.
+        // given how targeted they are.
         if self.suggest_wrapping_range_with_parens(
             tcx,
             rcvr_ty,
@@ -323,16 +345,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        let mut err = struct_span_err!(
-            tcx.sess,
-            span,
-            E0599,
-            "no {} named `{}` found for {} `{}` in the current scope",
-            item_kind,
-            item_name,
-            rcvr_ty.prefix_string(self.tcx),
-            ty_str_reported,
-        );
+        let is_write = sugg_span.ctxt().outer_expn_data().macro_def_id.map_or(false, |def_id| {
+            tcx.is_diagnostic_item(sym::write_macro, def_id)
+                || tcx.is_diagnostic_item(sym::writeln_macro, def_id)
+        }) && item_name.name == Symbol::intern("write_fmt");
+        let mut err = if is_write
+            && let Some(args) = args
+        {
+            self.suggest_missing_writer(rcvr_ty, args)
+        } else {
+            struct_span_err!(
+                tcx.sess,
+                span,
+                E0599,
+                "no {} named `{}` found for {} `{}` in the current scope",
+                item_kind,
+                item_name,
+                rcvr_ty.prefix_string(self.tcx),
+                ty_str_reported,
+            )
+        };
         if tcx.sess.source_map().is_multiline(sugg_span) {
             err.span_label(sugg_span.with_hi(span.lo()), "");
         }
@@ -346,6 +378,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
         if rcvr_ty.references_error() {
             err.downgrade_to_delayed_bug();
+        }
+
+        if tcx.ty_is_opaque_future(rcvr_ty) && item_name.name == sym::poll {
+            err.help(&format!(
+                "method `poll` found on `Pin<&mut {ty_str}>`, \
+                see documentation for `std::pin::Pin`"
+            ));
+            err.help("self type must be pinned to call `Future::poll`, \
+                see https://rust-lang.github.io/async-book/04_pinning/01_chapter.html#pinning-in-practice"
+            );
         }
 
         if let Mode::MethodCall = mode && let SelfSource::MethodCall(cal) = source {
@@ -405,6 +447,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 );
                 probe.is_ok()
             });
+
+            self.note_internal_mutation_in_method(
+                &mut err,
+                rcvr_expr,
+                expected.to_option(&self),
+                rcvr_ty,
+            );
         }
 
         let mut custom_span_label = false;
@@ -612,19 +661,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // Find all the requirements that come from a local `impl` block.
             let mut skip_list: FxHashSet<_> = Default::default();
             let mut spanned_predicates = FxHashMap::default();
-            for (p, parent_p, impl_def_id, cause) in unsatisfied_predicates
-                .iter()
-                .filter_map(|(p, parent, c)| c.as_ref().map(|c| (p, parent, c)))
-                .filter_map(|(p, parent, c)| match c.code() {
-                    ObligationCauseCode::ImplDerivedObligation(data)
-                        if matches!(p.kind().skip_binder(), ty::PredicateKind::Clause(_)) =>
-                    {
-                        Some((p, parent, data.impl_or_alias_def_id, data))
+            for (p, parent_p, cause) in unsatisfied_predicates {
+                // Extract the predicate span and parent def id of the cause,
+                // if we have one.
+                let (item_def_id, cause_span) = match cause.as_ref().map(|cause| cause.code()) {
+                    Some(ObligationCauseCode::ImplDerivedObligation(data)) => {
+                        (data.impl_or_alias_def_id, data.span)
                     }
-                    _ => None,
-                })
-            {
-                match self.tcx.hir().get_if_local(impl_def_id) {
+                    Some(
+                        ObligationCauseCode::ExprBindingObligation(def_id, span, _, _)
+                        | ObligationCauseCode::BindingObligation(def_id, span),
+                    ) => (*def_id, *span),
+                    _ => continue,
+                };
+
+                // Don't point out the span of `WellFormed` predicates.
+                if !matches!(p.kind().skip_binder(), ty::PredicateKind::Clause(_)) {
+                    continue;
+                };
+
+                match self.tcx.hir().get_if_local(item_def_id) {
                     // Unmet obligation comes from a `derive` macro, point at it once to
                     // avoid multiple span labels pointing at the same place.
                     Some(Node::Item(hir::Item {
@@ -669,7 +725,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 }
                             });
                         for param in generics.params {
-                            if param.span == cause.span && sized_pred {
+                            if param.span == cause_span && sized_pred {
                                 let (sp, sugg) = match param.colon_span {
                                     Some(sp) => (sp.shrink_to_hi(), " ?Sized +"),
                                     None => (param.span.shrink_to_hi(), ": ?Sized"),
@@ -692,9 +748,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             (FxHashSet::default(), FxHashSet::default(), Vec::new())
                         });
                         entry.2.push(p);
-                        if cause.span != *item_span {
-                            entry.0.insert(cause.span);
-                            entry.1.insert((cause.span, "unsatisfied trait bound introduced here"));
+                        if cause_span != *item_span {
+                            entry.0.insert(cause_span);
+                            entry.1.insert((cause_span, "unsatisfied trait bound introduced here"));
                         } else {
                             if let Some(trait_ref) = of_trait {
                                 entry.0.insert(trait_ref.path.span);
@@ -726,9 +782,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let entry = entry.or_insert_with(|| {
                             (FxHashSet::default(), FxHashSet::default(), Vec::new())
                         });
-                        entry.0.insert(cause.span);
+                        entry.0.insert(cause_span);
                         entry.1.insert((ident.span, ""));
-                        entry.1.insert((cause.span, "unsatisfied trait bound introduced here"));
+                        entry.1.insert((cause_span, "unsatisfied trait bound introduced here"));
                         entry.2.push(p);
                     }
                     Some(node) => unreachable!("encountered `{node:?}`"),
@@ -1164,7 +1220,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 .inputs()
                                 .skip_binder()
                                 .get(0)
-                                .filter(|ty| ty.is_region_ptr() && !rcvr_ty.is_region_ptr())
+                                .filter(|ty| ty.is_ref() && !rcvr_ty.is_ref())
                                 .copied()
                                 .unwrap_or(rcvr_ty),
                         };
@@ -1247,7 +1303,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let target_ty = self
                 .autoderef(sugg_span, rcvr_ty)
                 .find(|(rcvr_ty, _)| {
-                    DeepRejectCtxt { treat_obligation_params: TreatParams::AsInfer }
+                    DeepRejectCtxt { treat_obligation_params: TreatParams::AsCandidateKey }
                         .types_may_unify(*rcvr_ty, impl_ty)
                 })
                 .map_or(impl_ty, |(ty, _)| ty)
@@ -1506,7 +1562,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .into_iter()
             .any(|info| self.associated_value(info.def_id, item_name).is_some());
         let found_assoc = |ty: Ty<'tcx>| {
-            simplify_type(tcx, ty, TreatParams::AsInfer)
+            simplify_type(tcx, ty, TreatParams::AsCandidateKey)
                 .and_then(|simp| {
                     tcx.incoherent_impls(simp)
                         .iter()
@@ -1766,7 +1822,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .variants()
                     .iter()
                     .flat_map(|variant| {
-                        let [field] = &variant.fields[..] else { return None; };
+                        let [field] = &variant.fields.raw[..] else { return None; };
                         let field_ty = field.ty(tcx, substs);
 
                         // Skip `_`, since that'll just lead to ambiguity.
@@ -2517,7 +2573,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if !candidates.is_empty() {
             // Sort from most relevant to least relevant.
-            candidates.sort_by(|a, b| a.cmp(b).reverse());
+            candidates.sort_by_key(|&info| cmp::Reverse(info));
             candidates.dedup();
 
             let param_type = match rcvr_ty.kind() {
@@ -2636,7 +2692,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // cases where a positive bound implies a negative impl.
                 (candidates, Vec::new())
             } else if let Some(simp_rcvr_ty) =
-                simplify_type(self.tcx, rcvr_ty, TreatParams::AsPlaceholder)
+                simplify_type(self.tcx, rcvr_ty, TreatParams::ForLookup)
             {
                 let mut potential_candidates = Vec::new();
                 let mut explicitly_negative = Vec::new();
@@ -2651,7 +2707,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .any(|imp_did| {
                             let imp = self.tcx.impl_trait_ref(imp_did).unwrap().subst_identity();
                             let imp_simp =
-                                simplify_type(self.tcx, imp.self_ty(), TreatParams::AsPlaceholder);
+                                simplify_type(self.tcx, imp.self_ty(), TreatParams::ForLookup);
                             imp_simp.map_or(false, |s| s == simp_rcvr_ty)
                         })
                     {

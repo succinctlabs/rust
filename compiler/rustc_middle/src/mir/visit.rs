@@ -335,12 +335,14 @@ macro_rules! make_mir_visitor {
                         ty::InstanceDef::VTableShim(_def_id) |
                         ty::InstanceDef::ReifyShim(_def_id) |
                         ty::InstanceDef::Virtual(_def_id, _) |
+                        ty::InstanceDef::ThreadLocalShim(_def_id) |
                         ty::InstanceDef::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
                         ty::InstanceDef::DropGlue(_def_id, None) => {}
 
                         ty::InstanceDef::FnPtrShim(_def_id, ty) |
                         ty::InstanceDef::DropGlue(_def_id, Some(ty)) |
-                        ty::InstanceDef::CloneShim(_def_id, ty) => {
+                        ty::InstanceDef::CloneShim(_def_id, ty) |
+                        ty::InstanceDef::FnPtrAddrShim(_def_id, ty) => {
                             // FIXME(eddyb) use a better `TyContext` here.
                             self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                         }
@@ -405,6 +407,13 @@ macro_rules! make_mir_visitor {
                     StatementKind::Retag(kind, place) => {
                         self.visit_retag($(& $mutability)? *kind, place, location);
                     }
+                    StatementKind::PlaceMention(place) => {
+                        self.visit_place(
+                            place,
+                            PlaceContext::NonUse(NonUseContext::PlaceMention),
+                            location
+                        );
+                    }
                     StatementKind::AscribeUserType(
                         box (place, user_ty),
                         variance
@@ -453,7 +462,7 @@ macro_rules! make_mir_visitor {
                 match kind {
                     TerminatorKind::Goto { .. } |
                     TerminatorKind::Resume |
-                    TerminatorKind::Abort |
+                    TerminatorKind::Terminate |
                     TerminatorKind::GeneratorDrop |
                     TerminatorKind::Unreachable |
                     TerminatorKind::FalseEdge { .. } |
@@ -495,26 +504,12 @@ macro_rules! make_mir_visitor {
                         );
                     }
 
-                    TerminatorKind::DropAndReplace {
-                        place,
-                        value,
-                        target: _,
-                        unwind: _,
-                    } => {
-                        self.visit_place(
-                            place,
-                            PlaceContext::MutatingUse(MutatingUseContext::Drop),
-                            location
-                        );
-                        self.visit_operand(value, location);
-                    }
-
                     TerminatorKind::Call {
                         func,
                         args,
                         destination,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                         from_hir_call: _,
                         fn_span: _
                     } => {
@@ -534,7 +529,7 @@ macro_rules! make_mir_visitor {
                         expected: _,
                         msg,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         self.visit_operand(cond, location);
                         self.visit_assert_message(msg, location);
@@ -560,7 +555,7 @@ macro_rules! make_mir_visitor {
                         options: _,
                         line_spans: _,
                         destination: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         for op in operands {
                             match op {
@@ -615,6 +610,10 @@ macro_rules! make_mir_visitor {
                     ResumedAfterReturn(_) | ResumedAfterPanic(_) => {
                         // Nothing to visit
                     }
+                    MisalignedPointerDereference { required, found } => {
+                        self.visit_operand(required, location);
+                        self.visit_operand(found, location);
+                    }
                 }
             }
 
@@ -641,8 +640,8 @@ macro_rules! make_mir_visitor {
                             BorrowKind::Shallow => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::ShallowBorrow
                             ),
-                            BorrowKind::Unique => PlaceContext::NonMutatingUse(
-                                NonMutatingUseContext::UniqueBorrow
+                            BorrowKind::Unique => PlaceContext::MutatingUse(
+                                MutatingUseContext::Borrow
                             ),
                             BorrowKind::Mut { .. } =>
                                 PlaceContext::MutatingUse(MutatingUseContext::Borrow),
@@ -811,7 +810,6 @@ macro_rules! make_mir_visitor {
                     source_info,
                     internal: _,
                     local_info: _,
-                    is_block_tail: _,
                 } = local_decl;
 
                 self.visit_ty($(& $mutability)? *ty, TyContext::LocalDecl {
@@ -834,6 +832,7 @@ macro_rules! make_mir_visitor {
                     name: _,
                     source_info,
                     value,
+                    argument_index: _,
                 } = var_debug_info;
 
                 self.visit_source_info(source_info);
@@ -1248,8 +1247,6 @@ pub enum NonMutatingUseContext {
     SharedBorrow,
     /// Shallow borrow.
     ShallowBorrow,
-    /// Unique borrow.
-    UniqueBorrow,
     /// AddressOf for *const pointer.
     AddressOf,
     /// Used as base for another place, e.g., `x` in `x.y`. Will not mutate the place.
@@ -1302,6 +1299,8 @@ pub enum NonUseContext {
     AscribeUserTy,
     /// The data of a user variable, for debug info.
     VarDebugInfo,
+    /// PlaceMention statement.
+    PlaceMention,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1323,9 +1322,7 @@ impl PlaceContext {
         matches!(
             self,
             PlaceContext::NonMutatingUse(
-                NonMutatingUseContext::SharedBorrow
-                    | NonMutatingUseContext::ShallowBorrow
-                    | NonMutatingUseContext::UniqueBorrow
+                NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::ShallowBorrow
             ) | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
         )
     }

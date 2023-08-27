@@ -1,3 +1,4 @@
+use crate::infer::DefineOpaqueTypes;
 use crate::traits::PredicateObligations;
 
 use super::combine::{CombineFields, ObligationEmittingRelation, RelationDir};
@@ -34,20 +35,12 @@ impl<'tcx> TypeRelation<'tcx> for Equate<'_, '_, 'tcx> {
         self.fields.tcx()
     }
 
-    fn intercrate(&self) -> bool {
-        self.fields.infcx.intercrate
-    }
-
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.fields.param_env
     }
 
     fn a_is_expected(&self) -> bool {
         self.a_is_expected
-    }
-
-    fn mark_ambiguous(&mut self) {
-        self.fields.mark_ambiguous();
     }
 
     fn relate_item_substs(
@@ -110,7 +103,8 @@ impl<'tcx> TypeRelation<'tcx> for Equate<'_, '_, 'tcx> {
             }
             (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
             | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
-                if self.fields.define_opaque_types && def_id.is_local() =>
+                if self.fields.define_opaque_types == DefineOpaqueTypes::Yes
+                    && def_id.is_local() =>
             {
                 self.fields.obligations.extend(
                     infcx
@@ -207,5 +201,9 @@ impl<'tcx> ObligationEmittingRelation<'tcx> for Equate<'_, '_, 'tcx> {
 
     fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>) {
         self.fields.register_obligations(obligations);
+    }
+
+    fn alias_relate_direction(&self) -> ty::AliasRelationDirection {
+        ty::AliasRelationDirection::Equate
     }
 }

@@ -3,7 +3,7 @@ use rustc_hir::lang_items::LangItem;
 use rustc_middle::ty::layout::{
     fn_can_unwind, FnAbiError, HasParamEnv, HasTyCtxt, LayoutCx, LayoutOf, TyAndLayout,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, InstanceDef, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
 use rustc_span::def_id::DefId;
 use rustc_target::abi::call::{
@@ -29,6 +29,16 @@ fn fn_sig_for_fn_abi<'tcx>(
     instance: ty::Instance<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
 ) -> ty::PolyFnSig<'tcx> {
+    if let InstanceDef::ThreadLocalShim(..) = instance.def {
+        return ty::Binder::dummy(tcx.mk_fn_sig(
+            [],
+            tcx.thread_local_ptr_ty(instance.def_id()),
+            false,
+            hir::Unsafety::Normal,
+            rustc_target::spec::abi::Abi::Unadjusted,
+        ));
+    }
+
     let ty = instance.ty(tcx, param_env);
     match *ty.kind() {
         ty::FnDef(..) => {
@@ -539,7 +549,7 @@ fn make_thin_self_ptr<'tcx>(
         // get a built-in pointer type
         let mut fat_pointer_layout = layout;
         'descend_newtypes: while !fat_pointer_layout.ty.is_unsafe_ptr()
-            && !fat_pointer_layout.ty.is_region_ptr()
+            && !fat_pointer_layout.ty.is_ref()
         {
             for i in 0..fat_pointer_layout.fields.count() {
                 let field_layout = fat_pointer_layout.field(cx, i);

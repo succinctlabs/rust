@@ -8,7 +8,7 @@ use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
 use rustc_session::config::DebugInfo;
 use rustc_span::symbol::{kw, Symbol};
 use rustc_span::{BytePos, Span};
-use rustc_target::abi::{Abi, Size, VariantIdx};
+use rustc_target::abi::{Abi, FieldIdx, Size, VariantIdx};
 
 use super::operand::{OperandRef, OperandValue};
 use super::place::PlaceRef;
@@ -79,7 +79,7 @@ impl<'tcx, S: Copy, L: Copy> DebugScope<S, L> {
 trait DebugInfoOffsetLocation<'tcx, Bx> {
     fn deref(&self, bx: &mut Bx) -> Self;
     fn layout(&self) -> TyAndLayout<'tcx>;
-    fn project_field(&self, bx: &mut Bx, field: mir::Field) -> Self;
+    fn project_field(&self, bx: &mut Bx, field: FieldIdx) -> Self;
     fn downcast(&self, bx: &mut Bx, variant: VariantIdx) -> Self;
 }
 
@@ -94,7 +94,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> DebugInfoOffsetLocation<'tcx, Bx>
         self.layout
     }
 
-    fn project_field(&self, bx: &mut Bx, field: mir::Field) -> Self {
+    fn project_field(&self, bx: &mut Bx, field: FieldIdx) -> Self {
         PlaceRef::project_field(*self, bx, field.index())
     }
 
@@ -116,7 +116,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> DebugInfoOffsetLocation<'tcx, Bx>
         *self
     }
 
-    fn project_field(&self, bx: &mut Bx, field: mir::Field) -> Self {
+    fn project_field(&self, bx: &mut Bx, field: FieldIdx) -> Self {
         self.field(bx.cx(), field.index())
     }
 
@@ -165,11 +165,15 @@ fn calculate_debuginfo_offset<
             mir::ProjectionElem::Downcast(_, variant) => {
                 place = place.downcast(bx, variant);
             }
-            _ => span_bug!(
-                var.source_info.span,
-                "unsupported var debuginfo place `{:?}`",
-                mir::Place { local, projection: var.projection },
-            ),
+            _ => {
+                // Sanity check for `can_use_in_debuginfo`.
+                debug_assert!(!elem.can_use_in_debuginfo());
+                span_bug!(
+                    var.source_info.span,
+                    "unsupported var debuginfo place `{:?}`",
+                    mir::Place { local, projection: var.projection },
+                )
+            }
         }
     }
 
@@ -241,12 +245,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     pub fn debug_introduce_local(&self, bx: &mut Bx, local: mir::Local) {
         let full_debug_info = bx.sess().opts.debuginfo == DebugInfo::Full;
 
-        // FIXME(eddyb) maybe name the return place as `_0` or `return`?
-        if local == mir::RETURN_PLACE && !self.mir.local_decls[mir::RETURN_PLACE].is_user_variable()
-        {
-            return;
-        }
-
         let vars = match &self.per_local_var_debug_info {
             Some(per_local) => &per_local[local],
             None => return,
@@ -303,7 +301,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         let local_ref = &self.locals[local];
 
-        let name = if bx.sess().fewer_names() {
+        // FIXME Should the return place be named?
+        let name = if bx.sess().fewer_names() || local == mir::RETURN_PLACE {
             None
         } else {
             Some(match whole_local_var.or(fallback_var.clone()) {
@@ -317,7 +316,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 LocalRef::Place(place) | LocalRef::UnsizedPlace(place) => {
                     bx.set_var_name(place.llval, name);
                 }
-                LocalRef::Operand(Some(operand)) => match operand.val {
+                LocalRef::Operand(operand) => match operand.val {
                     OperandValue::Ref(x, ..) | OperandValue::Immediate(x) => {
                         bx.set_var_name(x, name);
                     }
@@ -328,7 +327,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         bx.set_var_name(b, &(name.clone() + ".1"));
                     }
                 },
-                LocalRef::Operand(None) => {}
+                LocalRef::PendingOperand => {}
             }
         }
 
@@ -337,9 +336,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
 
         let base = match local_ref {
-            LocalRef::Operand(None) => return,
+            LocalRef::PendingOperand => return,
 
-            LocalRef::Operand(Some(operand)) => {
+            LocalRef::Operand(operand) => {
                 // Don't spill operands onto the stack in naked functions.
                 // See: https://github.com/rust-lang/rust/issues/42779
                 let attrs = bx.tcx().codegen_fn_attrs(self.instance.def_id());
@@ -443,11 +442,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let (var_ty, var_kind) = match var.value {
                     mir::VarDebugInfoContents::Place(place) => {
                         let var_ty = self.monomorphized_place_ty(place.as_ref());
-                        let var_kind = if self.mir.local_kind(place.local) == mir::LocalKind::Arg
+                        let var_kind = if let Some(arg_index) = var.argument_index
                             && place.projection.is_empty()
-                            && var.source_info.scope == mir::OUTERMOST_SOURCE_SCOPE
                         {
-                            let arg_index = place.local.index() - 1;
+                            let arg_index = arg_index as usize;
                             if target_is_msvc {
                                 // ScalarPair parameters are spilled to the stack so they need to
                                 // be marked as a `LocalVariable` for MSVC debuggers to visualize
@@ -456,13 +454,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                 if let Abi::ScalarPair(_, _) = var_ty_layout.abi {
                                     VariableKind::LocalVariable
                                 } else {
-                                    VariableKind::ArgumentVariable(arg_index + 1)
+                                    VariableKind::ArgumentVariable(arg_index)
                                 }
                             } else {
                                 // FIXME(eddyb) shouldn't `ArgumentVariable` indices be
                                 // offset in closures to account for the hidden environment?
-                                // Also, is this `+ 1` needed at all?
-                                VariableKind::ArgumentVariable(arg_index + 1)
+                                VariableKind::ArgumentVariable(arg_index)
                             }
                         } else {
                             VariableKind::LocalVariable

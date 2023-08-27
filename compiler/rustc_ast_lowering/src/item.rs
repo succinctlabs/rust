@@ -12,8 +12,8 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID};
 use rustc_hir::PredicateOrigin;
-use rustc_index::vec::{Idx, IndexVec};
-use rustc_middle::ty::{DefIdTree, ResolverAstLowering, TyCtxt};
+use rustc_index::vec::{Idx, IndexSlice, IndexVec};
+use rustc_middle::ty::{ResolverAstLowering, TyCtxt};
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::source_map::DesugaringKind;
 use rustc_span::symbol::{kw, sym, Ident};
@@ -25,7 +25,7 @@ use thin_vec::ThinVec;
 pub(super) struct ItemLowerer<'a, 'hir> {
     pub(super) tcx: TyCtxt<'hir>,
     pub(super) resolver: &'a mut ResolverAstLowering,
-    pub(super) ast_index: &'a IndexVec<LocalDefId, AstOwner<'a>>,
+    pub(super) ast_index: &'a IndexSlice<LocalDefId, AstOwner<'a>>,
     pub(super) owners: &'a mut IndexVec<LocalDefId, hir::MaybeOwner<&'hir hir::OwnerInfo<'hir>>>,
 }
 
@@ -229,12 +229,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
                 self.lower_use_tree(use_tree, &prefix, id, vis_span, ident, attrs)
             }
-            ItemKind::Static(t, m, e) => {
+            ItemKind::Static(box ast::StaticItem { ty: t, mutability: m, expr: e }) => {
                 let (ty, body_id) = self.lower_const_item(t, span, e.as_deref());
                 hir::ItemKind::Static(ty, *m, body_id)
             }
-            ItemKind::Const(_, t, e) => {
-                let (ty, body_id) = self.lower_const_item(t, span, e.as_deref());
+            ItemKind::Const(box ast::ConstItem { ty, expr, .. }) => {
+                let (ty, body_id) = self.lower_const_item(ty, span, expr.as_deref());
                 hir::ItemKind::Const(ty, body_id)
             }
             ItemKind::Fn(box Fn {
@@ -708,10 +708,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let trait_item_def_id = hir_id.expect_owner();
 
         let (generics, kind, has_default) = match &i.kind {
-            AssocItemKind::Const(_, ty, default) => {
+            AssocItemKind::Const(box ConstItem { ty, expr, .. }) => {
                 let ty =
                     self.lower_ty(ty, &ImplTraitContext::Disallowed(ImplTraitPosition::ConstTy));
-                let body = default.as_ref().map(|x| self.lower_const_body(i.span, Some(x)));
+                let body = expr.as_ref().map(|x| self.lower_const_body(i.span, Some(x)));
                 (hir::Generics::empty(), hir::TraitItemKind::Const(ty, body), body.is_some())
             }
             AssocItemKind::Fn(box Fn { sig, generics, body: None, .. }) => {
@@ -809,7 +809,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         self.lower_attrs(hir_id, &i.attrs);
 
         let (generics, kind) = match &i.kind {
-            AssocItemKind::Const(_, ty, expr) => {
+            AssocItemKind::Const(box ConstItem { ty, expr, .. }) => {
                 let ty =
                     self.lower_ty(ty, &ImplTraitContext::Disallowed(ImplTraitPosition::ConstTy));
                 (
@@ -1146,7 +1146,6 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
             let async_expr = this.make_async_expr(
                 CaptureBy::Value,
-                fn_id,
                 closure_id,
                 None,
                 body.span,
@@ -1180,7 +1179,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 },
             );
 
-            (this.arena.alloc_from_iter(parameters), this.expr(body.span, async_expr))
+            let hir_id = this.lower_node_id(closure_id);
+            this.maybe_forward_track_caller(body.span, fn_id, hir_id);
+            let expr = hir::Expr { hir_id, kind: async_expr, span: this.lower_span(body.span) };
+
+            (this.arena.alloc_from_iter(parameters), expr)
         })
     }
 

@@ -1,23 +1,45 @@
-//! This module defines types which are thread safe if cfg!(parallel_compiler) is true.
+//! This module defines various operations and types that are implemented in
+//! one way for the serial compiler, and another way the parallel compiler.
 //!
-//! `Lrc` is an alias of `Arc` if cfg!(parallel_compiler) is true, `Rc` otherwise.
+//! Operations
+//! ----------
+//! The parallel versions of operations use Rayon to execute code in parallel,
+//! while the serial versions degenerate straightforwardly to serial execution.
+//! The operations include `join`, `parallel`, `par_iter`, and `par_for_each`.
 //!
-//! `Lock` is a mutex.
-//! It internally uses `parking_lot::Mutex` if cfg!(parallel_compiler) is true,
-//! `RefCell` otherwise.
+//! Types
+//! -----
+//! The parallel versions of types provide various kinds of synchronization,
+//! while the serial compiler versions do not.
 //!
-//! `RwLock` is a read-write lock.
-//! It internally uses `parking_lot::RwLock` if cfg!(parallel_compiler) is true,
-//! `RefCell` otherwise.
+//! The following table shows how the types are implemented internally. Except
+//! where noted otherwise, the type in column one is defined as a
+//! newtype around the type from column two or three.
 //!
-//! `MTLock` is a mutex which disappears if cfg!(parallel_compiler) is false.
+//! | Type                    | Serial version      | Parallel version                |
+//! | ----------------------- | ------------------- | ------------------------------- |
+//! | `Lrc<T>`                | `rc::Rc<T>`         | `sync::Arc<T>`                  |
+//! |` Weak<T>`               | `rc::Weak<T>`       | `sync::Weak<T>`                 |
+//! |                         |                     |                                 |
+//! | `AtomicBool`            | `Cell<bool>`        | `atomic::AtomicBool`            |
+//! | `AtomicU32`             | `Cell<u32>`         | `atomic::AtomicU32`             |
+//! | `AtomicU64`             | `Cell<u64>`         | `atomic::AtomicU64`             |
+//! | `AtomicUsize`           | `Cell<usize>`       | `atomic::AtomicUsize`           |
+//! |                         |                     |                                 |
+//! | `Lock<T>`               | `RefCell<T>`        | `parking_lot::Mutex<T>`         |
+//! | `RwLock<T>`             | `RefCell<T>`        | `parking_lot::RwLock<T>`        |
+//! | `MTLock<T>`        [^1] | `T`                 | `Lock<T>`                       |
+//! | `MTLockRef<'a, T>` [^2] | `&'a mut MTLock<T>` | `&'a MTLock<T>`                 |
+//! |                         |                     |                                 |
+//! | `ParallelIterator`      | `Iterator`          | `rayon::iter::ParallelIterator` |
 //!
-//! `MTRef` is an immutable reference if cfg!(parallel_compiler), and a mutable reference otherwise.
+//! [^1] `MTLock` is similar to `Lock`, but the serial version avoids the cost
+//! of a `RefCell`. This is appropriate when interior mutability is not
+//! required.
 //!
-//! `rustc_erase_owner!` erases an OwningRef owner into Erased or Erased + Send + Sync
-//! depending on the value of cfg!(parallel_compiler).
+//! [^2] `MTLockRef` is a typedef.
 
-use crate::owning_ref::{Erased, OwningRef};
+use crate::owned_slice::OwnedSlice;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::ops::{Deref, DerefMut};
@@ -26,24 +48,17 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 pub use std::sync::atomic::Ordering;
 pub use std::sync::atomic::Ordering::SeqCst;
 
-pub use vec::AppendOnlyVec;
+pub use vec::{AppendOnlyIndexVec, AppendOnlyVec};
 
 mod vec;
 
 cfg_if! {
     if #[cfg(not(parallel_compiler))] {
-        pub auto trait Send {}
-        pub auto trait Sync {}
+        pub unsafe auto trait Send {}
+        pub unsafe auto trait Sync {}
 
-        impl<T> Send for T {}
-        impl<T> Sync for T {}
-
-        #[macro_export]
-        macro_rules! rustc_erase_owner {
-            ($v:expr) => {
-                $v.erase_owner()
-            }
-        }
+        unsafe impl<T> Send for T {}
+        unsafe impl<T> Sync for T {}
 
         use std::ops::Add;
 
@@ -79,6 +94,14 @@ cfg_if! {
             #[inline]
             pub fn swap(&self, val: T, _: Ordering) -> T {
                 self.0.replace(val)
+            }
+        }
+
+        impl Atomic<bool> {
+            pub fn fetch_or(&self, val: bool, _: Ordering) -> bool {
+                let result = self.0.get() | val;
+                self.0.set(val);
+                result
             }
         }
 
@@ -164,7 +187,7 @@ cfg_if! {
             }
         }
 
-        pub type MetadataRef = OwningRef<Box<dyn Erased>, [u8]>;
+        pub type MetadataRef = OwnedSlice;
 
         pub use std::rc::Rc as Lrc;
         pub use std::rc::Weak as Weak;
@@ -209,7 +232,7 @@ cfg_if! {
             }
         }
 
-        pub type MTRef<'a, T> = &'a mut T;
+        pub type MTLockRef<'a, T> = &'a mut MTLock<T>;
 
         #[derive(Debug, Default)]
         pub struct MTLock<T>(T);
@@ -267,7 +290,7 @@ cfg_if! {
         pub use std::sync::Arc as Lrc;
         pub use std::sync::Weak as Weak;
 
-        pub type MTRef<'a, T> = &'a T;
+        pub type MTLockRef<'a, T> = &'a MTLock<T>;
 
         #[derive(Debug, Default)]
         pub struct MTLock<T>(Lock<T>);
@@ -347,20 +370,11 @@ cfg_if! {
             });
         }
 
-        pub type MetadataRef = OwningRef<Box<dyn Erased + Send + Sync>, [u8]>;
+        pub type MetadataRef = OwnedSlice;
 
         /// This makes locks panic if they are already held.
         /// It is only useful when you are running in a single thread
         const ERROR_CHECKING: bool = false;
-
-        #[macro_export]
-        macro_rules! rustc_erase_owner {
-            ($v:expr) => {{
-                let v = $v;
-                ::rustc_data_structures::sync::assert_send_val(&v);
-                v.erase_send_sync_owner()
-            }}
-        }
     }
 }
 
@@ -456,14 +470,6 @@ impl<T: Default> Default for Lock<T> {
     }
 }
 
-// FIXME: Probably a bad idea
-impl<T: Clone> Clone for Lock<T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Lock::new(self.borrow().clone())
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct RwLock<T>(InnerRwLock<T>);
 
@@ -551,18 +557,6 @@ impl<T> RwLock<T> {
     #[track_caller]
     pub fn borrow_mut(&self) -> WriteGuard<'_, T> {
         self.write()
-    }
-
-    #[cfg(not(parallel_compiler))]
-    #[inline(always)]
-    pub fn clone_guard<'a>(rg: &ReadGuard<'a, T>) -> ReadGuard<'a, T> {
-        ReadGuard::clone(rg)
-    }
-
-    #[cfg(parallel_compiler)]
-    #[inline(always)]
-    pub fn clone_guard<'a>(rg: &ReadGuard<'a, T>) -> ReadGuard<'a, T> {
-        ReadGuard::rwlock(&rg).read()
     }
 
     #[cfg(not(parallel_compiler))]

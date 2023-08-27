@@ -168,20 +168,19 @@ fn get_impl_substs(
     let assumed_wf_types =
         ocx.assumed_wf_types(param_env, tcx.def_span(impl1_def_id), impl1_def_id);
 
-    let impl1_substs = InternalSubsts::identity_for_item(tcx, impl1_def_id.to_def_id());
+    let impl1_substs = InternalSubsts::identity_for_item(tcx, impl1_def_id);
     let impl2_substs =
         translate_substs(infcx, param_env, impl1_def_id.to_def_id(), impl1_substs, impl2_node);
 
     let errors = ocx.select_all_or_error();
     if !errors.is_empty() {
-        ocx.infcx.err_ctxt().report_fulfillment_errors(&errors, None);
+        ocx.infcx.err_ctxt().report_fulfillment_errors(&errors);
         return None;
     }
 
     let implied_bounds = infcx.implied_bounds_tys(param_env, impl1_def_id, assumed_wf_types);
-    let outlives_env = OutlivesEnvironment::with_bounds(param_env, Some(infcx), implied_bounds);
-    let _ =
-        infcx.err_ctxt().check_region_obligations_and_report_errors(impl1_def_id, &outlives_env);
+    let outlives_env = OutlivesEnvironment::with_bounds(param_env, implied_bounds);
+    let _ = ocx.resolve_regions_and_report_errors(impl1_def_id, &outlives_env);
     let Ok(impl2_substs) = infcx.fully_resolve(impl2_substs) else {
         let span = tcx.def_span(impl1_def_id);
         tcx.sess.emit_err(SubstsOnOverriddenImpl { span });
@@ -318,30 +317,20 @@ fn check_predicates<'tcx>(
     span: Span,
 ) {
     let instantiated = tcx.predicates_of(impl1_def_id).instantiate(tcx, impl1_substs);
-    let impl1_predicates: Vec<_> = traits::elaborate_predicates_with_span(
-        tcx,
-        std::iter::zip(
-            instantiated.predicates,
-            // Don't drop predicates (unsound!) because `spans` is too short
-            instantiated.spans.into_iter().chain(std::iter::repeat(span)),
-        ),
-    )
-    .map(|obligation| (obligation.predicate, obligation.cause.span))
-    .collect();
+    let impl1_predicates: Vec<_> = traits::elaborate(tcx, instantiated.into_iter()).collect();
 
     let mut impl2_predicates = if impl2_node.is_from_trait() {
         // Always applicable traits have to be always applicable without any
         // assumptions.
         Vec::new()
     } else {
-        traits::elaborate_predicates(
+        traits::elaborate(
             tcx,
             tcx.predicates_of(impl2_node.def_id())
                 .instantiate(tcx, impl2_substs)
                 .predicates
                 .into_iter(),
         )
-        .map(|obligation| obligation.predicate)
         .collect()
     };
     debug!(?impl1_predicates, ?impl2_predicates);
@@ -361,12 +350,16 @@ fn check_predicates<'tcx>(
     // which is sound because we forbid impls like the following
     //
     // impl<D: Debug> AlwaysApplicable for D { }
-    let always_applicable_traits = impl1_predicates.iter().copied().filter(|&(predicate, _)| {
-        matches!(
-            trait_predicate_kind(tcx, predicate),
-            Some(TraitSpecializationKind::AlwaysApplicable)
-        )
-    });
+    let always_applicable_traits = impl1_predicates
+        .iter()
+        .copied()
+        .filter(|&(predicate, _)| {
+            matches!(
+                trait_predicate_kind(tcx, predicate),
+                Some(TraitSpecializationKind::AlwaysApplicable)
+            )
+        })
+        .map(|(pred, _span)| pred);
 
     // Include the well-formed predicates of the type parameters of the impl.
     for arg in tcx.impl_trait_ref(impl1_def_id).unwrap().subst_identity().substs {
@@ -376,14 +369,10 @@ fn check_predicates<'tcx>(
                 .unwrap();
 
         assert!(!obligations.needs_infer());
-        impl2_predicates.extend(
-            traits::elaborate_obligations(tcx, obligations).map(|obligation| obligation.predicate),
-        )
+        impl2_predicates
+            .extend(traits::elaborate(tcx, obligations).map(|obligation| obligation.predicate))
     }
-    impl2_predicates.extend(
-        traits::elaborate_predicates_with_span(tcx, always_applicable_traits)
-            .map(|obligation| obligation.predicate),
-    );
+    impl2_predicates.extend(traits::elaborate(tcx, always_applicable_traits));
 
     for (predicate, span) in impl1_predicates {
         if !impl2_predicates.iter().any(|pred2| trait_predicates_eq(tcx, predicate, *pred2, span)) {
@@ -528,7 +517,7 @@ fn trait_predicate_kind<'tcx>(
         | ty::PredicateKind::Clause(ty::Clause::TypeOutlives(_))
         | ty::PredicateKind::Clause(ty::Clause::Projection(_))
         | ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(..))
-        | ty::PredicateKind::AliasEq(..)
+        | ty::PredicateKind::AliasRelate(..)
         | ty::PredicateKind::WellFormed(_)
         | ty::PredicateKind::Subtype(_)
         | ty::PredicateKind::Coerce(_)

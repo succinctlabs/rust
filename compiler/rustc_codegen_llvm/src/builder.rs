@@ -2,7 +2,7 @@ use crate::abi::FnAbiLlvmExt;
 use crate::attributes;
 use crate::common::Funclet;
 use crate::context::CodegenCx;
-use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock};
+use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock, False, True};
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -841,7 +841,15 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     }
 
     fn intcast(&mut self, val: &'ll Value, dest_ty: &'ll Type, is_signed: bool) -> &'ll Value {
-        unsafe { llvm::LLVMRustBuildIntCast(self.llbuilder, val, dest_ty, is_signed) }
+        unsafe {
+            llvm::LLVMBuildIntCast2(
+                self.llbuilder,
+                val,
+                dest_ty,
+                if is_signed { True } else { False },
+                UNNAMED,
+            )
+        }
     }
 
     fn pointercast(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
@@ -990,7 +998,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
     fn resume(&mut self, exn0: &'ll Value, exn1: &'ll Value) {
         let ty = self.type_struct(&[self.type_i8p(), self.type_i32()], false);
-        let mut exn = self.const_undef(ty);
+        let mut exn = self.const_poison(ty);
         exn = self.insert_value(exn, exn0, 0);
         exn = self.insert_value(exn, exn1, 1);
         unsafe {
@@ -1001,11 +1009,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn cleanup_pad(&mut self, parent: Option<&'ll Value>, args: &[&'ll Value]) -> Funclet<'ll> {
         let name = cstr!("cleanuppad");
         let ret = unsafe {
-            llvm::LLVMRustBuildCleanupPad(
+            llvm::LLVMBuildCleanupPad(
                 self.llbuilder,
                 parent,
-                args.len() as c_uint,
                 args.as_ptr(),
+                args.len() as c_uint,
                 name.as_ptr(),
             )
         };
@@ -1014,7 +1022,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
     fn cleanup_ret(&mut self, funclet: &Funclet<'ll>, unwind: Option<&'ll BasicBlock>) {
         unsafe {
-            llvm::LLVMRustBuildCleanupRet(self.llbuilder, funclet.cleanuppad(), unwind)
+            llvm::LLVMBuildCleanupRet(self.llbuilder, funclet.cleanuppad(), unwind)
                 .expect("LLVM does not have support for cleanupret");
         }
     }
@@ -1022,11 +1030,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn catch_pad(&mut self, parent: &'ll Value, args: &[&'ll Value]) -> Funclet<'ll> {
         let name = cstr!("catchpad");
         let ret = unsafe {
-            llvm::LLVMRustBuildCatchPad(
+            llvm::LLVMBuildCatchPad(
                 self.llbuilder,
                 parent,
-                args.len() as c_uint,
                 args.as_ptr(),
+                args.len() as c_uint,
                 name.as_ptr(),
             )
         };
@@ -1041,7 +1049,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     ) -> &'ll Value {
         let name = cstr!("catchswitch");
         let ret = unsafe {
-            llvm::LLVMRustBuildCatchSwitch(
+            llvm::LLVMBuildCatchSwitch(
                 self.llbuilder,
                 parent,
                 unwind,
@@ -1052,7 +1060,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let ret = ret.expect("LLVM does not have support for catchswitch");
         for handler in handlers {
             unsafe {
-                llvm::LLVMRustAddHandler(ret, handler);
+                llvm::LLVMAddHandler(ret, handler);
             }
         }
         ret
@@ -1190,8 +1198,8 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         // Set KCFI operand bundle
         let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
         let kcfi_bundle =
-            if self.tcx.sess.is_sanitizer_kcfi_enabled() && fn_abi.is_some() && is_indirect_call {
-                let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi.unwrap());
+            if let Some(fn_abi) = fn_abi && self.tcx.sess.is_sanitizer_kcfi_enabled() && is_indirect_call {
+                let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi);
                 Some(llvm::OperandBundleDef::new("kcfi", &[self.const_u32(kcfi_typeid)]))
             } else {
                 None
@@ -1376,8 +1384,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     }
 
     pub fn catch_ret(&mut self, funclet: &Funclet<'ll>, unwind: &'ll BasicBlock) -> &'ll Value {
-        let ret =
-            unsafe { llvm::LLVMRustBuildCatchRet(self.llbuilder, funclet.cleanuppad(), unwind) };
+        let ret = unsafe { llvm::LLVMBuildCatchRet(self.llbuilder, funclet.cleanuppad(), unwind) };
         ret.expect("LLVM does not have support for catchret")
     }
 

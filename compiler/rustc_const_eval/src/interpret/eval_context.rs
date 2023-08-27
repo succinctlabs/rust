@@ -7,7 +7,7 @@ use either::{Either, Left, Right};
 use rustc_hir::{self as hir, def_id::DefId, definitions::DefPathData};
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir;
-use rustc_middle::mir::interpret::{ErrorHandled, InterpError, InvalidProgramInfo};
+use rustc_middle::mir::interpret::{ErrorHandled, InterpError};
 use rustc_middle::ty::layout::{
     self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOf, LayoutOfHelpers,
     TyAndLayout,
@@ -139,17 +139,6 @@ pub struct FrameInfo<'tcx> {
     pub lint_root: Option<hir::HirId>,
 }
 
-/// Unwind information.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub enum StackPopUnwind {
-    /// The cleanup block.
-    Cleanup(mir::BasicBlock),
-    /// No cleanup needs to be done.
-    Skip,
-    /// Unwinding is not allowed (UB).
-    NotAllowed,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq, Debug)] // Miri debug-prints these
 pub enum StackPopCleanup {
     /// Jump to the next block in the caller, or cause UB if None (that's a function
@@ -157,7 +146,7 @@ pub enum StackPopCleanup {
     /// we can validate it at that layout.
     /// `ret` stores the block we jump to on a normal return, while `unwind`
     /// stores the block used for cleanup during unwinding.
-    Goto { ret: Option<mir::BasicBlock>, unwind: StackPopUnwind },
+    Goto { ret: Option<mir::BasicBlock>, unwind: mir::UnwindAction },
     /// The root frame of the stack: nowhere else to jump to.
     /// `cleanup` says whether locals are deallocated. Static computation
     /// wants them leaked to intern what they need (and just throw away
@@ -508,14 +497,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         frame
             .instance
             .try_subst_mir_and_normalize_erasing_regions(*self.tcx, self.param_env, value)
-            .map_err(|e| {
-                self.tcx.sess.delay_span_bug(
-                    self.cur_span(),
-                    format!("failed to normalize {}", e.get_type_for_failure()).as_str(),
-                );
-
-                InterpError::InvalidProgram(InvalidProgramInfo::TooGeneric)
-            })
+            .map_err(|_| err_inval!(TooGeneric))
     }
 
     /// The `substs` are assumed to already be in our interpreter "universe" (param_env).
@@ -543,24 +525,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         local: mir::Local,
         layout: Option<TyAndLayout<'tcx>>,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
-        // `const_prop` runs into this with an invalid (empty) frame, so we
-        // have to support that case (mostly by skipping all caching).
-        match frame.locals.get(local).and_then(|state| state.layout.get()) {
-            None => {
-                let layout = from_known_layout(self.tcx, self.param_env, layout, || {
-                    let local_ty = frame.body.local_decls[local].ty;
-                    let local_ty =
-                        self.subst_from_frame_and_normalize_erasing_regions(frame, local_ty)?;
-                    self.layout_of(local_ty)
-                })?;
-                if let Some(state) = frame.locals.get(local) {
-                    // Layouts of locals are requested a lot, so we cache them.
-                    state.layout.set(Some(layout));
-                }
-                Ok(layout)
-            }
-            Some(layout) => Ok(layout),
+        let state = &frame.locals[local];
+        if let Some(layout) = state.layout.get() {
+            return Ok(layout);
         }
+
+        let layout = from_known_layout(self.tcx, self.param_env, layout, || {
+            let local_ty = frame.body.local_decls[local].ty;
+            let local_ty = self.subst_from_frame_and_normalize_erasing_regions(frame, local_ty)?;
+            self.layout_of(local_ty)
+        })?;
+
+        // Layouts of locals are requested a lot, so we cache them.
+        state.layout.set(Some(layout));
+        Ok(layout)
     }
 
     /// Returns the actual dynamic size and alignment of the place at the given type.
@@ -746,17 +724,21 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// *Unwind* to the given `target` basic block.
     /// Do *not* use for returning! Use `return_to_block` instead.
     ///
-    /// If `target` is `StackPopUnwind::Skip`, that indicates the function does not need cleanup
+    /// If `target` is `UnwindAction::Continue`, that indicates the function does not need cleanup
     /// during unwinding, and we will just keep propagating that upwards.
     ///
-    /// If `target` is `StackPopUnwind::NotAllowed`, that indicates the function does not allow
+    /// If `target` is `UnwindAction::Unreachable`, that indicates the function does not allow
     /// unwinding, and doing so is UB.
-    pub fn unwind_to_block(&mut self, target: StackPopUnwind) -> InterpResult<'tcx> {
+    pub fn unwind_to_block(&mut self, target: mir::UnwindAction) -> InterpResult<'tcx> {
         self.frame_mut().loc = match target {
-            StackPopUnwind::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
-            StackPopUnwind::Skip => Right(self.frame_mut().body.span),
-            StackPopUnwind::NotAllowed => {
+            mir::UnwindAction::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
+            mir::UnwindAction::Continue => Right(self.frame_mut().body.span),
+            mir::UnwindAction::Unreachable => {
                 throw_ub_format!("unwinding past a stack frame that does not allow unwinding")
+            }
+            mir::UnwindAction::Terminate => {
+                self.frame_mut().loc = Right(self.frame_mut().body.span);
+                M::abort(self, "panic in a function that cannot unwind".to_owned())?;
             }
         };
         Ok(())

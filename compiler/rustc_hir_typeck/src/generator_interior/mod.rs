@@ -13,7 +13,7 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::hir_id::HirIdSet;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Arm, Expr, ExprKind, Guard, HirId, Pat, PatKind};
-use rustc_infer::infer::RegionVariableOrigin;
+use rustc_infer::infer::{DefineOpaqueTypes, RegionVariableOrigin};
 use rustc_middle::middle::region::{self, Scope, ScopeData, YieldData};
 use rustc_middle::ty::fold::FnMutDelegate;
 use rustc_middle::ty::{self, BoundVariableKind, RvalueScopes, Ty, TyCtxt, TypeVisitableExt};
@@ -239,8 +239,7 @@ pub fn resolve_interior<'a, 'tcx>(
             // typeck had previously found constraints that would cause them to be related.
 
             let mut counter = 0;
-            let mut mk_bound_region = |span| {
-                let kind = ty::BrAnon(counter, span);
+            let mut mk_bound_region = |kind| {
                 let var = ty::BoundVar::from_u32(counter);
                 counter += 1;
                 ty::BoundRegion { var, kind }
@@ -252,24 +251,23 @@ pub fn resolve_interior<'a, 'tcx>(
                         let origin = fcx.region_var_origin(vid);
                         match origin {
                             RegionVariableOrigin::EarlyBoundRegion(span, _) => {
-                                mk_bound_region(Some(span))
+                                mk_bound_region(ty::BrAnon(Some(span)))
                             }
-                            _ => mk_bound_region(None),
+                            _ => mk_bound_region(ty::BrAnon(None)),
                         }
                     }
-                    // FIXME: these should use `BrNamed`
                     ty::ReEarlyBound(region) => {
-                        mk_bound_region(Some(fcx.tcx.def_span(region.def_id)))
+                        mk_bound_region(ty::BrNamed(region.def_id, region.name))
                     }
                     ty::ReLateBound(_, ty::BoundRegion { kind, .. })
                     | ty::ReFree(ty::FreeRegion { bound_region: kind, .. }) => match kind {
-                        ty::BoundRegionKind::BrAnon(_, span) => mk_bound_region(span),
-                        ty::BoundRegionKind::BrNamed(def_id, _) => {
-                            mk_bound_region(Some(fcx.tcx.def_span(def_id)))
+                        ty::BoundRegionKind::BrAnon(span) => mk_bound_region(ty::BrAnon(span)),
+                        ty::BoundRegionKind::BrNamed(def_id, sym) => {
+                            mk_bound_region(ty::BrNamed(def_id, sym))
                         }
-                        ty::BoundRegionKind::BrEnv => mk_bound_region(None),
+                        ty::BoundRegionKind::BrEnv => mk_bound_region(ty::BrAnon(None)),
                     },
-                    _ => mk_bound_region(None),
+                    _ => mk_bound_region(ty::BrAnon(None)),
                 };
                 let r = fcx.tcx.mk_re_late_bound(current_depth, br);
                 r
@@ -293,10 +291,7 @@ pub fn resolve_interior<'a, 'tcx>(
             type_causes,
             FnMutDelegate {
                 regions: &mut |br| {
-                    let kind = match br.kind {
-                        ty::BrAnon(_, span) => ty::BrAnon(counter, span),
-                        _ => br.kind,
-                    };
+                    let kind = br.kind;
                     let var = ty::BoundVar::from_usize(bound_vars.len());
                     bound_vars.push(ty::BoundVariableKind::Region(kind));
                     counter += 1;
@@ -313,8 +308,7 @@ pub fn resolve_interior<'a, 'tcx>(
     // Extract type components to build the witness type.
     let type_list = fcx.tcx.mk_type_list_from_iter(type_causes.iter().map(|cause| cause.ty));
     let bound_vars = fcx.tcx.mk_bound_variable_kinds(&bound_vars);
-    let witness =
-        fcx.tcx.mk_generator_witness(ty::Binder::bind_with_vars(type_list, bound_vars.clone()));
+    let witness = fcx.tcx.mk_generator_witness(ty::Binder::bind_with_vars(type_list, bound_vars));
 
     drop(typeck_results);
     // Store the generator types and spans into the typeck results for this generator.
@@ -327,7 +321,11 @@ pub fn resolve_interior<'a, 'tcx>(
     );
 
     // Unify the type variable inside the generator with the new witness
-    match fcx.at(&fcx.misc(body.value.span), fcx.param_env).eq(interior, witness) {
+    match fcx.at(&fcx.misc(body.value.span), fcx.param_env).eq(
+        DefineOpaqueTypes::No,
+        interior,
+        witness,
+    ) {
         Ok(ok) => fcx.register_infer_ok_obligations(ok),
         _ => bug!("failed to relate {interior} and {witness}"),
     }

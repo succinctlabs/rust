@@ -8,8 +8,8 @@
 //! https://rustc-dev-guide.rust-lang.org/traits/resolution.html#confirmation
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::lang_items::LangItem;
-use rustc_infer::infer::InferOk;
 use rustc_infer::infer::LateBoundRegionConversionTime::HigherRankedType;
+use rustc_infer::infer::{DefineOpaqueTypes, InferOk};
 use rustc_middle::ty::{
     self, Binder, GenericParamDefKind, InternalSubsts, SubstsRef, ToPolyTraitRef, ToPredicate,
     TraitRef, Ty, TyCtxt, TypeVisitableExt,
@@ -18,7 +18,7 @@ use rustc_session::config::TraitSolver;
 use rustc_span::def_id::DefId;
 
 use crate::traits::project::{normalize_with_depth, normalize_with_depth_to};
-use crate::traits::util::{self, closure_trait_ref_and_return_type, predicate_for_trait_def};
+use crate::traits::util::{self, closure_trait_ref_and_return_type};
 use crate::traits::vtable::{
     count_own_vtable_entries, prepare_vtable_segments, vtable_trait_first_method_offset,
     VtblSegment,
@@ -131,6 +131,12 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
         };
 
+        // The obligations returned by confirmation are recursively evaluated
+        // so we need to make sure they have the correct depth.
+        for subobligation in impl_src.borrow_nested_obligations_mut() {
+            subobligation.set_depth_from_parent(obligation.recursion_depth);
+        }
+
         if !obligation.predicate.is_const_if_const() {
             // normalize nested predicates according to parent predicate's constness.
             impl_src = impl_src.map(|mut o| {
@@ -177,7 +183,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         obligations.extend(self.infcx.commit_if_ok(|_| {
             self.infcx
                 .at(&obligation.cause, obligation.param_env)
-                .sup(placeholder_trait_predicate, candidate)
+                .sup(DefineOpaqueTypes::No, placeholder_trait_predicate, candidate)
                 .map(|InferOk { obligations, .. }| obligations)
                 .map_err(|_| Unimplemented)
         })?);
@@ -253,15 +259,13 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             };
 
             let cause = obligation.derived_cause(BuiltinDerivedObligation);
-            ensure_sufficient_stack(|| {
-                self.collect_predicates_for_types(
-                    obligation.param_env,
-                    cause,
-                    obligation.recursion_depth + 1,
-                    trait_def,
-                    nested,
-                )
-            })
+            self.collect_predicates_for_types(
+                obligation.param_env,
+                cause,
+                obligation.recursion_depth + 1,
+                trait_def,
+                nested,
+            )
         } else {
             vec![]
         };
@@ -462,7 +466,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         nested.extend(self.infcx.commit_if_ok(|_| {
             self.infcx
                 .at(&obligation.cause, obligation.param_env)
-                .sup(obligation_trait_ref, upcast_trait_ref)
+                .sup(DefineOpaqueTypes::No, obligation_trait_ref, upcast_trait_ref)
                 .map(|InferOk { obligations, .. }| obligations)
                 .map_err(|_| Unimplemented)
         })?);
@@ -601,10 +605,18 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         debug!(?obligation, "confirm_fn_pointer_candidate");
 
         let tcx = self.tcx();
-        let self_ty = self
+
+        let Some(self_ty) = self
             .infcx
-            .shallow_resolve(obligation.self_ty().no_bound_vars())
-            .expect("fn pointer should not capture bound vars from predicate");
+            .shallow_resolve(obligation.self_ty().no_bound_vars()) else
+        {
+            // FIXME: Ideally we'd support `for<'a> fn(&'a ()): Fn(&'a ())`,
+            // but we do not currently. Luckily, such a bound is not
+            // particularly useful, so we don't expect users to write
+            // them often.
+            return Err(SelectionError::Unimplemented);
+        };
+
         let sig = self_ty.fn_sig(tcx);
         let trait_ref = closure_trait_ref_and_return_type(
             tcx,
@@ -819,11 +831,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 )
             });
 
+        // needed to define opaque types for tests/ui/type-alias-impl-trait/assoc-projection-ice.rs
         self.infcx
             .at(&obligation.cause, obligation.param_env)
-            // needed for tests/ui/type-alias-impl-trait/assoc-projection-ice.rs
-            .define_opaque_types(true)
-            .sup(obligation_trait_ref, expected_trait_ref)
+            .sup(DefineOpaqueTypes::Yes, obligation_trait_ref, expected_trait_ref)
             .map(|InferOk { mut obligations, .. }| {
                 obligations.extend(nested);
                 obligations
@@ -888,7 +899,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let InferOk { obligations, .. } = self
                     .infcx
                     .at(&obligation.cause, obligation.param_env)
-                    .sup(target, source_trait)
+                    .sup(DefineOpaqueTypes::No, target, source_trait)
                     .map_err(|_| Unimplemented)?;
                 nested.extend(obligations);
 
@@ -987,7 +998,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let InferOk { obligations, .. } = self
                     .infcx
                     .at(&obligation.cause, obligation.param_env)
-                    .sup(target, source_trait)
+                    .sup(DefineOpaqueTypes::No, target, source_trait)
                     .map_err(|_| Unimplemented)?;
                 nested.extend(obligations);
 
@@ -1058,7 +1069,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let InferOk { obligations, .. } = self
                     .infcx
                     .at(&obligation.cause, obligation.param_env)
-                    .eq(b, a)
+                    .eq(DefineOpaqueTypes::No, b, a)
                     .map_err(|_| Unimplemented)?;
                 nested.extend(obligations);
             }
@@ -1073,6 +1084,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let tail_field = def
                     .non_enum_variant()
                     .fields
+                    .raw
                     .last()
                     .expect("expected unsized ADT to have a tail field");
                 let tail_field_ty = tcx.type_of(tail_field.did);
@@ -1106,19 +1118,16 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let InferOk { obligations, .. } = self
                     .infcx
                     .at(&obligation.cause, obligation.param_env)
-                    .eq(target, new_struct)
+                    .eq(DefineOpaqueTypes::No, target, new_struct)
                     .map_err(|_| Unimplemented)?;
                 nested.extend(obligations);
 
                 // Construct the nested `TailField<T>: Unsize<TailField<U>>` predicate.
-                nested.push(predicate_for_trait_def(
+                let tail_unsize_obligation = obligation.with(
                     tcx,
-                    obligation.param_env,
-                    obligation.cause.clone(),
-                    obligation.predicate.def_id(),
-                    obligation.recursion_depth + 1,
-                    [source_tail, target_tail],
-                ));
+                    tcx.mk_trait_ref(obligation.predicate.def_id(), [source_tail, target_tail]),
+                );
+                nested.push(tail_unsize_obligation);
             }
 
             // `(.., T)` -> `(.., U)`
@@ -1136,21 +1145,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 let InferOk { obligations, .. } = self
                     .infcx
                     .at(&obligation.cause, obligation.param_env)
-                    .eq(target, new_tuple)
+                    .eq(DefineOpaqueTypes::No, target, new_tuple)
                     .map_err(|_| Unimplemented)?;
                 nested.extend(obligations);
 
-                // Construct the nested `T: Unsize<U>` predicate.
-                nested.push(ensure_sufficient_stack(|| {
-                    predicate_for_trait_def(
-                        tcx,
-                        obligation.param_env,
-                        obligation.cause.clone(),
-                        obligation.predicate.def_id(),
-                        obligation.recursion_depth + 1,
-                        [a_last, b_last],
-                    )
-                }));
+                // Add a nested `T: Unsize<U>` predicate.
+                let last_unsize_obligation = obligation
+                    .with(tcx, tcx.mk_trait_ref(obligation.predicate.def_id(), [a_last, b_last]));
+                nested.push(last_unsize_obligation);
             }
 
             _ => bug!("source: {source}, target: {target}"),

@@ -6,6 +6,10 @@
 	3. Copy the filenames with updated suffixes from the directory.
 */
 
+:root {
+	--nav-sub-mobile-padding: 8px;
+}
+
 /* See FiraSans-LICENSE.txt for the Fira Sans license. */
 @font-face {
 	font-family: 'Fira Sans';
@@ -85,21 +89,6 @@
 
 * {
 	box-sizing: border-box;
-}
-
-/* This part handles the "default" theme being used depending on the system one. */
-html {
-	content: "";
-}
-@media (prefers-color-scheme: light) {
-	html {
-		content: "light";
-	}
-}
-@media (prefers-color-scheme: dark) {
-	html {
-		content: "dark";
-	}
 }
 
 /* General structure and fonts */
@@ -217,7 +206,7 @@ ul.all-items {
 a.anchor,
 .small-section-header a,
 #source-sidebar a,
-pre.rust a,
+.rust a,
 .sidebar h2 a,
 .sidebar h3 a,
 .mobile-topbar h2 a,
@@ -228,43 +217,43 @@ h1 a,
 	color: var(--main-color);
 }
 
-.content span.enum, .content a.enum,
-.content span.struct, .content a.struct,
-.content span.union, .content a.union,
-.content span.primitive, .content a.primitive,
-.content span.type, .content a.type,
-.content span.foreigntype, .content a.foreigntype {
+span.enum, a.enum,
+span.struct, a.struct,
+span.union, a.union,
+span.primitive, a.primitive,
+span.type, a.type,
+span.foreigntype, a.foreigntype {
 	color: var(--type-link-color);
 }
 
-.content span.trait, .content a.trait,
-.content span.traitalias, .content a.traitalias {
+span.trait, a.trait,
+span.traitalias, a.traitalias {
 	color: var(--trait-link-color);
 }
 
-.content span.associatedtype, .content a.associatedtype,
-.content span.constant, .content a.constant,
-.content span.static, .content a.static {
+span.associatedtype, a.associatedtype,
+span.constant, a.constant,
+span.static, a.static {
 	color: var(--assoc-item-link-color);
 }
 
-.content span.fn, .content a.fn,
-.content span.method, .content a.method,
-.content span.tymethod, .content a.tymethod {
+span.fn, a.fn,
+span.method, a.method,
+span.tymethod, a.tymethod {
 	color: var(--function-link-color);
 }
 
-.content span.attr, .content a.attr,
-.content span.derive, .content a.derive,
-.content span.macro, .content a.macro {
+span.attr, a.attr,
+span.derive, a.derive,
+span.macro, a.macro {
 	color: var(--macro-link-color);
 }
 
-.content span.mod, .content a.mod {
+span.mod, a.mod {
 	color: var(--mod-link-color);
 }
 
-.content span.keyword, .content a.keyword {
+span.keyword, a.keyword {
 	color: var(--keyword-link-color);
 }
 
@@ -363,7 +352,7 @@ pre.item-decl {
 .source .content pre {
 	padding: 20px;
 }
-.rustdoc.source .example-wrap > pre.src-line-numbers  {
+.rustdoc.source .example-wrap pre.src-line-numbers  {
 	padding: 20px 0 20px 4px;
 }
 
@@ -395,6 +384,7 @@ img {
 	font-size: 0.875rem;
 	flex: 0 0 200px;
 	overflow-y: scroll;
+	overscroll-behavior: contain;
 	position: sticky;
 	height: 100vh;
 	top: 0;
@@ -407,6 +397,7 @@ img {
 	overflow-x: hidden;
 	/* The sidebar is by default hidden  */
 	overflow-y: hidden;
+	z-index: 1;
 }
 
 .sidebar, .mobile-topbar, .sidebar-menu-toggle,
@@ -547,14 +538,17 @@ ul.block, .block li {
 	margin-bottom: 0px;
 }
 
-.rustdoc .example-wrap > pre {
+.rustdoc .example-wrap pre {
 	margin: 0;
 	flex-grow: 1;
+}
+
+.rustdoc:not(.source) .example-wrap pre {
 	overflow: auto hidden;
 }
 
-.rustdoc .example-wrap > pre.example-line-numbers,
-.rustdoc .example-wrap > pre.src-line-numbers {
+.rustdoc .example-wrap pre.example-line-numbers,
+.rustdoc .example-wrap pre.src-line-numbers {
 	flex-grow: 0;
 	min-width: fit-content; /* prevent collapsing into nothing in truncated scraped examples */
 	overflow: initial;
@@ -565,7 +559,7 @@ ul.block, .block li {
 	color: var(--src-line-numbers-span-color);
 }
 
-.rustdoc .example-wrap > pre.src-line-numbers {
+.rustdoc .example-wrap pre.src-line-numbers {
 	padding: 14px 0;
 }
 .src-line-numbers a, .src-line-numbers span {
@@ -713,7 +707,7 @@ h2.small-section-header > .anchor {
 }
 
 .main-heading a:hover,
-.example-wrap > pre.rust a:hover,
+.example-wrap .rust a:hover,
 .all-items a:hover,
 .docblock a:not(.test-arrow):not(.scrape-help):not(.tooltip):hover,
 .docblock-short a:not(.test-arrow):not(.scrape-help):not(.tooltip):hover,
@@ -1538,7 +1532,7 @@ However, it's not needed with smaller screen width because the doc/code block is
 /*
 WARNING: RUSTDOC_MOBILE_BREAKPOINT MEDIA QUERY
 If you update this line, then you also need to update the line with the same warning
-in storage.js
+in source-script.js
 */
 @media (max-width: 700px) {
 	/* When linking to an item with an `id` (for instance, by clicking a link in the sidebar,
@@ -1737,7 +1731,7 @@ in storage.js
 
 	.source nav.sub {
 		margin: 0;
-		padding: 8px;
+		padding: var(--nav-sub-mobile-padding);
 	}
 }
 
@@ -1794,6 +1788,7 @@ in storage.js
 	.sub-logo-container > img {
 		height: 35px;
 		width: 35px;
+		margin-bottom: var(--nav-sub-mobile-padding);
 	}
 }
 

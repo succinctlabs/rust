@@ -109,7 +109,7 @@ fn assert_default_hashing_controls<CTX: HashStableContext>(ctx: &CTX, msg: &str)
         // This is the case for instance when building a hash for name mangling.
         // Such configuration must not be used for metadata.
         HashingControls { hash_spans }
-            if hash_spans == !ctx.unstable_opts_incremental_ignore_spans() => {}
+            if hash_spans != ctx.unstable_opts_incremental_ignore_spans() => {}
         other => panic!("Attempted hashing of {msg} with non-default HashingControls: {other:?}"),
     }
 }
@@ -880,7 +880,7 @@ impl Span {
     pub fn fresh_expansion(self, expn_id: LocalExpnId) -> Span {
         HygieneData::with(|data| {
             self.with_ctxt(data.apply_mark(
-                SyntaxContext::root(),
+                self.ctxt(),
                 expn_id.to_expn_id(),
                 Transparency::Transparent,
             ))
@@ -1151,6 +1151,7 @@ pub enum DesugaringKind {
     Await,
     ForLoop,
     WhileLoop,
+    Replace,
 }
 
 impl DesugaringKind {
@@ -1166,6 +1167,7 @@ impl DesugaringKind {
             DesugaringKind::OpaqueTy => "`impl Trait`",
             DesugaringKind::ForLoop => "`for` loop",
             DesugaringKind::WhileLoop => "`while` loop",
+            DesugaringKind::Replace => "drop and replace",
         }
     }
 }
@@ -1205,7 +1207,7 @@ impl HygieneEncodeContext {
         // a `SyntaxContext` that we haven't seen before
         while !self.latest_ctxts.lock().is_empty() || !self.latest_expns.lock().is_empty() {
             debug!(
-                "encode_hygiene: Serializing a round of {:?} SyntaxContextDatas: {:?}",
+                "encode_hygiene: Serializing a round of {:?} SyntaxContextData: {:?}",
                 self.latest_ctxts.lock().len(),
                 self.latest_ctxts
             );

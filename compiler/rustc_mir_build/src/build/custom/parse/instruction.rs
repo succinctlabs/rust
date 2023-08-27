@@ -1,8 +1,9 @@
 use rustc_middle::mir::interpret::{ConstValue, Scalar};
 use rustc_middle::mir::tcx::PlaceTy;
+use rustc_middle::ty::cast::mir_cast_kind;
 use rustc_middle::{mir::*, thir::*, ty};
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use crate::build::custom::ParseError;
 use crate::build::expr::as_constant::as_constant_inner;
@@ -55,15 +56,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 Ok(TerminatorKind::Drop {
                     place: self.parse_place(args[0])?,
                     target: self.parse_block(args[1])?,
-                    unwind: None,
-                })
-            },
-            @call("mir_drop_and_replace", args) => {
-                Ok(TerminatorKind::DropAndReplace {
-                    place: self.parse_place(args[0])?,
-                    value: self.parse_operand(args[1])?,
-                    target: self.parse_block(args[2])?,
-                    unwind: None,
+                    unwind: UnwindAction::Continue,
                 })
             },
             @call("mir_call", args) => {
@@ -133,7 +126,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                     args,
                     destination,
                     target: Some(target),
-                    cleanup: None,
+                    unwind: UnwindAction::Continue,
                     from_hir_call: *from_hir_call,
                     fn_span: *fn_span,
                 })
@@ -142,14 +135,23 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
     }
 
     fn parse_rvalue(&self, expr_id: ExprId) -> PResult<Rvalue<'tcx>> {
-        parse_by_kind!(self, expr_id, _, "rvalue",
+        parse_by_kind!(self, expr_id, expr, "rvalue",
             @call("mir_discriminant", args) => self.parse_place(args[0]).map(Rvalue::Discriminant),
+            @call("mir_cast_transmute", args) => {
+                let source = self.parse_operand(args[0])?;
+                Ok(Rvalue::Cast(CastKind::Transmute, source, expr.ty))
+            },
             @call("mir_checked", args) => {
                 parse_by_kind!(self, args[0], _, "binary op",
                     ExprKind::Binary { op, lhs, rhs } => Ok(Rvalue::CheckedBinaryOp(
                         *op, Box::new((self.parse_operand(*lhs)?, self.parse_operand(*rhs)?))
                     )),
                 )
+            },
+            @call("mir_offset", args) => {
+                let ptr = self.parse_operand(args[0])?;
+                let offset = self.parse_operand(args[1])?;
+                Ok(Rvalue::BinaryOp(BinOp::Offset, Box::new((ptr, offset))))
             },
             @call("mir_len", args) => Ok(Rvalue::Len(self.parse_place(args[0])?)),
             ExprKind::Borrow { borrow_kind, arg } => Ok(
@@ -167,6 +169,34 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
             ExprKind::Repeat { value, count } => Ok(
                 Rvalue::Repeat(self.parse_operand(*value)?, *count)
             ),
+            ExprKind::Cast { source } => {
+                let source = self.parse_operand(*source)?;
+                let source_ty = source.ty(self.body.local_decls(), self.tcx);
+                let cast_kind = mir_cast_kind(source_ty, expr.ty);
+                Ok(Rvalue::Cast(cast_kind, source, expr.ty))
+            },
+            ExprKind::Tuple { fields } => Ok(
+                Rvalue::Aggregate(
+                    Box::new(AggregateKind::Tuple),
+                    fields.iter().map(|e| self.parse_operand(*e)).collect::<Result<_, _>>()?
+                )
+            ),
+            ExprKind::Array { fields } => {
+                let elem_ty = expr.ty.builtin_index().expect("ty must be an array");
+                Ok(Rvalue::Aggregate(
+                    Box::new(AggregateKind::Array(elem_ty)),
+                    fields.iter().map(|e| self.parse_operand(*e)).collect::<Result<_, _>>()?
+                ))
+            },
+            ExprKind::Adt(box AdtExpr{ adt_def, variant_index, substs, fields, .. }) => {
+                let is_union = adt_def.is_union();
+                let active_field_index = is_union.then(|| fields[0].name);
+
+                Ok(Rvalue::Aggregate(
+                    Box::new(AggregateKind::Adt(adt_def.did(), *variant_index, substs, None, active_field_index)),
+                    fields.iter().map(|f| self.parse_operand(f.expr)).collect::<Result<_, _>>()?
+                ))
+            },
             _ => self.parse_operand(expr_id).map(Rvalue::Use),
         )
     }
@@ -198,7 +228,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
         let (parent, proj) = parse_by_kind!(self, expr_id, expr, "place",
             @call("mir_field", args) => {
                 let (parent, ty) = self.parse_place_inner(args[0])?;
-                let field = Field::from_u32(self.parse_integer_literal(args[1])? as u32);
+                let field = FieldIdx::from_u32(self.parse_integer_literal(args[1])? as u32);
                 let field_ty = ty.field_ty(self.tcx, field);
                 let proj = PlaceElem::Field(field, field_ty);
                 let place = parent.project_deeper(&[proj], self.tcx);

@@ -246,7 +246,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             self.check_local_or_return_ty(return_ty.skip_binder(), RETURN_PLACE);
         }
 
-        if !tcx.has_attr(def_id.to_def_id(), sym::rustc_do_not_const_check) {
+        if !tcx.has_attr(def_id, sym::rustc_do_not_const_check) {
             self.visit_body(&body);
         }
 
@@ -412,9 +412,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         BorrowKind::Shallow => {
                             PlaceContext::NonMutatingUse(NonMutatingUseContext::ShallowBorrow)
                         }
-                        BorrowKind::Unique => {
-                            PlaceContext::NonMutatingUse(NonMutatingUseContext::UniqueBorrow)
-                        }
+                        BorrowKind::Unique => PlaceContext::MutatingUse(MutatingUseContext::Borrow),
                         BorrowKind::Mut { .. } => {
                             PlaceContext::MutatingUse(MutatingUseContext::Borrow)
                         }
@@ -553,7 +551,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             }
 
             Rvalue::Cast(CastKind::DynStar, _, _) => {
-                unimplemented!()
+                // `dyn*` coercion is implemented for CTFE.
             }
 
             Rvalue::Cast(_, _, _) => {}
@@ -643,7 +641,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 if base_ty.is_unsafe_ptr() {
                     if proj_base.is_empty() {
                         let decl = &self.body.local_decls[place_local];
-                        if let Some(box LocalInfo::StaticRef { def_id, .. }) = decl.local_info {
+                        if let LocalInfo::StaticRef { def_id, .. } = *decl.local_info() {
                             let span = decl.source_info.span;
                             self.check_static(def_id, span);
                             return;
@@ -690,6 +688,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
             | StatementKind::Retag { .. }
+            | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)
@@ -721,6 +720,32 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     }
                 };
 
+                // Check that all trait bounds that are marked as `~const` can be satisfied.
+                //
+                // Typeck only does a "non-const" check since it operates on HIR and cannot distinguish
+                // which path expressions are getting called on and which path expressions are only used
+                // as function pointers. This is required for correctness.
+                let infcx = tcx.infer_ctxt().build();
+                let ocx = ObligationCtxt::new(&infcx);
+
+                let predicates = tcx.predicates_of(callee).instantiate(tcx, substs);
+                let cause = ObligationCause::new(
+                    terminator.source_info.span,
+                    self.body.source.def_id().expect_local(),
+                    ObligationCauseCode::ItemObligation(callee),
+                );
+                let normalized_predicates = ocx.normalize(&cause, param_env, predicates);
+                ocx.register_obligations(traits::predicates_for_generics(
+                    |_, _| cause.clone(),
+                    self.param_env,
+                    normalized_predicates,
+                ));
+
+                let errors = ocx.select_all_or_error();
+                if !errors.is_empty() {
+                    infcx.err_ctxt().report_fulfillment_errors(&errors);
+                }
+
                 // Attempting to call a trait method?
                 if let Some(trait_id) = tcx.trait_of_item(callee) {
                     trace!("attempting to call a trait method");
@@ -747,31 +772,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                         let mut selcx = SelectionContext::new(&infcx);
                         selcx.select(&obligation)
                     };
-
-                    // do a well-formedness check on the trait method being called. This is because typeck only does a
-                    // "non-const" check. This is required for correctness here.
-                    {
-                        let infcx = tcx.infer_ctxt().build();
-                        let ocx = ObligationCtxt::new(&infcx);
-
-                        let predicates = tcx.predicates_of(callee).instantiate(tcx, substs);
-                        let cause = ObligationCause::new(
-                            terminator.source_info.span,
-                            self.body.source.def_id().expect_local(),
-                            ObligationCauseCode::ItemObligation(callee),
-                        );
-                        let normalized_predicates = ocx.normalize(&cause, param_env, predicates);
-                        ocx.register_obligations(traits::predicates_for_generics(
-                            |_, _| cause.clone(),
-                            self.param_env,
-                            normalized_predicates,
-                        ));
-
-                        let errors = ocx.select_all_or_error();
-                        if !errors.is_empty() {
-                            infcx.err_ctxt().report_fulfillment_errors(&errors, None);
-                        }
-                    }
 
                     match implsrc {
                         Ok(Some(ImplSource::Param(_, ty::BoundConstness::ConstIfConst))) => {
@@ -926,15 +926,24 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 // If the `const fn` we are trying to call is not const-stable, ensure that we have
                 // the proper feature gate enabled.
-                if let Some(gate) = is_unstable_const_fn(tcx, callee) {
+                if let Some((gate, implied_by)) = is_unstable_const_fn(tcx, callee) {
                     trace!(?gate, "calling unstable const fn");
                     if self.span.allows_unstable(gate) {
                         return;
                     }
+                    if let Some(implied_by_gate) = implied_by && self.span.allows_unstable(implied_by_gate) {
+                        return;
+                    }
 
                     // Calling an unstable function *always* requires that the corresponding gate
-                    // be enabled, even if the function has `#[rustc_allow_const_fn_unstable(the_gate)]`.
-                    if !tcx.features().declared_lib_features.iter().any(|&(sym, _)| sym == gate) {
+                    // (or implied gate) be enabled, even if the function has
+                    // `#[rustc_allow_const_fn_unstable(the_gate)]`.
+                    let gate_declared = |gate| {
+                        tcx.features().declared_lib_features.iter().any(|&(sym, _)| sym == gate)
+                    };
+                    let feature_gate_declared = gate_declared(gate);
+                    let implied_gate_declared = implied_by.map(gate_declared).unwrap_or(false);
+                    if !feature_gate_declared && !implied_gate_declared {
                         self.check_op(ops::FnCallUnstable(callee, Some(gate)));
                         return;
                     }
@@ -947,7 +956,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     }
 
                     // Otherwise, we are something const-stable calling a const-unstable fn.
-
                     if super::rustc_allow_const_fn_unstable(tcx, caller, gate) {
                         trace!("rustc_allow_const_fn_unstable gate active");
                         return;
@@ -977,8 +985,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
             // Forbid all `Drop` terminators unless the place being dropped is a local with no
             // projections that cannot be `NeedsNonConstDrop`.
-            TerminatorKind::Drop { place: dropped_place, .. }
-            | TerminatorKind::DropAndReplace { place: dropped_place, .. } => {
+            TerminatorKind::Drop { place: dropped_place, .. } => {
                 // If we are checking live drops after drop-elaboration, don't emit duplicate
                 // errors here.
                 if super::post_drop_elaboration::checking_enabled(self.ccx) {
@@ -1022,9 +1029,9 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 self.check_op(ops::Generator(hir::GeneratorKind::Gen))
             }
 
-            TerminatorKind::Abort => {
+            TerminatorKind::Terminate => {
                 // Cleanup blocks are skipped for const checking (see `visit_basic_block_data`).
-                span_bug!(self.span, "`Abort` terminator outside of cleanup block")
+                span_bug!(self.span, "`Terminate` terminator outside of cleanup block")
             }
 
             TerminatorKind::Assert { .. }

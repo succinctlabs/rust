@@ -398,6 +398,8 @@ fn run_test(
     compiler.stdin(Stdio::piped());
     compiler.stderr(Stdio::piped());
 
+    debug!("compiler invocation for doctest: {:?}", compiler);
+
     let mut child = compiler.spawn().expect("Failed to spawn rustc process");
     {
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
@@ -1057,6 +1059,16 @@ impl Tester for Collector {
                     Ignore::Some(ref ignores) => ignores.iter().any(|s| target_str.contains(s)),
                 },
                 ignore_message: None,
+                #[cfg(not(bootstrap))]
+                source_file: "",
+                #[cfg(not(bootstrap))]
+                start_line: 0,
+                #[cfg(not(bootstrap))]
+                start_col: 0,
+                #[cfg(not(bootstrap))]
+                end_line: 0,
+                #[cfg(not(bootstrap))]
+                end_col: 0,
                 // compiler failures are test failures
                 should_panic: test::ShouldPanic::No,
                 compile_fail: config.compile_fail,
@@ -1229,8 +1241,9 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
         if let Some(doc) = attrs.collapsed_doc_value() {
             // Use the outermost invocation, so that doctest names come from where the docs were written.
             let span = ast_attrs
-                .span()
-                .map(|span| span.ctxt().outer_expn().expansion_cause().unwrap_or(span))
+                .iter()
+                .find(|attr| attr.doc_str().is_some())
+                .map(|attr| attr.span.ctxt().outer_expn().expansion_cause().unwrap_or(attr.span))
                 .unwrap_or(DUMMY_SP);
             self.collector.set_position(span);
             markdown::find_testable_code(

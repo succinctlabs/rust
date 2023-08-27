@@ -12,16 +12,14 @@
   
       bb0: {
           _1 = const 1_u32;                // scope 0 at $DIR/scalar_literal_propagation.rs:+1:13: +1:14
-          StorageLive(_2);                 // scope 1 at $DIR/scalar_literal_propagation.rs:+2:5: +2:15
 -         _2 = consume(_1) -> bb1;         // scope 1 at $DIR/scalar_literal_propagation.rs:+2:5: +2:15
 +         _2 = consume(const 1_u32) -> bb1; // scope 1 at $DIR/scalar_literal_propagation.rs:+2:5: +2:15
                                            // mir::Constant
-                                           // + span: $DIR/scalar_literal_propagation.rs:4:5: 4:12
+                                           // + span: $DIR/scalar_literal_propagation.rs:5:5: 5:12
                                            // + literal: Const { ty: fn(u32) {consume}, val: Value(<ZST>) }
       }
   
       bb1: {
-          StorageDead(_2);                 // scope 1 at $DIR/scalar_literal_propagation.rs:+2:15: +2:16
           return;                          // scope 0 at $DIR/scalar_literal_propagation.rs:+3:2: +3:2
       }
   }

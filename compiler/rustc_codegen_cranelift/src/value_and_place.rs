@@ -3,13 +3,14 @@
 use crate::prelude::*;
 
 use cranelift_codegen::ir::immediates::Offset32;
+use cranelift_codegen::ir::{InstructionData, Opcode};
 
 fn codegen_field<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     base: Pointer,
     extra: Option<Value>,
     layout: TyAndLayout<'tcx>,
-    field: mir::Field,
+    field: FieldIdx,
 ) -> (Pointer, TyAndLayout<'tcx>) {
     let field_offset = layout.fields.offset(field.index());
     let field_layout = layout.field(&*fx, field.index());
@@ -209,7 +210,7 @@ impl<'tcx> CValue<'tcx> {
     pub(crate) fn value_field(
         self,
         fx: &mut FunctionCx<'_, '_, 'tcx>,
-        field: mir::Field,
+        field: FieldIdx,
     ) -> CValue<'tcx> {
         let layout = self.1;
         match self.0 {
@@ -457,6 +458,7 @@ impl<'tcx> CPlace<'tcx> {
         }
     }
 
+    #[track_caller]
     pub(crate) fn to_ptr(self) -> Pointer {
         match self.to_ptr_maybe_unsized() {
             (ptr, None) => ptr,
@@ -464,6 +466,7 @@ impl<'tcx> CPlace<'tcx> {
         }
     }
 
+    #[track_caller]
     pub(crate) fn to_ptr_maybe_unsized(self) -> (Pointer, Option<Value>) {
         match self.inner {
             CPlaceInner::Addr(ptr, extra) => (ptr, extra),
@@ -684,7 +687,7 @@ impl<'tcx> CPlace<'tcx> {
     pub(crate) fn place_field(
         self,
         fx: &mut FunctionCx<'_, '_, 'tcx>,
-        field: mir::Field,
+        field: FieldIdx,
     ) -> CPlace<'tcx> {
         let layout = self.layout();
 
@@ -698,7 +701,8 @@ impl<'tcx> CPlace<'tcx> {
                     };
                 }
                 ty::Adt(adt_def, substs) if layout.ty.is_simd() => {
-                    let f0_ty = adt_def.non_enum_variant().fields[0].ty(fx.tcx, substs);
+                    let f0 = &adt_def.non_enum_variant().fields[FieldIdx::from_u32(0)];
+                    let f0_ty = f0.ty(fx.tcx, substs);
 
                     match f0_ty.kind() {
                         ty::Array(_, _) => {
@@ -787,7 +791,36 @@ impl<'tcx> CPlace<'tcx> {
         index: Value,
     ) -> CPlace<'tcx> {
         let (elem_layout, ptr) = match self.layout().ty.kind() {
-            ty::Array(elem_ty, _) => (fx.layout_of(*elem_ty), self.to_ptr()),
+            ty::Array(elem_ty, _) => {
+                let elem_layout = fx.layout_of(*elem_ty);
+                match self.inner {
+                    CPlaceInner::Var(local, var) => {
+                        // This is a hack to handle `vector_val.0[1]`. It doesn't allow dynamic
+                        // indexing.
+                        let lane_idx = match fx.bcx.func.dfg.insts
+                            [fx.bcx.func.dfg.value_def(index).unwrap_inst()]
+                        {
+                            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => imm,
+                            _ => bug!(
+                                "Dynamic indexing into a vector type is not supported: {self:?}[{index}]"
+                            ),
+                        };
+                        return CPlace {
+                            inner: CPlaceInner::VarLane(
+                                local,
+                                var,
+                                lane_idx.bits().try_into().unwrap(),
+                            ),
+                            layout: elem_layout,
+                        };
+                    }
+                    CPlaceInner::Addr(addr, None) => (elem_layout, addr),
+                    CPlaceInner::Addr(_, Some(_))
+                    | CPlaceInner::VarPair(_, _, _)
+                    | CPlaceInner::VarLane(_, _, _) => bug!("Can't index into {self:?}"),
+                }
+                // FIXME use VarLane in case of Var with simd type
+            }
             ty::Slice(elem_ty) => (fx.layout_of(*elem_ty), self.to_ptr_maybe_unsized().0),
             _ => bug!("place_index({:?})", self.layout().ty),
         };

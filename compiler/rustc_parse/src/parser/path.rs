@@ -1,6 +1,6 @@
 use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
 use super::{Parser, Restrictions, TokenType};
-use crate::maybe_whole;
+use crate::{errors, maybe_whole};
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Delimiter, Token, TokenKind};
 use rustc_ast::{
@@ -290,6 +290,32 @@ impl<'a> Parser<'a> {
                     })?;
                     let span = lo.to(self.prev_token.span);
                     AngleBracketedArgs { args, span }.into()
+                } else if self.may_recover()
+                    && self.token.kind == token::OpenDelim(Delimiter::Parenthesis)
+                    // FIXME(return_type_notation): Could also recover `...` here.
+                    && self.look_ahead(1, |tok| tok.kind == token::DotDot)
+                {
+                    self.bump();
+                    self.sess
+                        .emit_err(errors::BadReturnTypeNotationDotDot { span: self.token.span });
+                    self.bump();
+                    self.expect(&token::CloseDelim(Delimiter::Parenthesis))?;
+                    let span = lo.to(self.prev_token.span);
+
+                    if self.eat_noexpect(&token::RArrow) {
+                        let lo = self.prev_token.span;
+                        let ty = self.parse_ty()?;
+                        self.sess
+                            .emit_err(errors::BadReturnTypeNotationOutput { span: lo.to(ty.span) });
+                    }
+
+                    ParenthesizedArgs {
+                        span,
+                        inputs: ThinVec::new(),
+                        inputs_span: span,
+                        output: ast::FnRetTy::Default(self.prev_token.span.shrink_to_hi()),
+                    }
+                    .into()
                 } else {
                     // `(T, U) -> R`
                     let (inputs, _) = self.parse_paren_comma_seq(|p| p.parse_ty())?;
@@ -300,7 +326,7 @@ impl<'a> Parser<'a> {
                     ParenthesizedArgs { span, inputs, inputs_span, output }.into()
                 };
 
-                PathSegment { ident, args, id: ast::DUMMY_NODE_ID }
+                PathSegment { ident, args: Some(args), id: ast::DUMMY_NODE_ID }
             } else {
                 // Generic arguments are not found.
                 PathSegment::from_ident(ident)
@@ -547,10 +573,16 @@ impl<'a> Parser<'a> {
                     };
 
                     let span = lo.to(self.prev_token.span);
-
                     // Gate associated type bounds, e.g., `Iterator<Item: Ord>`.
                     if let AssocConstraintKind::Bound { .. } = kind {
-                        self.sess.gated_spans.gate(sym::associated_type_bounds, span);
+                        if let Some(ast::GenericArgs::Parenthesized(args)) = &gen_args
+                            && args.inputs.is_empty()
+                            && matches!(args.output, ast::FnRetTy::Default(..))
+                        {
+                            self.sess.gated_spans.gate(sym::return_type_notation, span);
+                        } else {
+                            self.sess.gated_spans.gate(sym::associated_type_bounds, span);
+                        }
                     }
                     let constraint =
                         AssocConstraint { id: ast::DUMMY_NODE_ID, ident, gen_args, kind, span };

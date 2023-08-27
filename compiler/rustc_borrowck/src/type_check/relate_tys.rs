@@ -4,6 +4,7 @@ use rustc_infer::traits::PredicateObligations;
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::ty::relate::TypeRelation;
 use rustc_middle::ty::{self, Ty};
+use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 use rustc_trait_selection::traits::query::Fallible;
 
@@ -123,18 +124,17 @@ impl<'tcx> TypeRelatingDelegate<'tcx> for NllTypeRelatingDelegate<'_, '_, 'tcx> 
             .constraints
             .placeholder_region(self.type_checker.infcx, placeholder);
 
-        let reg_info = match placeholder.name {
-            ty::BoundRegionKind::BrAnon(_, Some(span)) => BoundRegionInfo::Span(span),
-            ty::BoundRegionKind::BrAnon(..) => BoundRegionInfo::Name(Symbol::intern("anon")),
+        let reg_info = match placeholder.bound.kind {
+            ty::BoundRegionKind::BrAnon(Some(span)) => BoundRegionInfo::Span(span),
+            ty::BoundRegionKind::BrAnon(..) => BoundRegionInfo::Name(sym::anon),
             ty::BoundRegionKind::BrNamed(_, name) => BoundRegionInfo::Name(name),
-            ty::BoundRegionKind::BrEnv => BoundRegionInfo::Name(Symbol::intern("env")),
+            ty::BoundRegionKind::BrEnv => BoundRegionInfo::Name(sym::env),
         };
 
-        let reg_var =
-            reg.as_var().unwrap_or_else(|| bug!("expected region {:?} to be of kind ReVar", reg));
-        let mut var_to_origin = self.type_checker.infcx.reg_var_to_origin.borrow_mut();
-        let prev = var_to_origin.insert(reg_var, RegionCtxt::Placeholder(reg_info));
-        assert!(matches!(prev, None));
+        if cfg!(debug_assertions) && !self.type_checker.infcx.inside_canonicalization_ctxt() {
+            let mut var_to_origin = self.type_checker.infcx.reg_var_to_origin.borrow_mut();
+            var_to_origin.insert(reg.as_var(), RegionCtxt::Placeholder(reg_info));
+        }
 
         reg
     }
@@ -146,17 +146,9 @@ impl<'tcx> TypeRelatingDelegate<'tcx> for NllTypeRelatingDelegate<'_, '_, 'tcx> 
             universe,
         );
 
-        let reg_var =
-            reg.as_var().unwrap_or_else(|| bug!("expected region {:?} to be of kind ReVar", reg));
-
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !self.type_checker.infcx.inside_canonicalization_ctxt() {
             let mut var_to_origin = self.type_checker.infcx.reg_var_to_origin.borrow_mut();
-            let prev = var_to_origin.insert(reg_var, RegionCtxt::Existential(None));
-
-            // It only makes sense to track region vars in non-canonicalization contexts. If this
-            // ever changes we either want to get rid of `BorrowckInferContext::reg_var_to_origin`
-            // or modify how we track nll region vars for that map.
-            assert!(matches!(prev, None));
+            var_to_origin.insert(reg.as_var(), RegionCtxt::Existential(None));
         }
 
         reg

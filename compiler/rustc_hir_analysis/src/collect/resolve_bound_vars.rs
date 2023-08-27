@@ -17,7 +17,7 @@ use rustc_hir::{GenericArg, GenericParam, GenericParamKind, HirIdMap, LifetimeNa
 use rustc_middle::bug;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::resolve_bound_vars::*;
-use rustc_middle::ty::{self, DefIdTree, TyCtxt, TypeSuperVisitable, TypeVisitor};
+use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitor};
 use rustc_session::lint;
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::{sym, Ident};
@@ -1051,9 +1051,8 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
     }
 }
 
-fn object_lifetime_default(tcx: TyCtxt<'_>, param_def_id: DefId) -> ObjectLifetimeDefault {
+fn object_lifetime_default(tcx: TyCtxt<'_>, param_def_id: LocalDefId) -> ObjectLifetimeDefault {
     debug_assert_eq!(tcx.def_kind(param_def_id), DefKind::TyParam);
-    let param_def_id = param_def_id.expect_local();
     let hir::Node::GenericParam(param) = tcx.hir().get_by_def_id(param_def_id) else {
         bug!("expected GenericParam for object_lifetime_default");
     };
@@ -1427,25 +1426,25 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
             if let ResolvedArg::LateBound(..) = def && crossed_anon_const {
                 let use_span = self.tcx.hir().span(hir_id);
                 let def_span = self.tcx.def_span(param_def_id);
-                match self.tcx.def_kind(param_def_id) {
+                let guar = match self.tcx.def_kind(param_def_id) {
                     DefKind::ConstParam => {
                         self.tcx.sess.emit_err(errors::CannotCaptureLateBoundInAnonConst::Const {
                             use_span,
                             def_span,
-                        });
+                        })
                     }
                     DefKind::TyParam => {
                         self.tcx.sess.emit_err(errors::CannotCaptureLateBoundInAnonConst::Type {
                             use_span,
                             def_span,
-                        });
+                        })
                     }
                     _ => unreachable!(),
-                }
-                return;
+                };
+                self.map.defs.insert(hir_id, ResolvedArg::Error(guar));
+            } else {
+                self.map.defs.insert(hir_id, def);
             }
-
-            self.map.defs.insert(hir_id, def);
             return;
         }
 
@@ -1462,7 +1461,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
         depth: usize,
         generic_args: &'tcx hir::GenericArgs<'tcx>,
     ) {
-        if generic_args.parenthesized {
+        if generic_args.parenthesized == hir::GenericArgsParentheses::ParenSugar {
             self.visit_fn_like_elision(
                 generic_args.inputs(),
                 Some(generic_args.bindings[0].ty()),
@@ -1641,7 +1640,59 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                 },
                 s: self.scope,
             };
-            if let Some(type_def_id) = type_def_id {
+            // If the binding is parenthesized, then this must be `feature(return_type_notation)`.
+            // In that case, introduce a binder over all of the function's early and late bound vars.
+            //
+            // For example, given
+            // ```
+            // trait Foo {
+            //     async fn x<'r, T>();
+            // }
+            // ```
+            // and a bound that looks like:
+            //    `for<'a> T::Trait<'a, x(): for<'b> Other<'b>>`
+            // this is going to expand to something like:
+            //    `for<'a> for<'r, T> <T as Trait<'a>>::x::<'r, T>::{opaque#0}: for<'b> Other<'b>`.
+            if binding.gen_args.parenthesized == hir::GenericArgsParentheses::ReturnTypeNotation {
+                let bound_vars = if let Some(type_def_id) = type_def_id
+                    && self.tcx.def_kind(type_def_id) == DefKind::Trait
+                    // FIXME(return_type_notation): We could bound supertrait methods.
+                    && let Some(assoc_fn) = self
+                        .tcx
+                        .associated_items(type_def_id)
+                        .find_by_name_and_kind(self.tcx, binding.ident, ty::AssocKind::Fn, type_def_id)
+                {
+                    self.tcx
+                        .generics_of(assoc_fn.def_id)
+                        .params
+                        .iter()
+                        .map(|param| match param.kind {
+                            ty::GenericParamDefKind::Lifetime => ty::BoundVariableKind::Region(
+                                ty::BoundRegionKind::BrNamed(param.def_id, param.name),
+                            ),
+                            ty::GenericParamDefKind::Type { .. } => ty::BoundVariableKind::Ty(
+                                ty::BoundTyKind::Param(param.def_id, param.name),
+                            ),
+                            ty::GenericParamDefKind::Const { .. } => ty::BoundVariableKind::Const,
+                        })
+                        .chain(self.tcx.fn_sig(assoc_fn.def_id).subst_identity().bound_vars())
+                        .collect()
+                } else {
+                    self.tcx.sess.delay_span_bug(
+                        binding.ident.span,
+                        "bad return type notation here",
+                    );
+                    vec![]
+                };
+                self.with(scope, |this| {
+                    let scope = Scope::Supertrait { bound_vars, s: this.scope };
+                    this.with(scope, |this| {
+                        let (bound_vars, _) = this.poly_trait_ref_binder_info();
+                        this.record_late_bound_vars(binding.hir_id, bound_vars);
+                        this.visit_assoc_type_binding(binding)
+                    });
+                });
+            } else if let Some(type_def_id) = type_def_id {
                 let bound_vars =
                     BoundVarContext::supertrait_hrtb_vars(self.tcx, type_def_id, binding.ident);
                 self.with(scope, |this| {
@@ -1698,8 +1749,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
             if trait_defines_associated_type_named(def_id) {
                 break Some(bound_vars.into_iter().collect());
             }
-            let predicates =
-                tcx.super_predicates_that_define_assoc_type((def_id, Some(assoc_name)));
+            let predicates = tcx.super_predicates_that_define_assoc_type((def_id, assoc_name));
             let obligations = predicates.predicates.iter().filter_map(|&(pred, _)| {
                 let bound_predicate = pred.kind();
                 match bound_predicate.skip_binder() {

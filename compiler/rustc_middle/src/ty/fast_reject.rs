@@ -1,6 +1,6 @@
 use crate::mir::Mutability;
 use crate::ty::subst::GenericArgKind;
-use crate::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use crate::ty::{self, SubstsRef, Ty, TyCtxt, TypeVisitableExt};
 use rustc_hir::def_id::DefId;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -51,15 +51,36 @@ pub enum SimplifiedType {
 /// generic parameters as if they were inference variables in that case.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum TreatParams {
-    /// Treat parameters as placeholders in the given environment.
+    /// Treat parameters as infer vars. This is the correct mode for caching
+    /// an impl's type for lookup.
+    AsCandidateKey,
+    /// Treat parameters as placeholders in the given environment. This is the
+    /// correct mode for *lookup*, as during candidate selection.
     ///
-    /// Note that this also causes us to treat projections as if they were
-    /// placeholders. This is only correct if the given projection cannot
-    /// be normalized in the current context. Even if normalization fails,
-    /// it may still succeed later if the projection contains any inference
-    /// variables.
-    AsPlaceholder,
-    AsInfer,
+    /// This also treats projections with inference variables as infer vars
+    /// since they could be further normalized.
+    ForLookup,
+    /// Treat parameters as placeholders in the given environment. This is the
+    /// correct mode for *lookup*, as during candidate selection.
+    ///
+    /// N.B. during deep rejection, this acts identically to `ForLookup`.
+    NextSolverLookup,
+}
+
+/// During fast-rejection, we have the choice of treating projection types
+/// as either simplifyable or not, depending on whether we expect the projection
+/// to be normalized/rigid.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum TreatProjections {
+    /// In the old solver we don't try to normalize projections
+    /// when looking up impls and only access them by using the
+    /// current self type. This means that if the self type is
+    /// a projection which could later be normalized, we must not
+    /// treat it as rigid.
+    ForLookup,
+    /// We can treat projections in the self type as opaque as
+    /// we separately look up impls for the normalized self type.
+    NextSolverLookup,
 }
 
 /// Tries to simplify a type by only returning the outermost injective¹ layer, if one exists.
@@ -115,19 +136,20 @@ pub fn simplify_type<'tcx>(
         ty::FnPtr(f) => Some(FunctionSimplifiedType(f.skip_binder().inputs().len())),
         ty::Placeholder(..) => Some(PlaceholderSimplifiedType),
         ty::Param(_) => match treat_params {
-            TreatParams::AsPlaceholder => Some(PlaceholderSimplifiedType),
-            TreatParams::AsInfer => None,
+            TreatParams::ForLookup | TreatParams::NextSolverLookup => {
+                Some(PlaceholderSimplifiedType)
+            }
+            TreatParams::AsCandidateKey => None,
         },
         ty::Alias(..) => match treat_params {
             // When treating `ty::Param` as a placeholder, projections also
             // don't unify with anything else as long as they are fully normalized.
             //
             // We will have to be careful with lazy normalization here.
-            TreatParams::AsPlaceholder if !ty.has_non_region_infer() => {
-                debug!("treating `{}` as a placeholder", ty);
-                Some(PlaceholderSimplifiedType)
-            }
-            TreatParams::AsPlaceholder | TreatParams::AsInfer => None,
+            // FIXME(lazy_normalization): This is probably not right...
+            TreatParams::ForLookup if !ty.has_non_region_infer() => Some(PlaceholderSimplifiedType),
+            TreatParams::NextSolverLookup => Some(PlaceholderSimplifiedType),
+            TreatParams::ForLookup | TreatParams::AsCandidateKey => None,
         },
         ty::Foreign(def_id) => Some(ForeignSimplifiedType(def_id)),
         ty::Bound(..) | ty::Infer(_) | ty::Error(_) => None,
@@ -166,22 +188,24 @@ pub struct DeepRejectCtxt {
 }
 
 impl DeepRejectCtxt {
-    pub fn generic_args_may_unify<'tcx>(
+    pub fn substs_refs_may_unify<'tcx>(
         self,
-        obligation_arg: ty::GenericArg<'tcx>,
-        impl_arg: ty::GenericArg<'tcx>,
+        obligation_substs: SubstsRef<'tcx>,
+        impl_substs: SubstsRef<'tcx>,
     ) -> bool {
-        match (obligation_arg.unpack(), impl_arg.unpack()) {
-            // We don't fast reject based on regions for now.
-            (GenericArgKind::Lifetime(_), GenericArgKind::Lifetime(_)) => true,
-            (GenericArgKind::Type(obl), GenericArgKind::Type(imp)) => {
-                self.types_may_unify(obl, imp)
+        iter::zip(obligation_substs, impl_substs).all(|(obl, imp)| {
+            match (obl.unpack(), imp.unpack()) {
+                // We don't fast reject based on regions for now.
+                (GenericArgKind::Lifetime(_), GenericArgKind::Lifetime(_)) => true,
+                (GenericArgKind::Type(obl), GenericArgKind::Type(imp)) => {
+                    self.types_may_unify(obl, imp)
+                }
+                (GenericArgKind::Const(obl), GenericArgKind::Const(imp)) => {
+                    self.consts_may_unify(obl, imp)
+                }
+                _ => bug!("kind mismatch: {obl} {imp}"),
             }
-            (GenericArgKind::Const(obl), GenericArgKind::Const(imp)) => {
-                self.consts_may_unify(obl, imp)
-            }
-            _ => bug!("kind mismatch: {obligation_arg} {impl_arg}"),
-        }
+        })
     }
 
     pub fn types_may_unify<'tcx>(self, obligation_ty: Ty<'tcx>, impl_ty: Ty<'tcx>) -> bool {
@@ -236,9 +260,7 @@ impl DeepRejectCtxt {
             },
             ty::Adt(obl_def, obl_substs) => match k {
                 &ty::Adt(impl_def, impl_substs) => {
-                    obl_def == impl_def
-                        && iter::zip(obl_substs, impl_substs)
-                            .all(|(obl, imp)| self.generic_args_may_unify(obl, imp))
+                    obl_def == impl_def && self.substs_refs_may_unify(obl_substs, impl_substs)
                 }
                 _ => false,
             },
@@ -290,14 +312,19 @@ impl DeepRejectCtxt {
             // Impls cannot contain these types as these cannot be named directly.
             ty::FnDef(..) | ty::Closure(..) | ty::Generator(..) => false,
 
+            // Placeholder types don't unify with anything on their own
             ty::Placeholder(..) | ty::Bound(..) => false,
 
             // Depending on the value of `treat_obligation_params`, we either
             // treat generic parameters like placeholders or like inference variables.
             ty::Param(_) => match self.treat_obligation_params {
-                TreatParams::AsPlaceholder => false,
-                TreatParams::AsInfer => true,
+                TreatParams::ForLookup | TreatParams::NextSolverLookup => false,
+                TreatParams::AsCandidateKey => true,
             },
+
+            ty::Infer(ty::IntVar(_)) => impl_ty.is_integral(),
+
+            ty::Infer(ty::FloatVar(_)) => impl_ty.is_floating_point(),
 
             ty::Infer(_) => true,
 
@@ -333,9 +360,12 @@ impl DeepRejectCtxt {
         let k = impl_ct.kind();
         match obligation_ct.kind() {
             ty::ConstKind::Param(_) => match self.treat_obligation_params {
-                TreatParams::AsPlaceholder => false,
-                TreatParams::AsInfer => true,
+                TreatParams::ForLookup | TreatParams::NextSolverLookup => false,
+                TreatParams::AsCandidateKey => true,
             },
+
+            // Placeholder consts don't unify with anything on their own
+            ty::ConstKind::Placeholder(_) => false,
 
             // As we don't necessarily eagerly evaluate constants,
             // they might unify with any value.
@@ -349,7 +379,7 @@ impl DeepRejectCtxt {
 
             ty::ConstKind::Infer(_) => true,
 
-            ty::ConstKind::Bound(..) | ty::ConstKind::Placeholder(_) => {
+            ty::ConstKind::Bound(..) => {
                 bug!("unexpected obl const: {:?}", obligation_ct)
             }
         }

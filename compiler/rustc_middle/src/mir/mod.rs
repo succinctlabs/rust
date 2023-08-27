@@ -10,7 +10,7 @@ use crate::ty::codec::{TyDecoder, TyEncoder};
 use crate::ty::fold::{FallibleTypeFolder, TypeFoldable};
 use crate::ty::print::{FmtPrinter, Printer};
 use crate::ty::visit::{TypeVisitable, TypeVisitableExt, TypeVisitor};
-use crate::ty::{self, DefIdTree, List, Ty, TyCtxt};
+use crate::ty::{self, List, Ty, TyCtxt};
 use crate::ty::{AdtDef, InstanceDef, ScalarInt, UserTypeAnnotationIndex};
 use crate::ty::{GenericArg, InternalSubsts, SubstsRef};
 
@@ -21,13 +21,13 @@ use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID};
 use rustc_hir::{self, GeneratorKind, ImplicitSelfKind};
 use rustc_hir::{self as hir, HirId};
 use rustc_session::Session;
-use rustc_target::abi::{Size, VariantIdx};
+use rustc_target::abi::{FieldIdx, Size, VariantIdx};
 
 use polonius_engine::Atom;
 pub use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::graph::dominators::Dominators;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::vec::{Idx, IndexSlice, IndexVec};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::symbol::Symbol;
 use rustc_span::{Span, DUMMY_SP};
@@ -70,10 +70,17 @@ pub use self::pretty::{
 };
 
 /// Types for locals
-pub type LocalDecls<'tcx> = IndexVec<Local, LocalDecl<'tcx>>;
+pub type LocalDecls<'tcx> = IndexSlice<Local, LocalDecl<'tcx>>;
 
 pub trait HasLocalDecls<'tcx> {
     fn local_decls(&self) -> &LocalDecls<'tcx>;
+}
+
+impl<'tcx> HasLocalDecls<'tcx> for IndexVec<Local, LocalDecl<'tcx>> {
+    #[inline]
+    fn local_decls(&self) -> &LocalDecls<'tcx> {
+        self
+    }
 }
 
 impl<'tcx> HasLocalDecls<'tcx> for LocalDecls<'tcx> {
@@ -250,7 +257,7 @@ pub struct Body<'tcx> {
     /// The first local is the return value pointer, followed by `arg_count`
     /// locals for the function arguments, followed by any user-declared
     /// variables and temporaries.
-    pub local_decls: LocalDecls<'tcx>,
+    pub local_decls: IndexVec<Local, LocalDecl<'tcx>>,
 
     /// User type annotations.
     pub user_type_annotations: ty::CanonicalUserTypeAnnotations<'tcx>,
@@ -311,7 +318,7 @@ impl<'tcx> Body<'tcx> {
         source: MirSource<'tcx>,
         basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
         source_scopes: IndexVec<SourceScope, SourceScopeData<'tcx>>,
-        local_decls: LocalDecls<'tcx>,
+        local_decls: IndexVec<Local, LocalDecl<'tcx>>,
         user_type_annotations: ty::CanonicalUserTypeAnnotations<'tcx>,
         arg_count: usize,
         var_debug_info: Vec<VarDebugInfo<'tcx>>,
@@ -401,8 +408,6 @@ impl<'tcx> Body<'tcx> {
             LocalKind::ReturnPointer
         } else if index < self.arg_count + 1 {
             LocalKind::Arg
-        } else if self.local_decls[local].is_user_variable() {
-            LocalKind::Var
         } else {
             LocalKind::Temp
         }
@@ -572,6 +577,13 @@ impl<T> ClearCrossCrate<T> {
         }
     }
 
+    pub fn as_mut(&mut self) -> ClearCrossCrate<&mut T> {
+        match self {
+            ClearCrossCrate::Clear => ClearCrossCrate::Clear,
+            ClearCrossCrate::Set(v) => ClearCrossCrate::Set(v),
+        }
+    }
+
     pub fn assert_crate_local(self) -> T {
         match self {
             ClearCrossCrate::Clear => bug!("unwrapping cross-crate data"),
@@ -661,9 +673,7 @@ impl Atom for Local {
 /// Classifies locals into categories. See `Body::local_kind`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, HashStable)]
 pub enum LocalKind {
-    /// User-declared variable binding.
-    Var,
-    /// Compiler-introduced temporary.
+    /// User-declared variable binding or compiler-introduced temporary.
     Temp,
     /// Function argument.
     Arg,
@@ -760,7 +770,7 @@ pub struct LocalDecl<'tcx> {
     pub mutability: Mutability,
 
     // FIXME(matthewjasper) Don't store in this in `Body`
-    pub local_info: Option<Box<LocalInfo<'tcx>>>,
+    pub local_info: ClearCrossCrate<Box<LocalInfo<'tcx>>>,
 
     /// `true` if this is an internal local.
     ///
@@ -777,13 +787,6 @@ pub struct LocalDecl<'tcx> {
     /// therefore don't affect the auto-trait or outlives properties of the
     /// generator.
     pub internal: bool,
-
-    /// If this local is a temporary and `is_block_tail` is `Some`,
-    /// then it is a temporary created for evaluation of some
-    /// subexpression of some block's tail expression (with no
-    /// intervening statement context).
-    // FIXME(matthewjasper) Don't store in this in `Body`
-    pub is_block_tail: Option<BlockTailInfo>,
 
     /// The type of this local.
     pub ty: Ty<'tcx>,
@@ -890,7 +893,7 @@ pub enum LocalInfo<'tcx> {
     /// The `BindingForm` is solely used for local diagnostics when generating
     /// warnings/errors when compiling the current crate, and therefore it need
     /// not be visible across crates.
-    User(ClearCrossCrate<BindingForm<'tcx>>),
+    User(BindingForm<'tcx>),
     /// A temporary created that references the static with the given `DefId`.
     StaticRef { def_id: DefId, is_thread_local: bool },
     /// A temporary created that references the const with the given `DefId`
@@ -898,13 +901,23 @@ pub enum LocalInfo<'tcx> {
     /// A temporary created during the creation of an aggregate
     /// (e.g. a temporary for `foo` in `MyStruct { my_field: foo }`)
     AggregateTemp,
+    /// A temporary created for evaluation of some subexpression of some block's tail expression
+    /// (with no intervening statement context).
+    // FIXME(matthewjasper) Don't store in this in `Body`
+    BlockTailTemp(BlockTailInfo),
     /// A temporary created during the pass `Derefer` to avoid it's retagging
     DerefTemp,
     /// A temporary created for borrow checking.
     FakeBorrow,
+    /// A local without anything interesting about it.
+    Boring,
 }
 
 impl<'tcx> LocalDecl<'tcx> {
+    pub fn local_info(&self) -> &LocalInfo<'tcx> {
+        &self.local_info.as_ref().assert_crate_local()
+    }
+
     /// Returns `true` only if local is a binding that can itself be
     /// made mutable via the addition of the `mut` keyword, namely
     /// something like the occurrences of `x` in:
@@ -913,15 +926,15 @@ impl<'tcx> LocalDecl<'tcx> {
     /// - or `match ... { C(x) => ... }`
     pub fn can_be_made_mutable(&self) -> bool {
         matches!(
-            self.local_info,
-            Some(box LocalInfo::User(ClearCrossCrate::Set(
+            self.local_info(),
+            LocalInfo::User(
                 BindingForm::Var(VarBindingForm {
                     binding_mode: ty::BindingMode::BindByValue(_),
                     opt_ty_info: _,
                     opt_match_place: _,
                     pat_span: _,
                 }) | BindingForm::ImplicitSelf(ImplicitSelfKind::Imm),
-            )))
+            )
         )
     }
 
@@ -930,15 +943,15 @@ impl<'tcx> LocalDecl<'tcx> {
     /// mutable bindings, but the inverse does not necessarily hold).
     pub fn is_nonref_binding(&self) -> bool {
         matches!(
-            self.local_info,
-            Some(box LocalInfo::User(ClearCrossCrate::Set(
+            self.local_info(),
+            LocalInfo::User(
                 BindingForm::Var(VarBindingForm {
                     binding_mode: ty::BindingMode::BindByValue(_),
                     opt_ty_info: _,
                     opt_match_place: _,
                     pat_span: _,
                 }) | BindingForm::ImplicitSelf(_),
-            )))
+            )
         )
     }
 
@@ -946,38 +959,35 @@ impl<'tcx> LocalDecl<'tcx> {
     /// parameter declared by the user.
     #[inline]
     pub fn is_user_variable(&self) -> bool {
-        matches!(self.local_info, Some(box LocalInfo::User(_)))
+        matches!(self.local_info(), LocalInfo::User(_))
     }
 
     /// Returns `true` if this is a reference to a variable bound in a `match`
     /// expression that is used to access said variable for the guard of the
     /// match arm.
     pub fn is_ref_for_guard(&self) -> bool {
-        matches!(
-            self.local_info,
-            Some(box LocalInfo::User(ClearCrossCrate::Set(BindingForm::RefForGuard)))
-        )
+        matches!(self.local_info(), LocalInfo::User(BindingForm::RefForGuard))
     }
 
     /// Returns `Some` if this is a reference to a static item that is used to
     /// access that static.
     pub fn is_ref_to_static(&self) -> bool {
-        matches!(self.local_info, Some(box LocalInfo::StaticRef { .. }))
+        matches!(self.local_info(), LocalInfo::StaticRef { .. })
     }
 
     /// Returns `Some` if this is a reference to a thread-local static item that is used to
     /// access that static.
     pub fn is_ref_to_thread_local(&self) -> bool {
-        match self.local_info {
-            Some(box LocalInfo::StaticRef { is_thread_local, .. }) => is_thread_local,
+        match self.local_info() {
+            LocalInfo::StaticRef { is_thread_local, .. } => *is_thread_local,
             _ => false,
         }
     }
 
     /// Returns `true` if this is a DerefTemp
     pub fn is_deref_temp(&self) -> bool {
-        match self.local_info {
-            Some(box LocalInfo::DerefTemp) => return true,
+        match self.local_info() {
+            LocalInfo::DerefTemp => return true,
             _ => (),
         }
         return false;
@@ -1001,9 +1011,8 @@ impl<'tcx> LocalDecl<'tcx> {
     pub fn with_source_info(ty: Ty<'tcx>, source_info: SourceInfo) -> Self {
         LocalDecl {
             mutability: Mutability::Mut,
-            local_info: None,
+            local_info: ClearCrossCrate::Set(Box::new(LocalInfo::Boring)),
             internal: false,
-            is_block_tail: None,
             ty,
             user_ty: None,
             source_info,
@@ -1023,20 +1032,11 @@ impl<'tcx> LocalDecl<'tcx> {
         self.mutability = Mutability::Not;
         self
     }
-
-    /// Converts `self` into same `LocalDecl` except tagged as internal temporary.
-    #[inline]
-    pub fn block_tail(mut self, info: BlockTailInfo) -> Self {
-        assert!(self.is_block_tail.is_none());
-        self.is_block_tail = Some(info);
-        self
-    }
 }
 
 #[derive(Clone, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub enum VarDebugInfoContents<'tcx> {
-    /// NOTE(eddyb) There's an unenforced invariant that this `Place` is
-    /// based on a `Local`, not a `Static`, and contains no indexing.
+    /// This `Place` only contains projection which satisfy `can_use_in_debuginfo`.
     Place(Place<'tcx>),
     Const(Constant<'tcx>),
     /// The user variable's data is split across several fragments,
@@ -1046,6 +1046,7 @@ pub enum VarDebugInfoContents<'tcx> {
     /// the underlying debuginfo feature this relies on.
     Composite {
         /// Type of the original user variable.
+        /// This cannot contain a union or an enum.
         ty: Ty<'tcx>,
         /// All the parts of the original user variable, which ended
         /// up in disjoint places, due to optimizations.
@@ -1074,17 +1075,16 @@ pub struct VarDebugInfoFragment<'tcx> {
     /// Where in the composite user variable this fragment is,
     /// represented as a "projection" into the composite variable.
     /// At lower levels, this corresponds to a byte/bit range.
-    // NOTE(eddyb) there's an unenforced invariant that this contains
-    // only `Field`s, and not into `enum` variants or `union`s.
-    // FIXME(eddyb) support this for `enum`s by either using DWARF's
+    ///
+    /// This can only contain `PlaceElem::Field`.
+    // FIXME support this for `enum`s by either using DWARF's
     // more advanced control-flow features (unsupported by LLVM?)
     // to match on the discriminant, or by using custom type debuginfo
     // with non-overlapping variants for the composite variable.
     pub projection: Vec<PlaceElem<'tcx>>,
 
     /// Where the data for this fragment can be found.
-    // NOTE(eddyb) There's an unenforced invariant that this `Place` is
-    // contains no indexing (with a non-constant index).
+    /// This `Place` only contains projection which satisfy `can_use_in_debuginfo`.
     pub contents: Place<'tcx>,
 }
 
@@ -1115,6 +1115,11 @@ pub struct VarDebugInfo<'tcx> {
 
     /// Where the data for this user variable is to be found.
     pub value: VarDebugInfoContents<'tcx>,
+
+    /// When present, indicates what argument number this variable is in the function that it
+    /// originated from (starting from 1). Note, if MIR inlining is enabled, then this is the
+    /// argument number in the original function before it was inlined.
+    pub argument_index: Option<u16>,
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1274,9 +1279,16 @@ impl<'tcx> BasicBlockData<'tcx> {
 }
 
 impl<O> AssertKind<O> {
+    /// Returns true if this an overflow checking assertion controlled by -C overflow-checks.
+    pub fn is_optional_overflow_check(&self) -> bool {
+        use AssertKind::*;
+        use BinOp::*;
+        matches!(self, OverflowNeg(..) | Overflow(Add | Sub | Mul | Shl | Shr, ..))
+    }
+
     /// Getting a description does not require `O` to be printable, and does not
     /// require allocation.
-    /// The caller is expected to handle `BoundsCheck` separately.
+    /// The caller is expected to handle `BoundsCheck` and `MisalignedPointerDereference` separately.
     pub fn description(&self) -> &'static str {
         use AssertKind::*;
         match self {
@@ -1295,7 +1307,9 @@ impl<O> AssertKind<O> {
             ResumedAfterReturn(GeneratorKind::Async(_)) => "`async fn` resumed after completion",
             ResumedAfterPanic(GeneratorKind::Gen) => "generator resumed after panicking",
             ResumedAfterPanic(GeneratorKind::Async(_)) => "`async fn` resumed after panicking",
-            BoundsCheck { .. } => bug!("Unexpected AssertKind"),
+            BoundsCheck { .. } | MisalignedPointerDereference { .. } => {
+                bug!("Unexpected AssertKind")
+            }
         }
     }
 
@@ -1352,6 +1366,13 @@ impl<O> AssertKind<O> {
             Overflow(BinOp::Shl, _, r) => {
                 write!(f, "\"attempt to shift left by `{{}}`, which would overflow\", {:?}", r)
             }
+            MisalignedPointerDereference { required, found } => {
+                write!(
+                    f,
+                    "\"misaligned pointer dereference: address must be a multiple of {{}} but is {{}}\", {:?}, {:?}",
+                    required, found
+                )
+            }
             _ => write!(f, "\"{}\"", self.description()),
         }
     }
@@ -1395,6 +1416,13 @@ impl<O: fmt::Debug> fmt::Debug for AssertKind<O> {
             }
             Overflow(BinOp::Shl, _, r) => {
                 write!(f, "attempt to shift left by `{:#?}`, which would overflow", r)
+            }
+            MisalignedPointerDereference { required, found } => {
+                write!(
+                    f,
+                    "misaligned pointer dereference: address must be a multiple of {:?} but is {:?}",
+                    required, found
+                )
             }
             _ => write!(f, "{}", self.description()),
         }
@@ -1453,6 +1481,9 @@ impl Debug for Statement<'_> {
                 write!(fmt, "discriminant({:?}) = {:?}", place, variant_index)
             }
             Deinit(ref place) => write!(fmt, "Deinit({:?})", place),
+            PlaceMention(ref place) => {
+                write!(fmt, "PlaceMention({:?})", place)
+            }
             AscribeUserType(box (ref place, ref c_ty), ref variance) => {
                 write!(fmt, "AscribeUserType({:?}, {:?}, {:?})", place, variance, c_ty)
             }
@@ -1508,30 +1539,25 @@ impl<V, T> ProjectionElem<V, T> {
     }
 
     /// Returns `true` if this is a `Field` projection with the given index.
-    pub fn is_field_to(&self, f: Field) -> bool {
+    pub fn is_field_to(&self, f: FieldIdx) -> bool {
         matches!(*self, Self::Field(x, _) if x == f)
+    }
+
+    /// Returns `true` if this is accepted inside `VarDebugInfoContents::Place`.
+    pub fn can_use_in_debuginfo(&self) -> bool {
+        match self {
+            Self::Deref | Self::Downcast(_, _) | Self::Field(_, _) => true,
+            Self::ConstantIndex { .. }
+            | Self::Index(_)
+            | Self::OpaqueCast(_)
+            | Self::Subslice { .. } => false,
+        }
     }
 }
 
 /// Alias for projections as they appear in `UserTypeProjection`, where we
 /// need neither the `V` parameter for `Index` nor the `T` for `Field`.
 pub type ProjectionKind = ProjectionElem<(), ()>;
-
-rustc_index::newtype_index! {
-    /// A [newtype'd][wrapper] index type in the MIR [control-flow graph][CFG]
-    ///
-    /// A field (e.g., `f` in `_1.f`) is one variant of [`ProjectionElem`]. Conceptually,
-    /// rustc can identify that a field projection refers to either two different regions of memory
-    /// or the same one between the base and the 'projection element'.
-    /// Read more about projections in the [rustc-dev-guide][mir-datatypes]
-    ///
-    /// [wrapper]: https://rustc-dev-guide.rust-lang.org/appendix/glossary.html#newtype
-    /// [CFG]: https://rustc-dev-guide.rust-lang.org/appendix/background.html#cfg
-    /// [mir-datatypes]: https://rustc-dev-guide.rust-lang.org/mir/index.html#mir-data-types
-    #[derive(HashStable)]
-    #[debug_format = "field[{}]"]
-    pub struct Field {}
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaceRef<'tcx> {
@@ -1775,7 +1801,7 @@ impl SourceScope {
     /// from the function that was inlined instead of the function call site.
     pub fn lint_root(
         self,
-        source_scopes: &IndexVec<SourceScope, SourceScopeData<'_>>,
+        source_scopes: &IndexSlice<SourceScope, SourceScopeData<'_>>,
     ) -> Option<HirId> {
         let mut data = &source_scopes[self];
         // FIXME(oli-obk): we should be able to just walk the `inlined_parent_scope`, but it
@@ -1795,7 +1821,7 @@ impl SourceScope {
     #[inline]
     pub fn inlined_instance<'tcx>(
         self,
-        source_scopes: &IndexVec<SourceScope, SourceScopeData<'tcx>>,
+        source_scopes: &IndexSlice<SourceScope, SourceScopeData<'tcx>>,
     ) -> Option<ty::Instance<'tcx>> {
         let scope_data = &source_scopes[self];
         if let Some((inlined_instance, _)) = scope_data.inlined {
@@ -1963,7 +1989,8 @@ impl<'tcx> Rvalue<'tcx> {
                 | CastKind::PtrToPtr
                 | CastKind::Pointer(_)
                 | CastKind::PointerFromExposedAddress
-                | CastKind::DynStar,
+                | CastKind::DynStar
+                | CastKind::Transmute,
                 _,
                 _,
             )
@@ -1979,6 +2006,13 @@ impl<'tcx> Rvalue<'tcx> {
 }
 
 impl BorrowKind {
+    pub fn mutability(&self) -> Mutability {
+        match *self {
+            BorrowKind::Shared | BorrowKind::Shallow | BorrowKind::Unique => Mutability::Not,
+            BorrowKind::Mut { .. } => Mutability::Mut,
+        }
+    }
+
     pub fn allows_two_phase_borrow(&self) -> bool {
         match *self {
             BorrowKind::Shared | BorrowKind::Shallow | BorrowKind::Unique => false,
@@ -1992,13 +2026,6 @@ impl BorrowKind {
             BorrowKind::Shared | BorrowKind::Shallow | BorrowKind::Unique => "immutable",
             BorrowKind::Mut { .. } => "mutable",
         }
-    }
-}
-
-impl BinOp {
-    pub fn is_checkable(self) -> bool {
-        use self::BinOp::*;
-        matches!(self, Add | Sub | Mul | Shl | Shr)
     }
 }
 
@@ -2528,7 +2555,7 @@ impl<'tcx> ConstantKind<'tcx> {
         let parent_substs = if let Some(parent_hir_id) = tcx.hir().opt_parent_id(hir_id)
             && let Some(parent_did) = parent_hir_id.as_owner()
         {
-            InternalSubsts::identity_for_item(tcx, parent_did.to_def_id())
+            InternalSubsts::identity_for_item(tcx, parent_did)
         } else {
             List::empty()
         };
@@ -2557,7 +2584,7 @@ impl<'tcx> ConstantKind<'tcx> {
                 Self::Unevaluated(
                     UnevaluatedConst {
                         def: def.to_global(),
-                        substs: InternalSubsts::identity_for_item(tcx, def.did.to_def_id()),
+                        substs: InternalSubsts::identity_for_item(tcx, def.did),
                         promoted: None,
                     },
                     ty,
@@ -2687,12 +2714,17 @@ impl<'tcx> UserTypeProjections {
         self.map_projections(|pat_ty_proj| pat_ty_proj.deref())
     }
 
-    pub fn leaf(self, field: Field) -> Self {
+    pub fn leaf(self, field: FieldIdx) -> Self {
         self.map_projections(|pat_ty_proj| pat_ty_proj.leaf(field))
     }
 
-    pub fn variant(self, adt_def: AdtDef<'tcx>, variant_index: VariantIdx, field: Field) -> Self {
-        self.map_projections(|pat_ty_proj| pat_ty_proj.variant(adt_def, variant_index, field))
+    pub fn variant(
+        self,
+        adt_def: AdtDef<'tcx>,
+        variant_index: VariantIdx,
+        field_index: FieldIdx,
+    ) -> Self {
+        self.map_projections(|pat_ty_proj| pat_ty_proj.variant(adt_def, variant_index, field_index))
     }
 }
 
@@ -2735,7 +2767,7 @@ impl UserTypeProjection {
         self
     }
 
-    pub(crate) fn leaf(mut self, field: Field) -> Self {
+    pub(crate) fn leaf(mut self, field: FieldIdx) -> Self {
         self.projs.push(ProjectionElem::Field(field, ()));
         self
     }
@@ -2744,13 +2776,13 @@ impl UserTypeProjection {
         mut self,
         adt_def: AdtDef<'_>,
         variant_index: VariantIdx,
-        field: Field,
+        field_index: FieldIdx,
     ) -> Self {
         self.projs.push(ProjectionElem::Downcast(
             Some(adt_def.variant(variant_index).name),
             variant_index,
         ));
-        self.projs.push(ProjectionElem::Field(field, ()));
+        self.projs.push(ProjectionElem::Field(field_index, ()));
         self
     }
 }
@@ -3085,7 +3117,7 @@ mod size_asserts {
     use rustc_data_structures::static_assert_size;
     // tidy-alphabetical-start
     static_assert_size!(BasicBlockData<'_>, 144);
-    static_assert_size!(LocalDecl<'_>, 56);
+    static_assert_size!(LocalDecl<'_>, 40);
     static_assert_size!(Statement<'_>, 32);
     static_assert_size!(StatementKind<'_>, 16);
     static_assert_size!(Terminator<'_>, 112);

@@ -2,15 +2,15 @@
 #![deny(rustc::diagnostic_outside_of_impl)]
 //! The entry point of the NLL borrow checker.
 
-use rustc_data_structures::vec_map::VecMap;
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir::def_id::LocalDefId;
-use rustc_index::vec::IndexVec;
+use rustc_index::vec::IndexSlice;
 use rustc_middle::mir::{create_dump_file, dump_enabled, dump_mir, PassWhere};
 use rustc_middle::mir::{
     BasicBlock, Body, ClosureOutlivesSubject, ClosureRegionRequirements, LocalKind, Location,
     Promoted,
 };
-use rustc_middle::ty::{self, OpaqueHiddenType, Region, RegionVid, TyCtxt};
+use rustc_middle::ty::{self, OpaqueHiddenType, TyCtxt};
 use rustc_span::symbol::sym;
 use std::env;
 use std::io;
@@ -44,7 +44,7 @@ pub type PoloniusOutput = Output<RustcFacts>;
 /// closure requirements to propagate, and any generated errors.
 pub(crate) struct NllOutput<'tcx> {
     pub regioncx: RegionInferenceContext<'tcx>,
-    pub opaque_type_values: VecMap<LocalDefId, OpaqueHiddenType<'tcx>>,
+    pub opaque_type_values: FxIndexMap<LocalDefId, OpaqueHiddenType<'tcx>>,
     pub polonius_input: Option<Box<AllFacts>>,
     pub polonius_output: Option<Rc<PoloniusOutput>>,
     pub opt_closure_req: Option<ClosureRegionRequirements<'tcx>>,
@@ -59,7 +59,7 @@ pub(crate) fn replace_regions_in_mir<'tcx>(
     infcx: &BorrowckInferCtxt<'_, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     body: &mut Body<'tcx>,
-    promoted: &mut IndexVec<Promoted, Body<'tcx>>,
+    promoted: &mut IndexSlice<Promoted, Body<'tcx>>,
 ) -> UniversalRegions<'tcx> {
     let def = body.source.with_opt_param().as_local().unwrap();
 
@@ -158,7 +158,7 @@ pub(crate) fn compute_regions<'cx, 'tcx>(
     infcx: &BorrowckInferCtxt<'_, 'tcx>,
     universal_regions: UniversalRegions<'tcx>,
     body: &Body<'tcx>,
-    promoted: &IndexVec<Promoted, Body<'tcx>>,
+    promoted: &IndexSlice<Promoted, Body<'tcx>>,
     location_table: &LocationTable,
     param_env: ty::ParamEnv<'tcx>,
     flow_inits: &mut ResultsCursor<'cx, 'tcx, MaybeInitializedPlaces<'cx, 'tcx>>,
@@ -377,7 +377,7 @@ pub(super) fn dump_annotation<'tcx>(
     body: &Body<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
     closure_region_requirements: &Option<ClosureRegionRequirements<'tcx>>,
-    opaque_type_values: &VecMap<LocalDefId, OpaqueHiddenType<'tcx>>,
+    opaque_type_values: &FxIndexMap<LocalDefId, OpaqueHiddenType<'tcx>>,
     errors: &mut crate::error::BorrowckErrors<'tcx>,
 ) {
     let tcx = infcx.tcx;
@@ -442,27 +442,6 @@ fn for_each_region_constraint<'tcx>(
         with_msg(&format!("where {}: {:?}", subject, req.outlived_free_region,))?;
     }
     Ok(())
-}
-
-/// Right now, we piggy back on the `ReVar` to store our NLL inference
-/// regions. These are indexed with `RegionVid`. This method will
-/// assert that the region is a `ReVar` and extract its internal index.
-/// This is reasonable because in our MIR we replace all universal regions
-/// with inference variables.
-pub trait ToRegionVid {
-    fn to_region_vid(self) -> RegionVid;
-}
-
-impl<'tcx> ToRegionVid for Region<'tcx> {
-    fn to_region_vid(self) -> RegionVid {
-        if let ty::ReVar(vid) = *self { vid } else { bug!("region is not an ReVar: {:?}", self) }
-    }
-}
-
-impl ToRegionVid for RegionVid {
-    fn to_region_vid(self) -> RegionVid {
-        self
-    }
 }
 
 pub(crate) trait ConstraintDescription {

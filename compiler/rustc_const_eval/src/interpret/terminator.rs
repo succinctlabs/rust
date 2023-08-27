@@ -13,7 +13,7 @@ use rustc_target::spec::abi::Abi;
 
 use super::{
     FnVal, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy, Machine, MemoryKind, OpTy, Operand,
-    PlaceTy, Scalar, StackPopCleanup, StackPopUnwind,
+    PlaceTy, Scalar, StackPopCleanup,
 };
 
 impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
@@ -60,7 +60,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 ref args,
                 destination,
                 target,
-                ref cleanup,
+                unwind,
                 from_hir_call: _,
                 fn_span: _,
             } => {
@@ -106,11 +106,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     with_caller_location,
                     &destination,
                     target,
-                    match (cleanup, fn_abi.can_unwind) {
-                        (Some(cleanup), true) => StackPopUnwind::Cleanup(*cleanup),
-                        (None, true) => StackPopUnwind::Skip,
-                        (_, false) => StackPopUnwind::NotAllowed,
-                    },
+                    if fn_abi.can_unwind { unwind } else { mir::UnwindAction::Unreachable },
                 )?;
                 // Sanity-check that `eval_fn_call` either pushed a new frame or
                 // did a jump to another block.
@@ -137,23 +133,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.drop_in_place(&place, instance, target, unwind)?;
             }
 
-            Assert { ref cond, expected, ref msg, target, cleanup } => {
-                let ignored = M::ignore_checkable_overflow_assertions(self)
-                    && match msg {
-                        mir::AssertKind::OverflowNeg(..) => true,
-                        mir::AssertKind::Overflow(op, ..) => op.is_checkable(),
-                        _ => false,
-                    };
+            Assert { ref cond, expected, ref msg, target, unwind } => {
+                let ignored =
+                    M::ignore_optional_overflow_checks(self) && msg.is_optional_overflow_check();
                 let cond_val = self.read_scalar(&self.eval_operand(cond, None)?)?.to_bool()?;
                 if ignored || expected == cond_val {
                     self.go_to_block(target);
                 } else {
-                    M::assert_panic(self, msg, cleanup)?;
+                    M::assert_panic(self, msg, unwind)?;
                 }
             }
 
-            Abort => {
-                M::abort(self, "the program aborted execution".to_owned())?;
+            Terminate => {
+                // FIXME: maybe should call `panic_no_unwind` lang item instead.
+                M::abort(self, "panic in a function that cannot unwind".to_owned())?;
             }
 
             // When we encounter Resume, we've finished unwinding
@@ -171,11 +164,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             Unreachable => throw_ub!(Unreachable),
 
             // These should never occur for MIR we actually run.
-            DropAndReplace { .. }
-            | FalseEdge { .. }
-            | FalseUnwind { .. }
-            | Yield { .. }
-            | GeneratorDrop => span_bug!(
+            FalseEdge { .. } | FalseUnwind { .. } | Yield { .. } | GeneratorDrop => span_bug!(
                 terminator.source_info.span,
                 "{:#?} should have been eliminated by MIR pass",
                 terminator.kind
@@ -359,7 +348,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         with_caller_location: bool,
         destination: &PlaceTy<'tcx, M::Provenance>,
         target: Option<mir::BasicBlock>,
-        mut unwind: StackPopUnwind,
+        mut unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         trace!("eval_fn_call: {:#?}", fn_val);
 
@@ -390,6 +379,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             | ty::InstanceDef::FnPtrShim(..)
             | ty::InstanceDef::DropGlue(..)
             | ty::InstanceDef::CloneShim(..)
+            | ty::InstanceDef::FnPtrAddrShim(..)
+            | ty::InstanceDef::ThreadLocalShim(..)
             | ty::InstanceDef::Item(_) => {
                 // We need MIR for this fn
                 let Some((body, instance)) =
@@ -416,9 +407,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     }
                 }
 
-                if !matches!(unwind, StackPopUnwind::NotAllowed) && !callee_fn_abi.can_unwind {
-                    // The callee cannot unwind.
-                    unwind = StackPopUnwind::NotAllowed;
+                if !callee_fn_abi.can_unwind {
+                    // The callee cannot unwind, so force the `Unreachable` unwind handling.
+                    unwind = mir::UnwindAction::Unreachable;
                 }
 
                 self.push_stack_frame(
@@ -547,7 +538,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let mut receiver = args[0].clone();
                 let receiver_place = loop {
                     match receiver.layout.ty.kind() {
-                        ty::Ref(..) | ty::RawPtr(..) => break self.deref_operand(&receiver)?,
+                        ty::Ref(..) | ty::RawPtr(..) => {
+                            // We do *not* use `deref_operand` here: we don't want to conceptually
+                            // create a place that must be dereferenceable, since the receiver might
+                            // be a raw pointer and (for `*const dyn Trait`) we don't need to
+                            // actually access memory to resolve this method.
+                            // Also see <https://github.com/rust-lang/miri/issues/2786>.
+                            let val = self.read_immediate(&receiver)?;
+                            break self.ref_to_mplace(&val)?;
+                        }
                         ty::Dynamic(.., ty::Dyn) => break receiver.assert_mem_place(), // no immediate unsized values
                         ty::Dynamic(.., ty::DynStar) => {
                             // Not clear how to handle this, so far we assume the receiver is always a pointer.
@@ -674,7 +673,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         place: &PlaceTy<'tcx, M::Provenance>,
         instance: ty::Instance<'tcx>,
         target: mir::BasicBlock,
-        unwind: Option<mir::BasicBlock>,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         trace!("drop_in_place: {:?},\n  {:?}, {:?}", *place, place.layout.ty, instance);
         // We take the address of the object. This may well be unaligned, which is fine
@@ -715,10 +714,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             false,
             &ret.into(),
             Some(target),
-            match unwind {
-                Some(cleanup) => StackPopUnwind::Cleanup(cleanup),
-                None => StackPopUnwind::Skip,
-            },
+            unwind,
         )
     }
 }

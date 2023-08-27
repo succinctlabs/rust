@@ -7,14 +7,15 @@ use crate::ty::subst::{GenericArg, InternalSubsts, SubstsRef};
 use crate::ty::visit::ValidateBoundVars;
 use crate::ty::InferTy::*;
 use crate::ty::{
-    self, AdtDef, DefIdTree, Discr, FallibleTypeFolder, Term, Ty, TyCtxt, TypeFlags, TypeFoldable,
-    TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, AdtDef, Discr, Term, Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor,
 };
 use crate::ty::{List, ParamEnv};
 use hir::def::DefKind;
 use polonius_engine::Atom;
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::intern::Interned;
+use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::LangItem;
@@ -22,8 +23,8 @@ use rustc_index::vec::Idx;
 use rustc_macros::HashStable;
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
-use rustc_target::spec::abi;
+use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
+use rustc_target::spec::abi::{self, Abi};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
@@ -60,7 +61,7 @@ pub struct FreeRegion {
 #[derive(HashStable)]
 pub enum BoundRegionKind {
     /// An anonymous region parameter for a given fn (&T)
-    BrAnon(u32, Option<Span>),
+    BrAnon(Option<Span>),
 
     /// Named region parameters for functions (a in &'a T)
     ///
@@ -107,15 +108,6 @@ impl BoundRegionKind {
             _ => None,
         }
     }
-
-    pub fn expect_anon(&self) -> u32 {
-        match *self {
-            BoundRegionKind::BrNamed(_, _) | BoundRegionKind::BrEnv => {
-                bug!("expected anon region: {self:?}")
-            }
-            BoundRegionKind::BrAnon(idx, _) => idx,
-        }
-    }
 }
 
 pub trait Article {
@@ -135,10 +127,6 @@ impl<'tcx> Article for TyKind<'tcx> {
         }
     }
 }
-
-// `TyKind` is used a lot. Make sure it doesn't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(TyKind<'_>, 32);
 
 /// A closure can be modeled as a struct that looks like:
 /// ```ignore (illustrative)
@@ -517,8 +505,7 @@ impl<'tcx> GeneratorSubsts<'tcx> {
     #[inline]
     pub fn variant_range(&self, def_id: DefId, tcx: TyCtxt<'tcx>) -> Range<VariantIdx> {
         // FIXME requires optimized MIR
-        let num_variants = tcx.generator_layout(def_id).unwrap().variant_fields.len();
-        VariantIdx::new(0)..VariantIdx::new(num_variants)
+        FIRST_VARIANT..tcx.generator_layout(def_id).unwrap().variant_fields.next_index()
     }
 
     /// The discriminant for the given variant. Panics if the `variant_index` is
@@ -878,8 +865,8 @@ impl<'tcx> PolyTraitRef<'tcx> {
     }
 }
 
-impl rustc_errors::IntoDiagnosticArg for PolyTraitRef<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+impl<'tcx> IntoDiagnosticArg for TraitRef<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
         self.to_string().into_diagnostic_arg()
     }
 }
@@ -924,6 +911,12 @@ impl<'tcx> ExistentialTraitRef<'tcx> {
     }
 }
 
+impl<'tcx> IntoDiagnosticArg for ExistentialTraitRef<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.to_string().into_diagnostic_arg()
+    }
+}
+
 pub type PolyExistentialTraitRef<'tcx> = Binder<'tcx, ExistentialTraitRef<'tcx>>;
 
 impl<'tcx> PolyExistentialTraitRef<'tcx> {
@@ -937,12 +930,6 @@ impl<'tcx> PolyExistentialTraitRef<'tcx> {
     /// or some placeholder type.
     pub fn with_self_ty(&self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> ty::PolyTraitRef<'tcx> {
         self.map_bound(|trait_ref| trait_ref.with_self_ty(tcx, self_ty))
-    }
-}
-
-impl rustc_errors::IntoDiagnosticArg for PolyExistentialTraitRef<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        self.to_string().into_diagnostic_arg()
     }
 }
 
@@ -1160,78 +1147,12 @@ impl<'tcx, T: IntoIterator> Binder<'tcx, T> {
     }
 }
 
-struct SkipBindersAt<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    index: ty::DebruijnIndex,
-}
-
-impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for SkipBindersAt<'tcx> {
-    type Error = ();
-
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn try_fold_binder<T>(&mut self, t: Binder<'tcx, T>) -> Result<Binder<'tcx, T>, Self::Error>
-    where
-        T: ty::TypeFoldable<TyCtxt<'tcx>>,
-    {
-        self.index.shift_in(1);
-        let value = t.try_map_bound(|t| t.try_fold_with(self));
-        self.index.shift_out(1);
-        value
-    }
-
-    fn try_fold_ty(&mut self, ty: Ty<'tcx>) -> Result<Ty<'tcx>, Self::Error> {
-        if !ty.has_escaping_bound_vars() {
-            Ok(ty)
-        } else if let ty::Bound(index, bv) = *ty.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_bound(index.shifted_out(1), bv))
-            }
-        } else {
-            ty.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_region(&mut self, r: ty::Region<'tcx>) -> Result<ty::Region<'tcx>, Self::Error> {
-        if !r.has_escaping_bound_vars() {
-            Ok(r)
-        } else if let ty::ReLateBound(index, bv) = r.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_re_late_bound(index.shifted_out(1), bv))
-            }
-        } else {
-            r.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_const(&mut self, ct: ty::Const<'tcx>) -> Result<ty::Const<'tcx>, Self::Error> {
-        if !ct.has_escaping_bound_vars() {
-            Ok(ct)
-        } else if let ty::ConstKind::Bound(index, bv) = ct.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_const(
-                    ty::ConstKind::Bound(index.shifted_out(1), bv),
-                    ct.ty().try_fold_with(self)?,
-                ))
-            }
-        } else {
-            ct.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_predicate(
-        &mut self,
-        p: ty::Predicate<'tcx>,
-    ) -> Result<ty::Predicate<'tcx>, Self::Error> {
-        if !p.has_escaping_bound_vars() { Ok(p) } else { p.try_super_fold_with(self) }
+impl<'tcx, T> IntoDiagnosticArg for Binder<'tcx, T>
+where
+    T: IntoDiagnosticArg,
+{
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.0.into_diagnostic_arg()
     }
 }
 
@@ -1288,7 +1209,7 @@ impl<'tcx> AliasTy<'tcx> {
         match tcx.def_kind(self.def_id) {
             DefKind::AssocTy | DefKind::AssocConst => tcx.parent(self.def_id),
             DefKind::ImplTraitPlaceholder => {
-                tcx.parent(tcx.impl_trait_in_trait_parent(self.def_id))
+                tcx.parent(tcx.impl_trait_in_trait_parent_fn(self.def_id))
             }
             kind => bug!("expected a projection AliasTy; found {kind:?}"),
         }
@@ -1376,6 +1297,12 @@ impl<'tcx> FnSig<'tcx> {
     }
 }
 
+impl<'tcx> IntoDiagnosticArg for FnSig<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.to_string().into_diagnostic_arg()
+    }
+}
+
 pub type PolyFnSig<'tcx> = Binder<'tcx, FnSig<'tcx>>;
 
 impl<'tcx> PolyFnSig<'tcx> {
@@ -1402,6 +1329,18 @@ impl<'tcx> PolyFnSig<'tcx> {
     }
     pub fn abi(&self) -> abi::Abi {
         self.skip_binder().abi
+    }
+
+    pub fn is_fn_trait_compatible(&self) -> bool {
+        matches!(
+            self.skip_binder(),
+            ty::FnSig {
+                unsafety: rustc_hir::Unsafety::Normal,
+                abi: Abi::Rust,
+                c_variadic: false,
+                ..
+            }
+        )
     }
 }
 
@@ -1522,22 +1461,13 @@ pub struct BoundTy {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, TyEncodable, TyDecodable)]
 #[derive(HashStable)]
 pub enum BoundTyKind {
-    Anon(u32),
+    Anon,
     Param(DefId, Symbol),
-}
-
-impl BoundTyKind {
-    pub fn expect_anon(self) -> u32 {
-        match self {
-            BoundTyKind::Anon(i) => i,
-            _ => bug!(),
-        }
-    }
 }
 
 impl From<BoundVar> for BoundTy {
     fn from(var: BoundVar) -> Self {
-        BoundTy { var, kind: BoundTyKind::Anon(var.as_u32()) }
+        BoundTy { var, kind: BoundTyKind::Anon }
     }
 }
 
@@ -1616,19 +1546,24 @@ impl<'tcx> Region<'tcx> {
 
     pub fn get_name(self) -> Option<Symbol> {
         if self.has_name() {
-            let name = match *self {
+            match *self {
                 ty::ReEarlyBound(ebr) => Some(ebr.name),
                 ty::ReLateBound(_, br) => br.kind.get_name(),
                 ty::ReFree(fr) => fr.bound_region.get_name(),
                 ty::ReStatic => Some(kw::StaticLifetime),
-                ty::RePlaceholder(placeholder) => placeholder.name.get_name(),
+                ty::RePlaceholder(placeholder) => placeholder.bound.kind.get_name(),
                 _ => None,
-            };
-
-            return name;
+            }
+        } else {
+            None
         }
+    }
 
-        None
+    pub fn get_name_or_anon(self) -> Symbol {
+        match self.get_name() {
+            Some(name) => name,
+            None => sym::anon,
+        }
     }
 
     /// Is this region named by the user?
@@ -1639,7 +1574,7 @@ impl<'tcx> Region<'tcx> {
             ty::ReFree(fr) => fr.bound_region.is_named(),
             ty::ReStatic => true,
             ty::ReVar(..) => false,
-            ty::RePlaceholder(placeholder) => placeholder.name.is_named(),
+            ty::RePlaceholder(placeholder) => placeholder.bound.kind.is_named(),
             ty::ReErased => false,
             ty::ReError(_) => false,
         }
@@ -1762,10 +1697,10 @@ impl<'tcx> Region<'tcx> {
         matches!(self.kind(), ty::ReVar(_))
     }
 
-    pub fn as_var(self) -> Option<RegionVid> {
+    pub fn as_var(self) -> RegionVid {
         match self.kind() {
-            ty::ReVar(vid) => Some(vid),
-            _ => None,
+            ty::ReVar(vid) => vid,
+            _ => bug!("expected region {:?} to be of kind ReVar", self),
         }
     }
 }
@@ -1892,7 +1827,7 @@ impl<'tcx> Ty<'tcx> {
             Adt(def, substs) => {
                 assert!(def.repr().simd(), "`simd_size_and_type` called on non-SIMD type");
                 let variant = def.non_enum_variant();
-                let f0_ty = variant.fields[0].ty(tcx, substs);
+                let f0_ty = variant.fields[FieldIdx::from_u32(0)].ty(tcx, substs);
 
                 match f0_ty.kind() {
                     // If the first field is an array, we assume it is the only field and its
@@ -1902,7 +1837,7 @@ impl<'tcx> Ty<'tcx> {
                         // The way we evaluate the `N` in `[T; N]` here only works since we use
                         // `simd_size_and_type` post-monomorphization. It will probably start to ICE
                         // if we use it in generic code. See the `simd-array-trait` ui test.
-                        (f0_len.eval_target_usize(tcx, ParamEnv::empty()) as u64, *f0_elem_ty)
+                        (f0_len.eval_target_usize(tcx, ParamEnv::empty()), *f0_elem_ty)
                     }
                     // Otherwise, the fields of this Adt are the SIMD components (and we assume they
                     // all have the same type).
@@ -1911,11 +1846,6 @@ impl<'tcx> Ty<'tcx> {
             }
             _ => bug!("`simd_size_and_type` called on invalid type"),
         }
-    }
-
-    #[inline]
-    pub fn is_region_ptr(self) -> bool {
-        matches!(self.kind(), Ref(..))
     }
 
     #[inline]
@@ -1944,7 +1874,7 @@ impl<'tcx> Ty<'tcx> {
     /// Tests if this is any kind of primitive pointer type (reference, raw pointer, fn pointer).
     #[inline]
     pub fn is_any_ptr(self) -> bool {
-        self.is_region_ptr() || self.is_unsafe_ptr() || self.is_fn_ptr()
+        self.is_ref() || self.is_unsafe_ptr() || self.is_fn_ptr()
     }
 
     #[inline]
@@ -2507,4 +2437,15 @@ impl<'tcx> VarianceDiagInfo<'tcx> {
             VarianceDiagInfo::Invariant { .. } => self,
         }
     }
+}
+
+// Some types are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod size_asserts {
+    use super::*;
+    use rustc_data_structures::static_assert_size;
+    // tidy-alphabetical-start
+    static_assert_size!(RegionKind<'_>, 28);
+    static_assert_size!(TyKind<'_>, 32);
+    // tidy-alphabetical-end
 }

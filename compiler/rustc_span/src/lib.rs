@@ -20,6 +20,7 @@
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
 #![feature(let_chains)]
+#![feature(round_char_boundary)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 
@@ -87,6 +88,14 @@ pub struct SessionGlobals {
     symbol_interner: symbol::Interner,
     span_interner: Lock<span_encoding::SpanInterner>,
     hygiene_data: Lock<hygiene::HygieneData>,
+
+    /// A reference to the source map in the `Session`. It's an `Option`
+    /// because it can't be initialized until `Session` is created, which
+    /// happens after `SessionGlobals`. `set_source_map` does the
+    /// initialization.
+    ///
+    /// This field should only be used in places where the `Session` is truly
+    /// not available, such as `<Span as Debug>::fmt`.
     source_map: Lock<Option<Lrc<SourceMap>>>,
 }
 
@@ -795,6 +804,18 @@ impl Span {
         })
     }
 
+    /// Splits a span into two composite spans around a certain position.
+    pub fn split_at(self, pos: u32) -> (Span, Span) {
+        let len = self.hi().0 - self.lo().0;
+        debug_assert!(pos <= len);
+
+        let split_pos = BytePos(self.lo().0 + pos);
+        (
+            Span::new(self.lo(), split_pos, self.ctxt(), self.parent()),
+            Span::new(split_pos, self.hi(), self.ctxt(), self.parent()),
+        )
+    }
+
     /// Returns a `Span` that would enclose both `self` and `end`.
     ///
     /// Note that this can also be used to extend the span "backwards":
@@ -1001,16 +1022,9 @@ impl<D: Decoder> Decodable<D> for Span {
     }
 }
 
-/// Calls the provided closure, using the provided `SourceMap` to format
-/// any spans that are debug-printed during the closure's execution.
-///
-/// Normally, the global `TyCtxt` is used to retrieve the `SourceMap`
-/// (see `rustc_interface::callbacks::span_debug1`). However, some parts
-/// of the compiler (e.g. `rustc_parse`) may debug-print `Span`s before
-/// a `TyCtxt` is available. In this case, we fall back to
-/// the `SourceMap` provided to this function. If that is not available,
-/// we fall back to printing the raw `Span` field values.
-pub fn with_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) -> T {
+/// Insert `source_map` into the session globals for the duration of the
+/// closure's execution.
+pub fn set_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) -> T {
     with_session_globals(|session_globals| {
         *session_globals.source_map.borrow_mut() = Some(source_map);
     });
@@ -1029,6 +1043,8 @@ pub fn with_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) ->
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Use the global `SourceMap` to print the span. If that's not
+        // available, fall back to printing the raw values.
         with_session_globals(|session_globals| {
             if let Some(source_map) = &*session_globals.source_map.borrow() {
                 write!(f, "{} ({:?})", source_map.span_to_diagnostic_string(*self), self.ctxt())
@@ -1303,7 +1319,6 @@ pub struct SourceFileDiffs {
 }
 
 /// A single source in the [`SourceMap`].
-#[derive(Clone)]
 pub struct SourceFile {
     /// The name of the file that the source came from. Source that doesn't
     /// originate from files has names between angle brackets by convention
@@ -1332,6 +1347,25 @@ pub struct SourceFile {
     pub name_hash: u128,
     /// Indicates which crate this `SourceFile` was imported from.
     pub cnum: CrateNum,
+}
+
+impl Clone for SourceFile {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            src: self.src.clone(),
+            src_hash: self.src_hash,
+            external_src: Lock::new(self.external_src.borrow().clone()),
+            start_pos: self.start_pos,
+            end_pos: self.end_pos,
+            lines: Lock::new(self.lines.borrow().clone()),
+            multibyte_chars: self.multibyte_chars.clone(),
+            non_narrow_chars: self.non_narrow_chars.clone(),
+            normalized_pos: self.normalized_pos.clone(),
+            name_hash: self.name_hash,
+            cnum: self.cnum,
+        }
+    }
 }
 
 impl<S: Encoder> Encodable<S> for SourceFile {
@@ -2018,13 +2052,13 @@ pub type FileLinesResult = Result<FileLines, SpanLinesError>;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SpanLinesError {
-    DistinctSources(DistinctSources),
+    DistinctSources(Box<DistinctSources>),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SpanSnippetError {
     IllFormedSpan(Span),
-    DistinctSources(DistinctSources),
+    DistinctSources(Box<DistinctSources>),
     MalformedForSourcemap(MalformedSourceMapPositions),
     SourceNotAvailable { filename: FileName },
 }

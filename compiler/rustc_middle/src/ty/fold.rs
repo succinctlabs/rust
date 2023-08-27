@@ -51,9 +51,7 @@ where
 // Region folder
 
 impl<'tcx> TyCtxt<'tcx> {
-    /// Folds the escaping and free regions in `value` using `f`, and
-    /// sets `skipped_regions` to true if any late-bound region was found
-    /// and skipped.
+    /// Folds the escaping and free regions in `value` using `f`.
     pub fn fold_regions<T>(
         self,
         value: T,
@@ -63,17 +61,6 @@ impl<'tcx> TyCtxt<'tcx> {
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
         value.fold_with(&mut RegionFolder::new(self, &mut f))
-    }
-
-    pub fn super_fold_regions<T>(
-        self,
-        value: T,
-        mut f: impl FnMut(ty::Region<'tcx>, ty::DebruijnIndex) -> ty::Region<'tcx>,
-    ) -> T
-    where
-        T: TypeSuperFoldable<TyCtxt<'tcx>>,
-    {
-        value.super_fold_with(&mut RegionFolder::new(self, &mut f))
     }
 }
 
@@ -392,9 +379,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 let index = entry.index();
                 let var = ty::BoundVar::from_usize(index);
                 let kind = entry
-                    .or_insert_with(|| {
-                        ty::BoundVariableKind::Region(ty::BrAnon(index as u32, None))
-                    })
+                    .or_insert_with(|| ty::BoundVariableKind::Region(ty::BrAnon(None)))
                     .expect_region();
                 let br = ty::BoundRegion { var, kind };
                 self.tcx.mk_re_late_bound(ty::INNERMOST, br)
@@ -404,9 +389,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 let index = entry.index();
                 let var = ty::BoundVar::from_usize(index);
                 let kind = entry
-                    .or_insert_with(|| {
-                        ty::BoundVariableKind::Ty(ty::BoundTyKind::Anon(index as u32))
-                    })
+                    .or_insert_with(|| ty::BoundVariableKind::Ty(ty::BoundTyKind::Anon))
                     .expect_ty();
                 self.tcx.mk_bound(ty::INNERMOST, BoundTy { var, kind })
             }

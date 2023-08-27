@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Write};
-use std::fs::{self};
+use std::fs::{self, File};
 use std::hash::Hash;
+use std::io::{BufRead, BufReader};
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -16,7 +17,7 @@ use crate::config::{SplitDebuginfo, TargetSelection};
 use crate::doc;
 use crate::flags::{Color, Subcommand};
 use crate::install;
-use crate::native;
+use crate::llvm;
 use crate::run;
 use crate::setup;
 use crate::test;
@@ -28,8 +29,11 @@ use crate::{clean, dist};
 use crate::{Build, CLang, DocTests, GitRepo, Mode};
 
 pub use crate::Compiler;
-// FIXME: replace with std::lazy after it gets stabilized and reaches beta
-use once_cell::sync::Lazy;
+// FIXME:
+// - use std::lazy for `Lazy`
+// - use std::cell for `OnceCell`
+// Once they get stabilized and reach beta.
+use once_cell::sync::{Lazy, OnceCell};
 
 pub struct Builder<'a> {
     pub build: &'a Build,
@@ -484,17 +488,43 @@ impl<'a> ShouldRun<'a> {
 
     // multiple aliases for the same job
     pub fn paths(mut self, paths: &[&str]) -> Self {
+        static SUBMODULES_PATHS: OnceCell<Vec<String>> = OnceCell::new();
+
+        let init_submodules_paths = |src: &PathBuf| {
+            let file = File::open(src.join(".gitmodules")).unwrap();
+
+            let mut submodules_paths = vec![];
+            for line in BufReader::new(file).lines() {
+                if let Ok(line) = line {
+                    let line = line.trim();
+
+                    if line.starts_with("path") {
+                        let actual_path =
+                            line.split(' ').last().expect("Couldn't get value of path");
+                        submodules_paths.push(actual_path.to_owned());
+                    }
+                }
+            }
+
+            submodules_paths
+        };
+
+        let submodules_paths =
+            SUBMODULES_PATHS.get_or_init(|| init_submodules_paths(&self.builder.src));
+
         self.paths.insert(PathSet::Set(
             paths
                 .iter()
                 .map(|p| {
-                    // FIXME(#96188): make sure this is actually a path.
-                    // This currently breaks for paths within submodules.
-                    //assert!(
-                    //    self.builder.src.join(p).exists(),
-                    //    "`should_run.paths` should correspond to real on-disk paths - use `alias` if there is no relevant path: {}",
-                    //    p
-                    //);
+                    // assert only if `p` isn't submodule
+                    if !submodules_paths.iter().find(|sm_p| p.contains(*sm_p)).is_some() {
+                        assert!(
+                            self.builder.src.join(p).exists(),
+                            "`should_run.paths` should correspond to real on-disk paths - use `alias` if there is no relevant path: {}",
+                            p
+                        );
+                    }
+
                     TaskPath { path: p.into(), kind: Some(self.kind) }
                 })
                 .collect(),
@@ -561,6 +591,7 @@ pub enum Kind {
     Install,
     Run,
     Setup,
+    Suggest,
 }
 
 impl Kind {
@@ -580,6 +611,7 @@ impl Kind {
             "install" => Kind::Install,
             "run" | "r" => Kind::Run,
             "setup" => Kind::Setup,
+            "suggest" => Kind::Suggest,
             _ => return None,
         })
     }
@@ -599,6 +631,7 @@ impl Kind {
             Kind::Install => "install",
             Kind::Run => "run",
             Kind::Setup => "setup",
+            Kind::Suggest => "suggest",
         }
     }
 }
@@ -636,13 +669,13 @@ impl<'a> Builder<'a> {
                 tool::Rustdoc,
                 tool::Clippy,
                 tool::CargoClippy,
-                native::Llvm,
-                native::Sanitizers,
+                llvm::Llvm,
+                llvm::Sanitizers,
                 tool::Rustfmt,
                 tool::Miri,
                 tool::CargoMiri,
-                native::Lld,
-                native::CrtBeginEnd
+                llvm::Lld,
+                llvm::CrtBeginEnd
             ),
             Kind::Check | Kind::Clippy | Kind::Fix => describe!(
                 check::Std,
@@ -679,6 +712,7 @@ impl<'a> Builder<'a> {
                 test::CrateRustdoc,
                 test::CrateRustdocJsonTypes,
                 test::CrateJsonDocLint,
+                test::SuggestTestsCrate,
                 test::Linkcheck,
                 test::TierCheck,
                 test::ReplacePlaceholderTest,
@@ -711,6 +745,7 @@ impl<'a> Builder<'a> {
                 test::RustdocUi,
                 test::RustdocJson,
                 test::HtmlCheck,
+                test::RustInstaller,
                 // Run bootstrap close to the end as it's unlikely to fail
                 test::Bootstrap,
                 // Run run-make last, since these won't pass without make on Windows
@@ -740,6 +775,7 @@ impl<'a> Builder<'a> {
                 doc::EmbeddedBook,
                 doc::EditionGuide,
                 doc::StyleGuide,
+                doc::Tidy,
             ),
             Kind::Dist => describe!(
                 dist::Docs,
@@ -795,7 +831,7 @@ impl<'a> Builder<'a> {
             Kind::Setup => describe!(setup::Profile, setup::Hook, setup::Link, setup::Vscode),
             Kind::Clean => describe!(clean::CleanAll, clean::Rustc, clean::Std),
             // special-cased in Build::build()
-            Kind::Format => vec![],
+            Kind::Format | Kind::Suggest => vec![],
         }
     }
 
@@ -859,11 +895,27 @@ impl<'a> Builder<'a> {
             Subcommand::Run { ref paths, .. } => (Kind::Run, &paths[..]),
             Subcommand::Clean { ref paths, .. } => (Kind::Clean, &paths[..]),
             Subcommand::Format { .. } => (Kind::Format, &[][..]),
+            Subcommand::Suggest { .. } => (Kind::Suggest, &[][..]),
             Subcommand::Setup { profile: ref path } => (
                 Kind::Setup,
                 path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
             ),
         };
+
+        Self::new_internal(build, kind, paths.to_owned())
+    }
+
+    /// Creates a new standalone builder for use outside of the normal process
+    pub fn new_standalone(
+        build: &mut Build,
+        kind: Kind,
+        paths: Vec<PathBuf>,
+        stage: Option<u32>,
+    ) -> Builder<'_> {
+        // FIXME: don't mutate `build`
+        if let Some(stage) = stage {
+            build.config.stage = stage;
+        }
 
         Self::new_internal(build, kind, paths.to_owned())
     }
@@ -910,14 +962,16 @@ impl<'a> Builder<'a> {
     /// new artifacts, it can't be used to rely on the presence of a particular
     /// sysroot.
     ///
-    /// See `force_use_stage1` for documentation on what each argument is.
+    /// See `force_use_stage1` and `force_use_stage2` for documentation on what each argument is.
     pub fn compiler_for(
         &self,
         stage: u32,
         host: TargetSelection,
         target: TargetSelection,
     ) -> Compiler {
-        if self.build.force_use_stage1(Compiler { stage, host }, target) {
+        if self.build.force_use_stage2(stage) {
+            self.compiler(2, self.config.build)
+        } else if self.build.force_use_stage1(stage, target) {
             self.compiler(1, self.config.build)
         } else {
             self.compiler(stage, host)
@@ -1097,7 +1151,7 @@ impl<'a> Builder<'a> {
     /// check build or dry-run, where there's no need to build all of LLVM.
     fn llvm_config(&self, target: TargetSelection) -> Option<PathBuf> {
         if self.config.llvm_enabled() && self.kind != Kind::Check && !self.config.dry_run() {
-            let native::LlvmResult { llvm_config, .. } = self.ensure(native::Llvm { target });
+            let llvm::LlvmResult { llvm_config, .. } = self.ensure(llvm::Llvm { target });
             if llvm_config.is_file() {
                 return Some(llvm_config);
             }
@@ -1223,7 +1277,7 @@ impl<'a> Builder<'a> {
             // rustc_llvm. But if LLVM is stale, that'll be a tiny amount
             // of work comparatively, and we'd likely need to rebuild it anyway,
             // so that's okay.
-            if crate::native::prebuilt_llvm_config(self, target).is_err() {
+            if crate::llvm::prebuilt_llvm_config(self, target).is_err() {
                 cargo.env("RUST_CHECK", "1");
             }
         }
@@ -1298,6 +1352,14 @@ impl<'a> Builder<'a> {
                 }
             }
         };
+
+        // By default, windows-rs depends on a native library that doesn't get copied into the
+        // sysroot. Passing this cfg enables raw-dylib support instead, which makes the native
+        // library unnecessary. This can be removed when windows-rs enables raw-dylib
+        // unconditionally.
+        if let Mode::Rustc | Mode::ToolRustc = mode {
+            rustflags.arg("--cfg=windows_raw_dylib");
+        }
 
         if use_new_symbol_mangling {
             rustflags.arg("-Csymbol-mangling-version=v0");
@@ -1718,6 +1780,15 @@ impl<'a> Builder<'a> {
 
         cargo.env("RUSTC_VERBOSE", self.verbosity.to_string());
 
+        // Downstream forks of the Rust compiler might want to use a custom libc to add support for
+        // targets that are not yet available upstream. Adding a patch to replace libc with a
+        // custom one would cause compilation errors though, because Cargo would interpret the
+        // custom libc as part of the workspace, and apply the check-cfg lints on it.
+        //
+        // The libc build script emits check-cfg flags only when this environment variable is set,
+        // so this line allows the use of custom libcs.
+        cargo.env("LIBC_CHECK_CFG", "1");
+
         if source_type == SourceType::InTree {
             let mut lint_flags = Vec::new();
             // When extending this list, add the new lints to the RUSTFLAGS of the
@@ -1920,6 +1991,12 @@ impl<'a> Builder<'a> {
                 rustflags.arg("-Zvalidate-mir");
                 rustflags.arg(&format!("-Zmir-opt-level={}", mir_opt_level));
             }
+            // Always enable inlining MIR when building the standard library.
+            // Without this flag, MIR inlining is disabled when incremental compilation is enabled.
+            // That causes some mir-opt tests which inline functions from the standard library to
+            // break when incremental compilation is enabled. So this overrides the "no inlining
+            // during incremental builds" heuristic for the standard library.
+            rustflags.arg("-Zinline-mir");
         }
 
         Cargo { command: cargo, rustflags, rustdocflags, allow_features }

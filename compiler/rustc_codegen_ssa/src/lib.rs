@@ -5,7 +5,6 @@
 #![feature(int_roundings)]
 #![feature(let_chains)]
 #![feature(never_type)]
-#![feature(once_cell)]
 #![feature(strict_provenance)]
 #![feature(try_blocks)]
 #![recursion_limit = "256"]
@@ -56,7 +55,7 @@ pub mod mono_item;
 pub mod target_features;
 pub mod traits;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 pub struct ModuleCodegen<M> {
     /// The name of the module. When the crate may be saved between
@@ -118,7 +117,7 @@ bitflags::bitflags! {
 #[derive(Clone, Debug, Encodable, Decodable, HashStable)]
 pub struct NativeLib {
     pub kind: NativeLibKind,
-    pub name: Option<Symbol>,
+    pub name: Symbol,
     pub filename: Option<Symbol>,
     pub cfg: Option<ast::MetaItem>,
     pub verbatim: bool,

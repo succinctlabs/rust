@@ -1,8 +1,15 @@
 // check-pass
+#![feature(const_trait_impl)]
 
-type I32Cmp = fn(&i32, &i32) -> core::cmp::Ordering;
-pub const fn min_by_i32() -> fn(i32, i32, I32Cmp) -> i32 {
-    core::cmp::min_by
+#[const_trait]
+pub trait Test {}
+
+impl Test for () {}
+
+pub const fn test<T: ~const Test>() {}
+
+pub const fn min_by_i32() -> fn() {
+    test::<()>
 }
 
 fn main() {}

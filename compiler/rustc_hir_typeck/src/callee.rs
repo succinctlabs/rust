@@ -311,9 +311,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let fn_decl_span = if hir.body(body).generator_kind
                 == Some(hir::GeneratorKind::Async(hir::AsyncGeneratorKind::Closure))
             {
-                // Actually need to unwrap a few more layers of HIR to get to
+                // Actually need to unwrap one more layer of HIR to get to
                 // the _real_ closure...
-                let async_closure = hir.parent_id(hir.parent_id(parent_hir_id));
+                let async_closure = hir.parent_id(parent_hir_id);
                 if let hir::Node::Expr(hir::Expr {
                     kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
                     ..
@@ -668,7 +668,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if !self.maybe_suggest_bad_array_definition(&mut err, call_expr, callee_expr) {
             if let Some((maybe_def, output_ty, _)) = self.extract_callable_info(callee_ty)
-                && !self.type_is_sized_modulo_regions(self.param_env, output_ty, callee_expr.span)
+                && !self.type_is_sized_modulo_regions(self.param_env, output_ty)
             {
                 let descr = match maybe_def {
                     DefIdOrName::DefId(def_id) => self.tcx.def_descr(def_id),

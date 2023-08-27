@@ -11,7 +11,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufWriter;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{CpuExt, System, SystemExt};
 
 pub(crate) struct BuildMetrics {
@@ -27,6 +27,7 @@ impl BuildMetrics {
             system_info: System::new(),
             timer_start: None,
             invocation_timer_start: Instant::now(),
+            invocation_start: SystemTime::now(),
         });
 
         BuildMetrics { state }
@@ -51,6 +52,7 @@ impl BuildMetrics {
             duration_excluding_children_sec: Duration::ZERO,
 
             children: Vec::new(),
+            tests: Vec::new(),
         });
     }
 
@@ -70,6 +72,16 @@ impl BuildMetrics {
             state.system_info.refresh_cpu();
             state.timer_start = Some(Instant::now());
         }
+    }
+
+    pub(crate) fn record_test(&self, name: &str, outcome: TestOutcome) {
+        let mut state = self.state.borrow_mut();
+        state
+            .running_steps
+            .last_mut()
+            .unwrap()
+            .tests
+            .push(Test { name: name.to_string(), outcome });
     }
 
     fn collect_stats(&self, state: &mut MetricsState) {
@@ -113,6 +125,11 @@ impl BuildMetrics {
             }
         };
         invocations.push(JsonInvocation {
+            start_time: state
+                .invocation_start
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             duration_including_children_sec: state.invocation_timer_start.elapsed().as_secs_f64(),
             children: steps.into_iter().map(|step| self.prepare_json_step(step)).collect(),
         });
@@ -125,6 +142,14 @@ impl BuildMetrics {
     }
 
     fn prepare_json_step(&self, step: StepMetrics) -> JsonNode {
+        let mut children = Vec::new();
+        children.extend(step.children.into_iter().map(|child| self.prepare_json_step(child)));
+        children.extend(
+            step.tests
+                .into_iter()
+                .map(|test| JsonNode::Test { name: test.name, outcome: test.outcome }),
+        );
+
         JsonNode::RustbuildStep {
             type_: step.type_,
             debug_repr: step.debug_repr,
@@ -135,11 +160,7 @@ impl BuildMetrics {
                     / step.duration_excluding_children_sec.as_secs_f64(),
             },
 
-            children: step
-                .children
-                .into_iter()
-                .map(|child| self.prepare_json_step(child))
-                .collect(),
+            children,
         }
     }
 }
@@ -151,6 +172,7 @@ struct MetricsState {
     system_info: System,
     timer_start: Option<Instant>,
     invocation_timer_start: Instant,
+    invocation_start: SystemTime,
 }
 
 struct StepMetrics {
@@ -161,6 +183,12 @@ struct StepMetrics {
     duration_excluding_children_sec: Duration,
 
     children: Vec<StepMetrics>,
+    tests: Vec<Test>,
+}
+
+struct Test {
+    name: String,
+    outcome: TestOutcome,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +201,10 @@ struct JsonRoot {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct JsonInvocation {
+    // Unix timestamp in seconds
+    //
+    // This is necessary to easily correlate this invocation with logs or other data.
+    start_time: u64,
     duration_including_children_sec: f64,
     children: Vec<JsonNode>,
 }
@@ -190,6 +222,19 @@ enum JsonNode {
 
         children: Vec<JsonNode>,
     },
+    Test {
+        name: String,
+        #[serde(flatten)]
+        outcome: TestOutcome,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum TestOutcome {
+    Passed,
+    Failed,
+    Ignored { ignore_reason: Option<String> },
 }
 
 #[derive(Serialize, Deserialize)]

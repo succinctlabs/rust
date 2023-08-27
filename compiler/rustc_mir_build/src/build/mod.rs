@@ -3,6 +3,7 @@ use crate::build::expr::as_place::PlaceBuilder;
 use crate::build::scope::DropKind;
 use rustc_apfloat::ieee::{Double, Single};
 use rustc_apfloat::Float;
+use rustc_ast::attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_errors::ErrorGuaranteed;
@@ -10,7 +11,7 @@ use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{GeneratorKind, Node};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::vec::{Idx, IndexSlice, IndexVec};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
 use rustc_middle::middle::region;
@@ -24,6 +25,7 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use rustc_span::Symbol;
+use rustc_target::abi::FieldIdx;
 use rustc_target::spec::abi::Abi;
 
 use super::lints;
@@ -48,17 +50,15 @@ pub(crate) fn mir_built(
 /// Construct the MIR for a given `DefId`.
 fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_> {
     // Ensure unsafeck and abstract const building is ran before we steal the THIR.
-    // We can't use `ensure()` for `thir_abstract_const` as it doesn't compute the query
-    // if inputs are green. This can cause ICEs when calling `thir_abstract_const` after
-    // THIR has been stolen if we haven't computed this query yet.
     match def {
         ty::WithOptConstParam { did, const_param_did: Some(const_param_did) } => {
-            tcx.ensure().thir_check_unsafety_for_const_arg((did, const_param_did));
-            drop(tcx.thir_abstract_const_of_const_arg((did, const_param_did)));
+            tcx.ensure_with_value().thir_check_unsafety_for_const_arg((did, const_param_did));
+            tcx.ensure_with_value().thir_abstract_const_of_const_arg((did, const_param_did));
         }
         ty::WithOptConstParam { did, const_param_did: None } => {
-            tcx.ensure().thir_check_unsafety(did);
-            drop(tcx.thir_abstract_const(did));
+            tcx.ensure_with_value().thir_check_unsafety(did);
+            tcx.ensure_with_value().thir_abstract_const(did);
+            tcx.ensure_with_value().check_match(did);
         }
     }
 
@@ -683,7 +683,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // Some functions always have overflow checks enabled,
         // however, they may not get codegen'd, depending on
         // the settings for the crate they are codegened in.
-        let mut check_overflow = tcx.sess.contains_name(attrs, sym::rustc_inherit_overflow_checks);
+        let mut check_overflow = attr::contains_name(attrs, sym::rustc_inherit_overflow_checks);
         // Respect -C overflow-checks.
         check_overflow |= tcx.sess.overflow_checks();
         // Constants always need overflow checks.
@@ -795,7 +795,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let mutability = captured_place.mutability;
 
                 let mut projs = closure_env_projs.clone();
-                projs.push(ProjectionElem::Field(Field::new(i), ty));
+                projs.push(ProjectionElem::Field(FieldIdx::new(i), ty));
                 match capture {
                     ty::UpvarCapture::ByValue => {}
                     ty::UpvarCapture::ByRef(..) => {
@@ -811,6 +811,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     name,
                     source_info: SourceInfo::outermost(captured_place.var_ident.span),
                     value: VarDebugInfoContents::Place(use_place),
+                    argument_index: None,
                 });
 
                 let capture = Capture { captured_place, use_place, mutability };
@@ -822,12 +823,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn args_and_body(
         &mut self,
         mut block: BasicBlock,
-        arguments: &IndexVec<ParamId, Param<'tcx>>,
+        arguments: &IndexSlice<ParamId, Param<'tcx>>,
         argument_scope: region::Scope,
         expr: &Expr<'tcx>,
     ) -> BlockAnd<()> {
         // Allocate locals for the function arguments
-        for param in arguments.iter() {
+        for (argument_index, param) in arguments.iter().enumerate() {
             let source_info =
                 SourceInfo::outermost(param.pat.as_ref().map_or(self.fn_span, |pat| pat.span));
             let arg_local =
@@ -839,6 +840,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     name,
                     source_info,
                     value: VarDebugInfoContents::Place(arg_local.into()),
+                    argument_index: Some(argument_index as u16 + 1),
                 });
             }
         }
@@ -879,21 +881,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 } => {
                     self.local_decls[local].mutability = mutability;
                     self.local_decls[local].source_info.scope = self.source_scope;
-                    self.local_decls[local].local_info = if let Some(kind) = param.self_kind {
-                        Some(Box::new(LocalInfo::User(ClearCrossCrate::Set(
-                            BindingForm::ImplicitSelf(kind),
-                        ))))
-                    } else {
-                        let binding_mode = ty::BindingMode::BindByValue(mutability);
-                        Some(Box::new(LocalInfo::User(ClearCrossCrate::Set(BindingForm::Var(
-                            VarBindingForm {
+                    **self.local_decls[local].local_info.as_mut().assert_crate_local() =
+                        if let Some(kind) = param.self_kind {
+                            LocalInfo::User(BindingForm::ImplicitSelf(kind))
+                        } else {
+                            let binding_mode = ty::BindingMode::BindByValue(mutability);
+                            LocalInfo::User(BindingForm::Var(VarBindingForm {
                                 binding_mode,
                                 opt_ty_info: param.ty_span,
                                 opt_match_place: Some((None, span)),
                                 pat_span: span,
-                            },
-                        )))))
-                    };
+                            }))
+                        };
                     self.var_indices.insert(var, LocalsForNode::One(local));
                 }
                 _ => {

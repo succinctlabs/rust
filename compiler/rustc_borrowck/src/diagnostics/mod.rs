@@ -6,18 +6,19 @@ use rustc_errors::{Applicability, Diagnostic};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, Namespace};
 use rustc_hir::GeneratorKind;
+use rustc_index::vec::IndexSlice;
 use rustc_infer::infer::{LateBoundRegionConversionTime, TyCtxtInferExt};
 use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::mir::{
-    AggregateKind, Constant, FakeReadCause, Field, Local, LocalInfo, LocalKind, Location, Operand,
-    Place, PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+    AggregateKind, Constant, FakeReadCause, Local, LocalInfo, LocalKind, Location, Operand, Place,
+    PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
 };
 use rustc_middle::ty::print::Print;
-use rustc_middle::ty::{self, DefIdTree, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_mir_dataflow::move_paths::{InitLocation, LookupResult};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{symbol::sym, Span, Symbol, DUMMY_SP};
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use rustc_trait_selection::traits::{
     type_known_to_meet_bound_modulo_regions, Obligation, ObligationCause,
@@ -196,10 +197,10 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                         if self.body.local_decls[local].is_ref_for_guard() {
                             continue;
                         }
-                        if let Some(box LocalInfo::StaticRef { def_id, .. }) =
-                            &self.body.local_decls[local].local_info
+                        if let LocalInfo::StaticRef { def_id, .. } =
+                            *self.body.local_decls[local].local_info()
                         {
-                            buf.push_str(self.infcx.tcx.item_name(*def_id).as_str());
+                            buf.push_str(self.infcx.tcx.item_name(def_id).as_str());
                             ok = Ok(());
                             continue;
                         }
@@ -302,7 +303,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
     fn describe_field(
         &self,
         place: PlaceRef<'tcx>,
-        field: Field,
+        field: FieldIdx,
         including_tuple_field: IncludingTupleField,
     ) -> Option<String> {
         let place_ty = match place {
@@ -331,7 +332,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
     fn describe_field_from_ty(
         &self,
         ty: Ty<'_>,
-        field: Field,
+        field: FieldIdx,
         variant_index: Option<VariantIdx>,
         including_tuple_field: IncludingTupleField,
     ) -> Option<String> {
@@ -350,7 +351,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     if !including_tuple_field.0 && variant.ctor_kind() == Some(CtorKind::Fn) {
                         return None;
                     }
-                    Some(variant.fields[field.index()].name.to_string())
+                    Some(variant.fields[field].name.to_string())
                 }
                 ty::Tuple(_) => Some(field.index().to_string()),
                 ty::Ref(_, ty, _) | ty::RawPtr(ty::TypeAndMut { ty, .. }) => {
@@ -466,9 +467,10 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         if let ty::Ref(region, ..) = ty.kind() {
             match **region {
                 ty::ReLateBound(_, ty::BoundRegion { kind: br, .. })
-                | ty::RePlaceholder(ty::PlaceholderRegion { name: br, .. }) => {
-                    printer.region_highlight_mode.highlighting_bound_region(br, counter)
-                }
+                | ty::RePlaceholder(ty::PlaceholderRegion {
+                    bound: ty::BoundRegion { kind: br, .. },
+                    ..
+                }) => printer.region_highlight_mode.highlighting_bound_region(br, counter),
                 _ => {}
             }
         }
@@ -484,9 +486,10 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         let region = if let ty::Ref(region, ..) = ty.kind() {
             match **region {
                 ty::ReLateBound(_, ty::BoundRegion { kind: br, .. })
-                | ty::RePlaceholder(ty::PlaceholderRegion { name: br, .. }) => {
-                    printer.region_highlight_mode.highlighting_bound_region(br, counter)
-                }
+                | ty::RePlaceholder(ty::PlaceholderRegion {
+                    bound: ty::BoundRegion { kind: br, .. },
+                    ..
+                }) => printer.region_highlight_mode.highlighting_bound_region(br, counter),
                 _ => {}
             }
             region
@@ -825,7 +828,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     debug!("move_spans: def_id={:?} place={:?}", closure_def_id, place);
                     let places = &[Operand::Move(place)];
                     if let Some((args_span, generator_kind, capture_kind_span, path_span)) =
-                        self.closure_span(closure_def_id, moved_place, places)
+                        self.closure_span(closure_def_id, moved_place, IndexSlice::from_raw(places))
                     {
                         return ClosureUse {
                             generator_kind,
@@ -925,7 +928,20 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
             return OtherUse(use_span);
         }
 
-        for stmt in &self.body[location.block].statements[location.statement_index + 1..] {
+        // drop and replace might have moved the assignment to the next block
+        let maybe_additional_statement =
+            if let TerminatorKind::Drop { target: drop_target, .. } =
+                self.body[location.block].terminator().kind
+            {
+                self.body[drop_target].statements.first()
+            } else {
+                None
+            };
+
+        let statements =
+            self.body[location.block].statements[location.statement_index + 1..].iter();
+
+        for stmt in statements.chain(maybe_additional_statement) {
             if let StatementKind::Assign(box (_, Rvalue::Aggregate(kind, places))) = &stmt.kind {
                 let (&def_id, is_generator) = match kind {
                     box AggregateKind::Closure(def_id, _) => (def_id, false),
@@ -962,7 +978,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         &self,
         def_id: LocalDefId,
         target_place: PlaceRef<'tcx>,
-        places: &[Operand<'tcx>],
+        places: &IndexSlice<FieldIdx, Operand<'tcx>>,
     ) -> Option<(Span, Option<GeneratorKind>, Span, Span)> {
         debug!(
             "closure_span: def_id={:?} target_place={:?} places={:?}",
@@ -1065,7 +1081,6 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                                     self.param_env,
                                     tcx.mk_imm_ref(tcx.lifetimes.re_erased, tcx.erase_regions(ty)),
                                     def_id,
-                                    DUMMY_SP,
                                 )
                             }
                             _ => false,

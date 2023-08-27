@@ -83,7 +83,7 @@
 //!   that ever have their address taken. Of course that requires actually having alias analysis
 //!   (and a model to build it on), so this might be a bit of a ways off.
 //!
-//! * Various perf improvents. There are a bunch of comments in here marked `PERF` with ideas for
+//! * Various perf improvements. There are a bunch of comments in here marked `PERF` with ideas for
 //!   how to do things more efficiently. However, the complexity of the pass as a whole should be
 //!   kept in mind.
 //!
@@ -583,7 +583,9 @@ impl WriteInfo {
             | StatementKind::Coverage(_)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_) => (),
-            StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
+            StatementKind::FakeRead(_)
+            | StatementKind::AscribeUserType(_, _)
+            | StatementKind::PlaceMention(_) => {
                 bug!("{:?} not found in this MIR phase", statement)
             }
         }
@@ -643,15 +645,14 @@ impl WriteInfo {
                 }
             }
             TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume { .. }
-            | TerminatorKind::Abort { .. }
+            | TerminatorKind::Resume
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable { .. } => (),
             TerminatorKind::Drop { .. } => {
                 // `Drop`s create a `&mut` and so are not considered
             }
-            TerminatorKind::DropAndReplace { .. }
-            | TerminatorKind::Yield { .. }
+            TerminatorKind::Yield { .. }
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {
@@ -787,7 +788,7 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
 fn is_local_required(local: Local, body: &Body<'_>) -> bool {
     match body.local_kind(local) {
         LocalKind::Arg | LocalKind::ReturnPointer => true,
-        LocalKind::Var | LocalKind::Temp => false,
+        LocalKind::Temp => false,
     }
 }
 

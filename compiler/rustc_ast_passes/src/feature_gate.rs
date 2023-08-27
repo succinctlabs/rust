@@ -1,6 +1,6 @@
 use rustc_ast as ast;
 use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
-use rustc_ast::{AssocConstraint, AssocConstraintKind, NodeId};
+use rustc_ast::{attr, AssocConstraint, AssocConstraintKind, NodeId};
 use rustc_ast::{PatKind, RangeEnd};
 use rustc_errors::{Applicability, StashKey};
 use rustc_feature::{AttributeGate, BuiltinAttribute, Features, GateIssue, BUILTIN_ATTRIBUTE_MAP};
@@ -121,24 +121,34 @@ impl<'a> PostExpansionVisitor<'a> {
     }
 
     /// Feature gate `impl Trait` inside `type Alias = $type_expr;`.
-    fn check_impl_trait(&self, ty: &ast::Ty) {
+    fn check_impl_trait(&self, ty: &ast::Ty, in_associated_ty: bool) {
         struct ImplTraitVisitor<'a> {
             vis: &'a PostExpansionVisitor<'a>,
+            in_associated_ty: bool,
         }
         impl Visitor<'_> for ImplTraitVisitor<'_> {
             fn visit_ty(&mut self, ty: &ast::Ty) {
                 if let ast::TyKind::ImplTrait(..) = ty.kind {
-                    gate_feature_post!(
-                        &self.vis,
-                        type_alias_impl_trait,
-                        ty.span,
-                        "`impl Trait` in type aliases is unstable"
-                    );
+                    if self.in_associated_ty {
+                        gate_feature_post!(
+                            &self.vis,
+                            impl_trait_in_assoc_type,
+                            ty.span,
+                            "`impl Trait` in associated types is unstable"
+                        );
+                    } else {
+                        gate_feature_post!(
+                            &self.vis,
+                            type_alias_impl_trait,
+                            ty.span,
+                            "`impl Trait` in type aliases is unstable"
+                        );
+                    }
                 }
                 visit::walk_ty(self, ty);
             }
         }
-        ImplTraitVisitor { vis: self }.visit_ty(ty);
+        ImplTraitVisitor { vis: self, in_associated_ty }.visit_ty(ty);
     }
 
     fn check_late_bound_lifetime_defs(&self, params: &[ast::GenericParam]) {
@@ -232,7 +242,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
 
             ast::ItemKind::Fn(..) => {
-                if self.sess.contains_name(&i.attrs, sym::start) {
+                if attr::contains_name(&i.attrs, sym::start) {
                     gate_feature_post!(
                         &self,
                         start,
@@ -245,7 +255,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
 
             ast::ItemKind::Struct(..) => {
-                for attr in self.sess.filter_by_name(&i.attrs, sym::repr) {
+                for attr in attr::filter_by_name(&i.attrs, sym::repr) {
                     for item in attr.meta_item_list().unwrap_or_else(ThinVec::new) {
                         if item.has_name(sym::simd) {
                             gate_feature_post!(
@@ -294,7 +304,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
 
             ast::ItemKind::TyAlias(box ast::TyAlias { ty: Some(ty), .. }) => {
-                self.check_impl_trait(&ty)
+                self.check_impl_trait(&ty, false)
             }
 
             _ => {}
@@ -306,7 +316,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     fn visit_foreign_item(&mut self, i: &'a ast::ForeignItem) {
         match i.kind {
             ast::ForeignItemKind::Fn(..) | ast::ForeignItemKind::Static(..) => {
-                let link_name = self.sess.first_attr_value_str_by_name(&i.attrs, sym::link_name);
+                let link_name = attr::first_attr_value_str_by_name(&i.attrs, sym::link_name);
                 let links_to_llvm =
                     link_name.map_or(false, |val| val.as_str().starts_with("llvm."));
                 if links_to_llvm {
@@ -336,9 +346,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
             ast::TyKind::Never => {
                 gate_feature_post!(&self, never_type, ty.span, "the `!` type is experimental");
-            }
-            ast::TyKind::TraitObject(_, ast::TraitObjectSyntax::DynStar, ..) => {
-                gate_feature_post!(&self, dyn_star, ty.span, "dyn* trait objects are unstable");
             }
             _ => {}
         }
@@ -395,14 +402,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_expr(&mut self, e: &'a ast::Expr) {
         match e.kind {
-            ast::ExprKind::Box(_) => {
-                gate_feature_post!(
-                    &self,
-                    box_syntax,
-                    e.span,
-                    "box expression syntax is experimental; you can call `Box::new` instead"
-                );
-            }
             ast::ExprKind::Type(..) => {
                 if self.sess.parse_sess.span_diagnostic.err_count() == 0 {
                     // To avoid noise about type ascription in common syntax errors,
@@ -415,23 +414,18 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                     );
                 } else {
                     // And if it isn't, cancel the early-pass warning.
-                    self.sess
+                    if let Some(err) = self
+                        .sess
                         .parse_sess
                         .span_diagnostic
                         .steal_diagnostic(e.span, StashKey::EarlySyntaxWarning)
-                        .map(|err| err.cancel());
+                    {
+                        err.cancel()
+                    }
                 }
             }
             ast::ExprKind::TryBlock(_) => {
                 gate_feature_post!(&self, try_blocks, e.span, "`try` expression is experimental");
-            }
-            ast::ExprKind::Closure(box ast::Closure { constness: ast::Const::Yes(_), .. }) => {
-                gate_feature_post!(
-                    &self,
-                    const_closures,
-                    e.span,
-                    "const closures are experimental"
-                );
             }
             _ => {}
         }
@@ -501,12 +495,24 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_assoc_constraint(&mut self, constraint: &'a AssocConstraint) {
         if let AssocConstraintKind::Bound { .. } = constraint.kind {
-            gate_feature_post!(
-                &self,
-                associated_type_bounds,
-                constraint.span,
-                "associated type bounds are unstable"
-            )
+            if let Some(ast::GenericArgs::Parenthesized(args)) = constraint.gen_args.as_ref()
+                && args.inputs.is_empty()
+                && matches!(args.output, ast::FnRetTy::Default(..))
+            {
+                gate_feature_post!(
+                    &self,
+                    return_type_notation,
+                    constraint.span,
+                    "return type notation is experimental"
+                );
+            } else {
+                gate_feature_post!(
+                    &self,
+                    associated_type_bounds,
+                    constraint.span,
+                    "associated type bounds are unstable"
+                );
+            }
         }
         visit::walk_assoc_constraint(self, constraint)
     }
@@ -524,7 +530,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                     );
                 }
                 if let Some(ty) = ty {
-                    self.check_impl_trait(ty);
+                    self.check_impl_trait(ty, true);
                 }
                 false
             }
@@ -594,6 +600,8 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
     gate_all!(inline_const_pat, "inline-const in pattern position is experimental");
     gate_all!(associated_const_equality, "associated const equality is incomplete");
     gate_all!(yeet_expr, "`do yeet` expression is experimental");
+    gate_all!(dyn_star, "`dyn*` trait objects are experimental");
+    gate_all!(const_closures, "const closures are experimental");
 
     // All uses of `gate_all!` below this point were added in #65742,
     // and subsequently disabled (with the non-early gating readded).
@@ -609,11 +617,11 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
 
     gate_all!(trait_alias, "trait aliases are experimental");
     gate_all!(associated_type_bounds, "associated type bounds are unstable");
+    gate_all!(return_type_notation, "return type notation is experimental");
     gate_all!(decl_macro, "`macro` is experimental");
     gate_all!(box_patterns, "box pattern syntax is experimental");
     gate_all!(exclusive_range_pattern, "exclusive range pattern syntax is experimental");
     gate_all!(try_blocks, "`try` blocks are unstable");
-    gate_all!(box_syntax, "box expression syntax is experimental; you can call `Box::new` instead");
     gate_all!(type_ascription, "type ascription is experimental");
 
     visit::walk_crate(&mut visitor, krate);

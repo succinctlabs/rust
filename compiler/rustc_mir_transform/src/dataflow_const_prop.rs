@@ -8,12 +8,12 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_middle::mir::visit::{MutVisitor, Visitor};
 use rustc_middle::mir::*;
+use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{Map, State, TrackElem, ValueAnalysis, ValueOrPlace};
 use rustc_mir_dataflow::{lattice::FlatSet, Analysis, ResultsVisitor, SwitchIntEdgeEffects};
 use rustc_span::DUMMY_SP;
-use rustc_target::abi::Align;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{Align, FieldIdx, VariantIdx};
 
 use crate::MirPass;
 
@@ -147,7 +147,7 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'_, 'tcx> {
                         for (field_index, operand) in operands.iter().enumerate() {
                             if let Some(field) = self.map().apply(
                                 variant_target_idx,
-                                TrackElem::Field(Field::from_usize(field_index)),
+                                TrackElem::Field(FieldIdx::from_usize(field_index)),
                             ) {
                                 let result = self.handle_operand(operand, state);
                                 state.insert_idx(field, result, self.map());
@@ -548,7 +548,7 @@ impl<'mir, 'tcx> rustc_const_eval::interpret::Machine<'mir, 'tcx> for DummyMachi
         unimplemented!()
     }
 
-    fn enforce_validity(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
+    fn enforce_validity(_ecx: &InterpCx<'mir, 'tcx, Self>, _layout: TyAndLayout<'tcx>) -> bool {
         unimplemented!()
     }
     fn alignment_check_failed(
@@ -567,7 +567,7 @@ impl<'mir, 'tcx> rustc_const_eval::interpret::Machine<'mir, 'tcx> for DummyMachi
         _args: &[rustc_const_eval::interpret::OpTy<'tcx, Self::Provenance>],
         _destination: &rustc_const_eval::interpret::PlaceTy<'tcx, Self::Provenance>,
         _target: Option<BasicBlock>,
-        _unwind: rustc_const_eval::interpret::StackPopUnwind,
+        _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx, Option<(&'mir Body<'tcx>, ty::Instance<'tcx>)>> {
         unimplemented!()
     }
@@ -578,7 +578,7 @@ impl<'mir, 'tcx> rustc_const_eval::interpret::Machine<'mir, 'tcx> for DummyMachi
         _args: &[rustc_const_eval::interpret::OpTy<'tcx, Self::Provenance>],
         _destination: &rustc_const_eval::interpret::PlaceTy<'tcx, Self::Provenance>,
         _target: Option<BasicBlock>,
-        _unwind: rustc_const_eval::interpret::StackPopUnwind,
+        _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx> {
         unimplemented!()
     }
@@ -586,7 +586,7 @@ impl<'mir, 'tcx> rustc_const_eval::interpret::Machine<'mir, 'tcx> for DummyMachi
     fn assert_panic(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _msg: &rustc_middle::mir::AssertMessage<'tcx>,
-        _unwind: Option<BasicBlock>,
+        _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx> {
         unimplemented!()
     }

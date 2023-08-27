@@ -65,7 +65,7 @@ impl<'tcx> MockBlocks<'tcx> {
     }
 
     fn push(&mut self, kind: TerminatorKind<'tcx>) -> BasicBlock {
-        let next_lo = if let Some(last) = self.blocks.last() {
+        let next_lo = if let Some(last) = self.blocks.last_index() {
             self.blocks[last].terminator().source_info.span.hi()
         } else {
             BytePos(1)
@@ -86,7 +86,6 @@ impl<'tcx> MockBlocks<'tcx> {
             TerminatorKind::Assert { ref mut target, .. }
             | TerminatorKind::Call { target: Some(ref mut target), .. }
             | TerminatorKind::Drop { ref mut target, .. }
-            | TerminatorKind::DropAndReplace { ref mut target, .. }
             | TerminatorKind::FalseEdge { real_target: ref mut target, .. }
             | TerminatorKind::FalseUnwind { real_target: ref mut target, .. }
             | TerminatorKind::Goto { ref mut target }
@@ -141,7 +140,7 @@ impl<'tcx> MockBlocks<'tcx> {
                 args: vec![],
                 destination: self.dummy_place.clone(),
                 target: Some(TEMP_BLOCK),
-                cleanup: None,
+                unwind: UnwindAction::Continue,
                 from_hir_call: false,
                 fn_span: DUMMY_SP,
             },
@@ -184,7 +183,6 @@ fn debug_basic_blocks(mir_body: &Body<'_>) -> String {
                     TerminatorKind::Assert { target, .. }
                     | TerminatorKind::Call { target: Some(target), .. }
                     | TerminatorKind::Drop { target, .. }
-                    | TerminatorKind::DropAndReplace { target, .. }
                     | TerminatorKind::FalseEdge { real_target: target, .. }
                     | TerminatorKind::FalseUnwind { real_target: target, .. }
                     | TerminatorKind::Goto { target }

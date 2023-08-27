@@ -7,14 +7,14 @@
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(drain_filter)]
-#![feature(is_terminal)]
 #![feature(let_chains)]
 #![feature(test)]
 #![feature(never_type)]
-#![feature(once_cell)]
+#![feature(lazy_cell)]
 #![feature(type_ascription)]
 #![feature(iter_intersperse)]
 #![feature(type_alias_impl_trait)]
+#![cfg_attr(not(bootstrap), feature(impl_trait_in_assoc_type))]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
@@ -69,7 +69,6 @@ extern crate test;
 #[cfg(feature = "jemalloc")]
 extern crate jemalloc_sys;
 
-use std::default::Default;
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
 use std::process;
@@ -203,7 +202,7 @@ fn init_logging() {
         .with_verbose_exit(true)
         .with_verbose_entry(true)
         .with_indent_amount(2);
-    #[cfg(parallel_compiler)]
+    #[cfg(all(parallel_compiler, debug_assertions))]
     let layer = layer.with_thread_ids(true).with_thread_names(true);
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -284,7 +283,7 @@ fn opts() -> Vec<RustcOptGroup> {
         stable("test-args", |o| {
             o.optmulti("", "test-args", "arguments to pass to the test runner", "ARGS")
         }),
-        unstable("test-run-directory", |o| {
+        stable("test-run-directory", |o| {
             o.optopt(
                 "",
                 "test-run-directory",

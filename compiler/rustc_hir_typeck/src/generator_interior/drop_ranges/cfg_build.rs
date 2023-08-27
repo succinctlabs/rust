@@ -190,7 +190,6 @@ impl<'a, 'tcx> DropRangeVisitor<'a, 'tcx> {
             //
             // Some of these may be interesting in the future
             ExprKind::Path(..)
-            | ExprKind::Box(..)
             | ExprKind::ConstBlock(..)
             | ExprKind::Array(..)
             | ExprKind::Call(..)
@@ -478,7 +477,6 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
             | ExprKind::AssignOp(..)
             | ExprKind::Binary(..)
             | ExprKind::Block(..)
-            | ExprKind::Box(..)
             | ExprKind::Cast(..)
             | ExprKind::Closure { .. }
             | ExprKind::ConstBlock(..)
@@ -528,8 +526,9 @@ impl DropRangesBuilder {
         let mut next = <_>::from(0u32);
         for value in tracked_values {
             for_each_consumable(hir, value, |value| {
-                if !tracked_value_map.contains_key(&value) {
-                    tracked_value_map.insert(value, next);
+                if let std::collections::hash_map::Entry::Vacant(e) = tracked_value_map.entry(value)
+                {
+                    e.insert(next);
                     next = next + 1;
                 }
             });

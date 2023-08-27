@@ -237,7 +237,7 @@ impl Step for Rustc {
             target,
             cargo_subcommand(builder.kind),
         );
-        rustc_cargo(builder, &mut cargo, target);
+        rustc_cargo(builder, &mut cargo, target, compiler.stage);
 
         // For ./x.py clippy, don't run with --all-targets because
         // linting tests and benchmarks can produce very noisy results
@@ -271,9 +271,17 @@ impl Step for Rustc {
             false,
         );
 
-        let libdir = builder.sysroot_libdir(compiler, target);
-        let hostdir = builder.sysroot_libdir(compiler, compiler.host);
-        add_to_sysroot(&builder, &libdir, &hostdir, &librustc_stamp(builder, compiler, target));
+        // HACK: This avoids putting the newly built artifacts in the sysroot if we're using
+        // `download-rustc`, to avoid "multiple candidates for `rmeta`" errors. Technically, that's
+        // not quite right: people can set `download-rustc = true` to download even if there are
+        // changes to the compiler, and in that case ideally we would put the *new* artifacts in the
+        // sysroot, in case there are API changes that should be used by tools.  In practice,
+        // though, that should be very uncommon, and people can still disable download-rustc.
+        if !builder.download_rustc() {
+            let libdir = builder.sysroot_libdir(compiler, target);
+            let hostdir = builder.sysroot_libdir(compiler, compiler.host);
+            add_to_sysroot(&builder, &libdir, &hostdir, &librustc_stamp(builder, compiler, target));
+        }
     }
 }
 
@@ -315,7 +323,7 @@ impl Step for CodegenBackend {
         cargo
             .arg("--manifest-path")
             .arg(builder.src.join(format!("compiler/rustc_codegen_{}/Cargo.toml", backend)));
-        rustc_cargo_env(builder, &mut cargo, target);
+        rustc_cargo_env(builder, &mut cargo, target, compiler.stage);
 
         let msg = if compiler.host == target {
             format!("Checking stage{} {} artifacts ({target})", builder.top_stage, backend)

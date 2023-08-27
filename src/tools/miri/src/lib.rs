@@ -5,10 +5,9 @@
 #![feature(io_error_more)]
 #![feature(variant_count)]
 #![feature(yeet_expr)]
-#![feature(is_some_and)]
 #![feature(nonzero_ops)]
 #![feature(local_key_cell_methods)]
-#![feature(is_terminal)]
+#![feature(round_ties_even)]
 // Configure clippy and other lints
 #![allow(
     clippy::collapsible_else_if,
@@ -94,6 +93,7 @@ pub use crate::shims::EvalContextExt as _;
 pub use crate::borrow_tracker::stacked_borrows::{
     EvalContextExt as _, Item, Permission, Stack, Stacks,
 };
+pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
 pub use crate::borrow_tracker::{
     BorTag, BorrowTrackerMethod, CallId, EvalContextExt as _, RetagFields,
 };
@@ -123,11 +123,13 @@ pub use crate::tag_gc::{EvalContextExt as _, VisitTags};
 
 /// Insert rustc arguments at the beginning of the argument list that Miri wants to be
 /// set per default, for maximal validation power.
+/// Also disable the MIR pass that inserts an alignment check on every pointer dereference. Miri
+/// does that too, and with a better error message.
 pub const MIRI_DEFAULT_ARGS: &[&str] = &[
+    "--cfg=miri",
     "-Zalways-encode-mir",
+    "-Zextra-const-ub-checks",
     "-Zmir-emit-retag",
     "-Zmir-opt-level=0",
-    "--cfg=miri",
-    "-Cdebug-assertions=on",
-    "-Zextra-const-ub-checks",
+    "-Zmir-enable-passes=-CheckAlignment",
 ];

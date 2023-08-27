@@ -1,6 +1,6 @@
 use crate::mir::interpret::{AllocRange, GlobalAlloc, Pointer, Provenance, Scalar};
 use crate::ty::{
-    self, ConstInt, DefIdTree, ParamConst, ScalarInt, Term, TermKind, Ty, TyCtxt, TypeFoldable,
+    self, ConstInt, ParamConst, ScalarInt, Term, TermKind, Ty, TyCtxt, TypeFoldable,
     TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
 };
 use crate::ty::{GenericArg, GenericArgKind};
@@ -701,10 +701,12 @@ pub trait PrettyPrinter<'tcx>:
             ty::Error(_) => p!("[type error]"),
             ty::Param(ref param_ty) => p!(print(param_ty)),
             ty::Bound(debruijn, bound_ty) => match bound_ty.kind {
-                ty::BoundTyKind::Anon(bv) => {
-                    self.pretty_print_bound_var(debruijn, ty::BoundVar::from_u32(bv))?
-                }
-                ty::BoundTyKind::Param(_, s) => p!(write("{}", s)),
+                ty::BoundTyKind::Anon => self.pretty_print_bound_var(debruijn, bound_ty.var)?,
+                ty::BoundTyKind::Param(_, s) => match self.should_print_verbose() {
+                    true if debruijn == ty::INNERMOST => p!(write("^{}", s)),
+                    true => p!(write("^{}_{}", debruijn.index(), s)),
+                    false => p!(write("{}", s)),
+                },
             },
             ty::Adt(def, substs) => {
                 p!(print_def_path(def.did(), substs));
@@ -728,15 +730,15 @@ pub trait PrettyPrinter<'tcx>:
             }
             ty::Alias(ty::Projection, ref data) => {
                 if !(self.should_print_verbose() || NO_QUERIES.with(|q| q.get()))
-                    && self.tcx().def_kind(data.def_id) == DefKind::ImplTraitPlaceholder
+                    && self.tcx().is_impl_trait_in_trait(data.def_id)
                 {
                     return self.pretty_print_opaque_impl_type(data.def_id, data.substs);
                 } else {
                     p!(print(data))
                 }
             }
-            ty::Placeholder(placeholder) => match placeholder.name {
-                ty::BoundTyKind::Anon(_) => p!(write("Placeholder({:?})", placeholder)),
+            ty::Placeholder(placeholder) => match placeholder.bound.kind {
+                ty::BoundTyKind::Anon => p!(write("Placeholder({:?})", placeholder)),
                 ty::BoundTyKind::Param(_, name) => p!(write("{}", name)),
             },
             ty::Alias(ty::Opaque, ty::AliasTy { def_id, substs, .. }) => {
@@ -1345,7 +1347,7 @@ pub trait PrettyPrinter<'tcx>:
                             p!(write("{}::{}", self.tcx().crate_name(def.did.krate), self.tcx().def_path(def.did).to_string_no_crate_verbose()))
                         }
                     }
-                    defkind => bug!("`{:?}` has unexpcted defkind {:?}", ct, defkind),
+                    defkind => bug!("`{:?}` has unexpected defkind {:?}", ct, defkind),
                 }
             }
             ty::ConstKind::Infer(infer_ct) => {
@@ -2100,7 +2102,9 @@ impl<'tcx> PrettyPrinter<'tcx> for FmtPrinter<'_, 'tcx> {
 
             ty::ReLateBound(_, ty::BoundRegion { kind: br, .. })
             | ty::ReFree(ty::FreeRegion { bound_region: br, .. })
-            | ty::RePlaceholder(ty::Placeholder { name: br, .. }) => {
+            | ty::RePlaceholder(ty::Placeholder {
+                bound: ty::BoundRegion { kind: br, .. }, ..
+            }) => {
                 if br.is_named() {
                     return true;
                 }
@@ -2177,7 +2181,9 @@ impl<'tcx> FmtPrinter<'_, 'tcx> {
             }
             ty::ReLateBound(_, ty::BoundRegion { kind: br, .. })
             | ty::ReFree(ty::FreeRegion { bound_region: br, .. })
-            | ty::RePlaceholder(ty::Placeholder { name: br, .. }) => {
+            | ty::RePlaceholder(ty::Placeholder {
+                bound: ty::BoundRegion { kind: br, .. }, ..
+            }) => {
                 if let ty::BrNamed(_, name) = br && br.is_named() {
                     p!(write("{}", name));
                     return Ok(self);
@@ -2255,7 +2261,10 @@ impl<'a, 'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RegionFolder<'a, 'tcx> {
             ty::ReLateBound(db, br) if db >= self.current_index => {
                 *self.region_map.entry(br).or_insert_with(|| name(Some(db), self.current_index, br))
             }
-            ty::RePlaceholder(ty::PlaceholderRegion { name: kind, .. }) => {
+            ty::RePlaceholder(ty::PlaceholderRegion {
+                bound: ty::BoundRegion { kind, .. },
+                ..
+            }) => {
                 // If this is an anonymous placeholder, don't rename. Otherwise, in some
                 // async fns, we get a `for<'r> Send` bound
                 match kind {
@@ -2847,7 +2856,7 @@ define_print_and_forward_display! {
                 p!("the type `", print(ty), "` is found in the environment")
             }
             ty::PredicateKind::Ambiguous => p!("ambiguous"),
-            ty::PredicateKind::AliasEq(t1, t2) => p!(print(t1), " == ", print(t2)),
+            ty::PredicateKind::AliasRelate(t1, t2, dir) => p!(print(t1), write(" {} ", dir), print(t2)),
         }
     }
 

@@ -2,10 +2,11 @@
 
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::mir;
+use crate::ty::fast_reject::TreatProjections;
 use crate::ty::layout::IntegerExt;
 use crate::ty::{
-    self, DefIdTree, FallibleTypeFolder, ToPredicate, Ty, TyCtxt, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeVisitableExt,
+    self, FallibleTypeFolder, ToPredicate, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt,
 };
 use crate::ty::{GenericArgKind, SubstsRef};
 use rustc_apfloat::Float as _;
@@ -14,11 +15,12 @@ use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_macros::HashStable;
-use rustc_span::{sym, DUMMY_SP};
+use rustc_session::Limit;
+use rustc_span::sym;
 use rustc_target::abi::{Integer, IntegerType, Size, TargetDataLayout};
 use rustc_target::spec::abi::Abi;
 use smallvec::SmallVec;
@@ -59,22 +61,13 @@ impl<'tcx> fmt::Display for Discr<'tcx> {
     }
 }
 
-fn int_size_and_signed<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> (Size, bool) {
-    let (int, signed) = match *ty.kind() {
-        ty::Int(ity) => (Integer::from_int_ty(&tcx, ity), true),
-        ty::Uint(uty) => (Integer::from_uint_ty(&tcx, uty), false),
-        _ => bug!("non integer discriminant"),
-    };
-    (int.size(), signed)
-}
-
 impl<'tcx> Discr<'tcx> {
     /// Adds `1` to the value and wraps around if the maximum for the type is reached.
     pub fn wrap_incr(self, tcx: TyCtxt<'tcx>) -> Self {
         self.checked_add(tcx, 1).0
     }
     pub fn checked_add(self, tcx: TyCtxt<'tcx>, n: u128) -> (Self, bool) {
-        let (size, signed) = int_size_and_signed(tcx, self.ty);
+        let (size, signed) = self.ty.int_size_and_signed(tcx);
         let (val, oflo) = if signed {
             let min = size.signed_int_min();
             let max = size.signed_int_max();
@@ -233,17 +226,20 @@ impl<'tcx> TyCtxt<'tcx> {
         let recursion_limit = self.recursion_limit();
         for iteration in 0.. {
             if !recursion_limit.value_within_limit(iteration) {
-                return self.ty_error_with_message(
-                    DUMMY_SP,
-                    &format!("reached the recursion limit finding the struct tail for {}", ty),
-                );
+                let suggested_limit = match recursion_limit {
+                    Limit(0) => Limit(2),
+                    limit => limit * 2,
+                };
+                let reported =
+                    self.sess.emit_err(crate::error::RecursionLimitReached { ty, suggested_limit });
+                return self.ty_error(reported);
             }
             match *ty.kind() {
                 ty::Adt(def, substs) => {
                     if !def.is_struct() {
                         break;
                     }
-                    match def.non_enum_variant().fields.last() {
+                    match def.non_enum_variant().fields.raw.last() {
                         Some(field) => {
                             f();
                             ty = field.ty(self, substs);
@@ -317,7 +313,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 (&ty::Adt(a_def, a_substs), &ty::Adt(b_def, b_substs))
                     if a_def == b_def && a_def.is_struct() =>
                 {
-                    if let Some(f) = a_def.non_enum_variant().fields.last() {
+                    if let Some(f) = a_def.non_enum_variant().fields.raw.last() {
                         a = f.ty(self, a_substs);
                         b = f.ty(self, b_substs);
                     } else {
@@ -363,14 +359,20 @@ impl<'tcx> TyCtxt<'tcx> {
         self.ensure().coherent_trait(drop_trait);
 
         let ty = self.type_of(adt_did).subst_identity();
-        let (did, constness) = self.find_map_relevant_impl(drop_trait, ty, |impl_did| {
-            if let Some(item_id) = self.associated_item_def_ids(impl_did).first() {
-                if validate(self, impl_did).is_ok() {
-                    return Some((*item_id, self.constness(impl_did)));
+        let (did, constness) = self.find_map_relevant_impl(
+            drop_trait,
+            ty,
+            // FIXME: This could also be some other mode, like "unexpected"
+            TreatProjections::ForLookup,
+            |impl_did| {
+                if let Some(item_id) = self.associated_item_def_ids(impl_did).first() {
+                    if validate(self, impl_did).is_ok() {
+                        return Some((*item_id, self.constness(impl_did)));
+                    }
                 }
-            }
-            None
-        })?;
+                None
+            },
+        )?;
 
         Some(ty::Destructor { did, constness })
     }
@@ -599,6 +601,28 @@ impl<'tcx> TyCtxt<'tcx> {
         self.static_mutability(def_id) == Some(hir::Mutability::Mut)
     }
 
+    /// Returns `true` if the item pointed to by `def_id` is a thread local which needs a
+    /// thread local shim generated.
+    #[inline]
+    pub fn needs_thread_local_shim(self, def_id: DefId) -> bool {
+        !self.sess.target.dll_tls_export
+            && self.is_thread_local_static(def_id)
+            && !self.is_foreign_item(def_id)
+    }
+
+    /// Returns the type a reference to the thread local takes in MIR.
+    pub fn thread_local_ptr_ty(self, def_id: DefId) -> Ty<'tcx> {
+        let static_ty = self.type_of(def_id).subst_identity();
+        if self.is_mutable_static(def_id) {
+            self.mk_mut_ptr(static_ty)
+        } else if self.is_foreign_item(def_id) {
+            self.mk_imm_ptr(static_ty)
+        } else {
+            // FIXME: These things don't *really* have 'static lifetime.
+            self.mk_imm_ref(self.lifetimes.re_static, static_ty)
+        }
+    }
+
     /// Get the type of the pointer to the static that we use in MIR.
     pub fn static_ptr_ty(self, def_id: DefId) -> Ty<'tcx> {
         // Make sure that any constants in the static's type are evaluated.
@@ -682,10 +706,6 @@ impl<'tcx> TyCtxt<'tcx> {
         def_id: DefId,
     ) -> ty::EarlyBinder<&'tcx [(ty::Predicate<'tcx>, rustc_span::Span)]> {
         ty::EarlyBinder(self.explicit_item_bounds(def_id))
-    }
-
-    pub fn bound_impl_subject(self, def_id: DefId) -> ty::EarlyBinder<ty::ImplSubject<'tcx>> {
-        ty::EarlyBinder(self.impl_subject(def_id))
     }
 
     /// Returns names of captured upvars for closures and generators.
@@ -922,12 +942,21 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
 }
 
 impl<'tcx> Ty<'tcx> {
+    pub fn int_size_and_signed(self, tcx: TyCtxt<'tcx>) -> (Size, bool) {
+        let (int, signed) = match *self.kind() {
+            ty::Int(ity) => (Integer::from_int_ty(&tcx, ity), true),
+            ty::Uint(uty) => (Integer::from_uint_ty(&tcx, uty), false),
+            _ => bug!("non integer discriminant"),
+        };
+        (int.size(), signed)
+    }
+
     /// Returns the maximum value for the given numeric type (including `char`s)
     /// or returns `None` if the type is not numeric.
     pub fn numeric_max_val(self, tcx: TyCtxt<'tcx>) -> Option<ty::Const<'tcx>> {
         let val = match self.kind() {
             ty::Int(_) | ty::Uint(_) => {
-                let (size, signed) = int_size_and_signed(tcx, self);
+                let (size, signed) = self.int_size_and_signed(tcx);
                 let val =
                     if signed { size.signed_int_max() as u128 } else { size.unsigned_int_max() };
                 Some(val)
@@ -948,7 +977,7 @@ impl<'tcx> Ty<'tcx> {
     pub fn numeric_min_val(self, tcx: TyCtxt<'tcx>) -> Option<ty::Const<'tcx>> {
         let val = match self.kind() {
             ty::Int(_) | ty::Uint(_) => {
-                let (size, signed) = int_size_and_signed(tcx, self);
+                let (size, signed) = self.int_size_and_signed(tcx);
                 let val = if signed { size.truncate(size.signed_int_min() as u128) } else { 0 };
                 Some(val)
             }
@@ -1432,8 +1461,7 @@ pub fn reveal_opaque_types_in_bounds<'tcx>(
 }
 
 /// Determines whether an item is annotated with `doc(hidden)`.
-fn is_doc_hidden(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    assert!(def_id.is_local());
+fn is_doc_hidden(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     tcx.get_attrs(def_id, sym::doc)
         .filter_map(|attr| attr.meta_item_list())
         .any(|items| items.iter().any(|item| item.has_name(sym::hidden)))
@@ -1447,7 +1475,7 @@ pub fn is_doc_notable_trait(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 }
 
 /// Determines whether an item is an intrinsic by Abi.
-pub fn is_intrinsic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+pub fn is_intrinsic(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     matches!(tcx.fn_sig(def_id).skip_binder().abi(), Abi::RustIntrinsic | Abi::PlatformIntrinsic)
 }
 

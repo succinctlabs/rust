@@ -60,13 +60,13 @@ use rustc_hir::def::{DefKind, LifetimeRes, Namespace, PartialRes, PerNS, Res};
 use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID};
 use rustc_hir::definitions::DefPathData;
 use rustc_hir::{ConstArg, GenericArg, ItemLocalId, ParamName, TraitCandidate};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::vec::{Idx, IndexSlice, IndexVec};
 use rustc_macros::fluent_messages;
 use rustc_middle::{
     span_bug,
     ty::{ResolverAstLowering, TyCtxt},
 };
-use rustc_session::parse::feature_err;
+use rustc_session::parse::{add_feature_diagnostics, feature_err};
 use rustc_span::hygiene::MacroKind;
 use rustc_span::source_map::DesugaringKind;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
@@ -92,7 +92,7 @@ mod lifetime_collector;
 mod pat;
 mod path;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 struct LoweringContext<'a, 'hir> {
     tcx: TyCtxt<'hir>,
@@ -414,7 +414,7 @@ fn index_crate<'a>(
 /// This hash will then be part of the crate_hash which is stored in the metadata.
 fn compute_hir_hash(
     tcx: TyCtxt<'_>,
-    owners: &IndexVec<LocalDefId, hir::MaybeOwner<&hir::OwnerInfo<'_>>>,
+    owners: &IndexSlice<LocalDefId, hir::MaybeOwner<&hir::OwnerInfo<'_>>>,
 ) -> Fingerprint {
     let mut hir_body_nodes: Vec<_> = owners
         .iter_enumerated()
@@ -435,7 +435,9 @@ fn compute_hir_hash(
 
 pub fn lower_to_hir(tcx: TyCtxt<'_>, (): ()) -> hir::Crate<'_> {
     let sess = tcx.sess;
-    tcx.ensure().output_filenames(());
+    // Queries that borrow `resolver_for_lowering`.
+    tcx.ensure_with_value().output_filenames(());
+    tcx.ensure_with_value().early_lint_checks(());
     let (mut resolver, krate) = tcx.resolver_for_lowering(()).steal();
 
     let ast_index = index_crate(&resolver.node_id_to_def_id, &krate);
@@ -463,8 +465,10 @@ pub fn lower_to_hir(tcx: TyCtxt<'_>, (): ()) -> hir::Crate<'_> {
         rustc_span::hygiene::clear_syntax_context_map();
     }
 
-    let hir_hash = compute_hir_hash(tcx, &owners);
-    hir::Crate { owners, hir_hash }
+    // Don't hash unless necessary, because it's expensive.
+    let opt_hir_hash =
+        if tcx.sess.needs_crate_hash() { Some(compute_hir_hash(tcx, &owners)) } else { None };
+    hir::Crate { owners, opt_hir_hash }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -478,7 +482,7 @@ enum ParamMode {
 }
 
 enum ParenthesizedGenericArgs {
-    Ok,
+    ParenSugar,
     Err,
 }
 
@@ -657,40 +661,31 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         bodies.sort_by_key(|(k, _)| *k);
         let bodies = SortedMap::from_presorted_elements(bodies);
-        let (hash_including_bodies, hash_without_bodies) = self.hash_owner(node, &bodies);
-        let (nodes, parenting) =
-            index::index_hir(self.tcx.sess, &*self.tcx.definitions_untracked(), node, &bodies);
-        let nodes = hir::OwnerNodes { hash_including_bodies, hash_without_bodies, nodes, bodies };
-        let attrs = {
-            let hash = self.tcx.with_stable_hashing_context(|mut hcx| {
+
+        // Don't hash unless necessary, because it's expensive.
+        let (opt_hash_including_bodies, attrs_hash) = if self.tcx.sess.needs_crate_hash() {
+            self.tcx.with_stable_hashing_context(|mut hcx| {
+                let mut stable_hasher = StableHasher::new();
+                hcx.with_hir_bodies(node.def_id(), &bodies, |hcx| {
+                    node.hash_stable(hcx, &mut stable_hasher)
+                });
+                let h1 = stable_hasher.finish();
+
                 let mut stable_hasher = StableHasher::new();
                 attrs.hash_stable(&mut hcx, &mut stable_hasher);
-                stable_hasher.finish()
-            });
-            hir::AttributeMap { map: attrs, hash }
+                let h2 = stable_hasher.finish();
+
+                (Some(h1), Some(h2))
+            })
+        } else {
+            (None, None)
         };
+        let (nodes, parenting) =
+            index::index_hir(self.tcx.sess, &*self.tcx.definitions_untracked(), node, &bodies);
+        let nodes = hir::OwnerNodes { opt_hash_including_bodies, nodes, bodies };
+        let attrs = hir::AttributeMap { map: attrs, opt_hash: attrs_hash };
 
         self.arena.alloc(hir::OwnerInfo { nodes, parenting, attrs, trait_map })
-    }
-
-    /// Hash the HIR node twice, one deep and one shallow hash. This allows to differentiate
-    /// queries which depend on the full HIR tree and those which only depend on the item signature.
-    fn hash_owner(
-        &mut self,
-        node: hir::OwnerNode<'hir>,
-        bodies: &SortedMap<hir::ItemLocalId, &'hir hir::Body<'hir>>,
-    ) -> (Fingerprint, Fingerprint) {
-        self.tcx.with_stable_hashing_context(|mut hcx| {
-            let mut stable_hasher = StableHasher::new();
-            hcx.with_hir_bodies(node.def_id(), bodies, |hcx| {
-                node.hash_stable(hcx, &mut stable_hasher)
-            });
-            let hash_including_bodies = stable_hasher.finish();
-            let mut stable_hasher = StableHasher::new();
-            hcx.without_hir_bodies(|hcx| node.hash_stable(hcx, &mut stable_hasher));
-            let hash_without_bodies = stable_hasher.finish();
-            (hash_including_bodies, hash_without_bodies)
-        })
     }
 
     /// This method allocates a new `HirId` for the given `NodeId` and stores it in
@@ -993,13 +988,60 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     self.lower_angle_bracketed_parameter_data(data, ParamMode::Explicit, itctx).0
                 }
                 GenericArgs::Parenthesized(data) => {
-                    self.emit_bad_parenthesized_trait_in_assoc_ty(data);
-                    self.lower_angle_bracketed_parameter_data(
-                        &data.as_angle_bracketed_args(),
-                        ParamMode::Explicit,
-                        itctx,
-                    )
-                    .0
+                    if data.inputs.is_empty() && matches!(data.output, FnRetTy::Default(..)) {
+                        let parenthesized = if self.tcx.features().return_type_notation {
+                            hir::GenericArgsParentheses::ReturnTypeNotation
+                        } else {
+                            self.emit_bad_parenthesized_trait_in_assoc_ty(data);
+                            hir::GenericArgsParentheses::No
+                        };
+                        GenericArgsCtor {
+                            args: Default::default(),
+                            bindings: &[],
+                            parenthesized,
+                            span: data.inputs_span,
+                        }
+                    } else if let Some(first_char) = constraint.ident.as_str().chars().next()
+                        && first_char.is_ascii_lowercase()
+                    {
+                        let mut err = if !data.inputs.is_empty() {
+                            self.tcx.sess.create_err(errors::BadReturnTypeNotation::Inputs {
+                                span: data.inputs_span,
+                            })
+                        } else if let FnRetTy::Ty(ty) = &data.output {
+                            self.tcx.sess.create_err(errors::BadReturnTypeNotation::Output {
+                                span: data.inputs_span.shrink_to_hi().to(ty.span),
+                            })
+                        } else {
+                            unreachable!("inputs are empty and return type is not provided")
+                        };
+                        if !self.tcx.features().return_type_notation
+                            && self.tcx.sess.is_nightly_build()
+                        {
+                            add_feature_diagnostics(
+                                &mut err,
+                                &self.tcx.sess.parse_sess,
+                                sym::return_type_notation,
+                            );
+                        }
+                        err.emit();
+                        GenericArgsCtor {
+                            args: Default::default(),
+                            bindings: &[],
+                            parenthesized: hir::GenericArgsParentheses::ReturnTypeNotation,
+                            span: data.span,
+                        }
+                    } else {
+                        self.emit_bad_parenthesized_trait_in_assoc_ty(data);
+                        // FIXME(return_type_notation): we could issue a feature error
+                        // if the parens are empty and there's no return type.
+                        self.lower_angle_bracketed_parameter_data(
+                            &data.as_angle_bracketed_args(),
+                            ParamMode::Explicit,
+                            itctx,
+                        )
+                        .0
+                    }
                 }
             };
             gen_args_ctor.into_generic_args(self)
@@ -2080,7 +2122,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let future_args = self.arena.alloc(hir::GenericArgs {
             args: &[],
             bindings: arena_vec![self; self.output_ty_binding(span, output_ty)],
-            parenthesized: false,
+            parenthesized: hir::GenericArgsParentheses::No,
             span_ext: DUMMY_SP,
         });
 
@@ -2190,7 +2232,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             def_id: self.local_def_id(param.id),
             name,
             span: self.lower_span(param.span()),
-            pure_wrt_drop: self.tcx.sess.contains_name(&param.attrs, sym::may_dangle),
+            pure_wrt_drop: attr::contains_name(&param.attrs, sym::may_dangle),
             kind,
             colon_span: param.colon_span.map(|s| self.lower_span(s)),
             source,
@@ -2600,13 +2642,15 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 struct GenericArgsCtor<'hir> {
     args: SmallVec<[hir::GenericArg<'hir>; 4]>,
     bindings: &'hir [hir::TypeBinding<'hir>],
-    parenthesized: bool,
+    parenthesized: hir::GenericArgsParentheses,
     span: Span,
 }
 
 impl<'hir> GenericArgsCtor<'hir> {
     fn is_empty(&self) -> bool {
-        self.args.is_empty() && self.bindings.is_empty() && !self.parenthesized
+        self.args.is_empty()
+            && self.bindings.is_empty()
+            && self.parenthesized == hir::GenericArgsParentheses::No
     }
 
     fn into_generic_args(self, this: &LoweringContext<'_, 'hir>) -> &'hir hir::GenericArgs<'hir> {

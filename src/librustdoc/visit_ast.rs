@@ -8,14 +8,14 @@ use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId, LocalDefIdSet};
 use rustc_hir::intravisit::{walk_item, Visitor};
 use rustc_hir::{Node, CRATE_HIR_ID};
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::{DefIdTree, TyCtxt};
+use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
 
-use std::mem;
+use std::{iter, mem};
 
-use crate::clean::{cfg::Cfg, AttributesExt, NestedAttributesExt};
+use crate::clean::{cfg::Cfg, reexport_chain, AttributesExt, NestedAttributesExt};
 use crate::core;
 
 /// This module is used to store stuff from Rust's AST in a more convenient
@@ -133,7 +133,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         // is declared but also a reexport of itself producing two exports of the same
         // macro in the same module.
         let mut inserted = FxHashSet::default();
-        for export in self.cx.tcx.module_reexports(CRATE_DEF_ID).unwrap_or(&[]) {
+        for export in self.cx.tcx.module_children_reexports(CRATE_DEF_ID) {
             if let Res::Def(DefKind::Macro(_), def_id) = export.res &&
                 let Some(local_def_id) = def_id.as_local() &&
                 self.cx.tcx.has_attr(def_id, sym::macro_export) &&
@@ -223,6 +223,11 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
     ) -> bool {
         debug!("maybe_inline_local res: {:?}", res);
 
+        if renamed == Some(kw::Underscore) {
+            // We never inline `_` reexports.
+            return false;
+        }
+
         if self.cx.output_format.is_json() {
             return false;
         }
@@ -256,6 +261,22 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
 
         // Only inline if requested or if the item would otherwise be stripped.
         if (!please_inline && !is_private && !is_hidden) || is_no_inline {
+            return false;
+        }
+
+        if !please_inline &&
+            let Some(item_def_id) = reexport_chain(self.cx.tcx, def_id, res_did).iter()
+                .flat_map(|reexport| reexport.id()).map(|id| id.expect_local())
+                .chain(iter::once(res_did)).nth(1) &&
+            item_def_id != def_id &&
+            self
+                .cx
+                .cache
+                .effective_visibilities
+                .is_directly_public(self.cx.tcx, item_def_id.to_def_id()) &&
+            !inherits_doc_hidden(self.cx.tcx, item_def_id)
+        {
+            // The imported item is public and not `doc(hidden)` so no need to inline it.
             return false;
         }
 
@@ -329,8 +350,8 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
                     self.visit_foreign_item_inner(item, None);
                 }
             }
-            // If we're inlining, skip private items or item reexported as "_".
-            _ if self.inlining && (!is_pub || renamed == Some(kw::Underscore)) => {}
+            // If we're inlining, skip private items.
+            _ if self.inlining && !is_pub => {}
             hir::ItemKind::GlobalAsm(..) => {}
             hir::ItemKind::Use(_, hir::UseKind::ListStem) => {}
             hir::ItemKind::Use(path, kind) => {

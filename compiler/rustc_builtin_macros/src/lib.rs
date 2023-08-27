@@ -7,9 +7,9 @@
 #![feature(box_patterns)]
 #![feature(decl_macro)]
 #![feature(if_let_guard)]
-#![feature(is_some_and)]
 #![feature(is_sorted)]
 #![feature(let_chains)]
+#![feature(lint_reasons)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
 #![recursion_limit = "256"]
@@ -40,6 +40,7 @@ mod derive;
 mod deriving;
 mod edition_panic;
 mod env;
+mod errors;
 mod format;
 mod format_foreign;
 mod global_allocator;
@@ -56,7 +57,7 @@ pub mod proc_macro_harness;
 pub mod standard_library_imports;
 pub mod test_harness;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
     let mut register = |name, kind| resolver.register_builtin_macro(name, kind);

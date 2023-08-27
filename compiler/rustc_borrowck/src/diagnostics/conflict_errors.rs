@@ -1,7 +1,7 @@
 use either::Either;
 use rustc_const_eval::util::CallKind;
 use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{
     struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed, MultiSpan,
 };
@@ -24,6 +24,7 @@ use rustc_span::hygiene::DesugaringKind;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::{BytePos, Span, Symbol};
 use rustc_trait_selection::infer::InferCtxtExt;
+use rustc_trait_selection::traits::ObligationCtxt;
 
 use crate::borrow_set::TwoPhaseActivation;
 use crate::borrowck_errors;
@@ -173,7 +174,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
 
             let mut is_loop_move = false;
             let mut in_pattern = false;
-            let mut seen_spans = FxHashSet::default();
+            let mut seen_spans = FxIndexSet::default();
 
             for move_site in &move_site_vec {
                 let move_out = self.move_data.moves[(*move_site).moi];
@@ -760,20 +761,12 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         else { return; };
         // Try to find predicates on *generic params* that would allow copying `ty`
         let infcx = tcx.infer_ctxt().build();
-        let copy_did = infcx.tcx.require_lang_item(LangItem::Copy, Some(span));
-        let cause = ObligationCause::new(
-            span,
-            self.mir_def_id(),
-            rustc_infer::traits::ObligationCauseCode::MiscObligation,
-        );
-        let errors = rustc_trait_selection::traits::fully_solve_bound(
-            &infcx,
-            cause,
-            self.param_env,
-            // Erase any region vids from the type, which may not be resolved
-            infcx.tcx.erase_regions(ty),
-            copy_did,
-        );
+        let ocx = ObligationCtxt::new(&infcx);
+        let copy_did = tcx.require_lang_item(LangItem::Copy, Some(span));
+        let cause = ObligationCause::misc(span, self.mir_def_id());
+
+        ocx.register_bound(cause, self.param_env, infcx.tcx.erase_regions(ty), copy_did);
+        let errors = ocx.select_all_or_error();
 
         // Only emit suggestion if all required predicates are on generic
         let predicates: Result<Vec<_>, _> = errors
@@ -1467,6 +1460,32 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
 
     /// Reports StorageDeadOrDrop of `place` conflicts with `borrow`.
     ///
+    /// Depending on the origin of the StorageDeadOrDrop, this may be
+    /// reported as either a drop or an illegal mutation of a borrowed value.
+    /// The latter is preferred when the this is a drop triggered by a
+    /// reassignment, as it's more user friendly to report a problem with the
+    /// explicit assignment than the implicit drop.
+    #[instrument(level = "debug", skip(self))]
+    pub(crate) fn report_storage_dead_or_drop_of_borrowed(
+        &mut self,
+        location: Location,
+        place_span: (Place<'tcx>, Span),
+        borrow: &BorrowData<'tcx>,
+    ) {
+        // It's sufficient to check the last desugaring as Replace is the last
+        // one to be applied.
+        if let Some(DesugaringKind::Replace) = place_span.1.desugaring_kind() {
+            self.report_illegal_mutation_of_borrowed(location, place_span, borrow)
+        } else {
+            self.report_borrowed_value_does_not_live_long_enough(
+                location,
+                borrow,
+                place_span,
+                Some(WriteKind::StorageDeadOrDrop),
+            )
+        }
+    }
+
     /// This means that some data referenced by `borrow` needs to live
     /// past the point where the StorageDeadOrDrop of `place` occurs.
     /// This is usually interpreted as meaning that `place` has too
@@ -1959,16 +1978,18 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         let (place_desc, note) = if let Some(place_desc) = opt_place_desc {
             let local_kind = if let Some(local) = borrow.borrowed_place.as_local() {
                 match self.body.local_kind(local) {
-                    LocalKind::ReturnPointer | LocalKind::Temp => {
-                        bug!("temporary or return pointer with a name")
+                    LocalKind::Temp if self.body.local_decls[local].is_user_variable() => {
+                        "local variable "
                     }
-                    LocalKind::Var => "local variable ",
                     LocalKind::Arg
                         if !self.upvars.is_empty() && local == ty::CAPTURE_STRUCT_LOCAL =>
                     {
                         "variable captured by `move` "
                     }
                     LocalKind::Arg => "function parameter ",
+                    LocalKind::ReturnPointer | LocalKind::Temp => {
+                        bug!("temporary or return pointer with a name")
+                    }
                 }
             } else {
                 "local data "
@@ -1982,15 +2003,15 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 self.prefixes(borrow.borrowed_place.as_ref(), PrefixSet::All).last().unwrap();
             let local = root_place.local;
             match self.body.local_kind(local) {
-                LocalKind::ReturnPointer | LocalKind::Temp => {
-                    ("temporary value".to_string(), "temporary value created here".to_string())
-                }
                 LocalKind::Arg => (
                     "function parameter".to_string(),
                     "function parameter borrowed here".to_string(),
                 ),
-                LocalKind::Var => {
+                LocalKind::Temp if self.body.local_decls[local].is_user_variable() => {
                     ("local binding".to_string(), "local binding introduced here".to_string())
+                }
+                LocalKind::ReturnPointer | LocalKind::Temp => {
+                    ("temporary value".to_string(), "temporary value created here".to_string())
                 }
             }
         };
@@ -2197,8 +2218,8 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
             }
         }
 
-        let mut visited = FxHashSet::default();
-        let mut move_locations = FxHashSet::default();
+        let mut visited = FxIndexSet::default();
+        let mut move_locations = FxIndexSet::default();
         let mut reinits = vec![];
         let mut result = vec![];
 
@@ -2325,7 +2346,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         let reinits_reachable = reinits
             .into_iter()
             .filter(|reinit| {
-                let mut visited = FxHashSet::default();
+                let mut visited = FxIndexSet::default();
                 let mut stack = vec![*reinit];
                 while let Some(location) = stack.pop() {
                     if !visited.insert(location) {
@@ -2456,15 +2477,14 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         let (place_description, assigned_span) = match local_decl {
             Some(LocalDecl {
                 local_info:
-                    Some(box LocalInfo::User(
-                        ClearCrossCrate::Clear
-                        | ClearCrossCrate::Set(BindingForm::Var(VarBindingForm {
+                    ClearCrossCrate::Set(
+                        box LocalInfo::User(BindingForm::Var(VarBindingForm {
                             opt_match_place: None,
                             ..
-                        })),
-                    ))
-                    | Some(box LocalInfo::StaticRef { .. })
-                    | None,
+                        }))
+                        | box LocalInfo::StaticRef { .. }
+                        | box LocalInfo::Boring,
+                    ),
                 ..
             })
             | None => (self.describe_any_place(place.as_ref()), assigned_span),

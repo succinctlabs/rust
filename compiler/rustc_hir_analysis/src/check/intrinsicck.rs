@@ -1,10 +1,11 @@
 use rustc_ast::InlineAsmTemplatePiece;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir as hir;
 use rustc_middle::ty::{self, Article, FloatTy, IntTy, Ty, TyCtxt, TypeVisitableExt, UintTy};
 use rustc_session::lint;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Symbol, DUMMY_SP};
+use rustc_target::abi::FieldIdx;
 use rustc_target::asm::{InlineAsmReg, InlineAsmRegClass, InlineAsmRegOrRegClass, InlineAsmType};
 
 pub struct InlineAsmCtxt<'a, 'tcx> {
@@ -51,7 +52,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
         template: &[InlineAsmTemplatePiece],
         is_input: bool,
         tied_input: Option<(&'tcx hir::Expr<'tcx>, Option<InlineAsmType>)>,
-        target_features: &FxHashSet<Symbol>,
+        target_features: &FxIndexSet<Symbol>,
     ) -> Option<InlineAsmType> {
         let ty = (self.get_operand_ty)(expr);
         if ty.has_non_region_infer() {
@@ -82,7 +83,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
             }
             ty::Adt(adt, substs) if adt.repr().simd() => {
                 let fields = &adt.non_enum_variant().fields;
-                let elem_ty = fields[0].ty(self.tcx, substs);
+                let elem_ty = fields[FieldIdx::from_u32(0)].ty(self.tcx, substs);
                 match elem_ty.kind() {
                     ty::Never | ty::Error(_) => return None,
                     ty::Int(IntTy::I8) | ty::Uint(UintTy::U8) => {
@@ -201,7 +202,7 @@ impl<'a, 'tcx> InlineAsmCtxt<'a, 'tcx> {
         // (!). In that case we still need the earlier check to verify that the
         // register class is usable at all.
         if let Some(feature) = feature {
-            if !target_features.contains(&feature) {
+            if !target_features.contains(feature) {
                 let msg = &format!("`{}` target feature is not enabled", feature);
                 let mut err = self.tcx.sess.struct_span_err(expr.span, msg);
                 err.note(&format!(

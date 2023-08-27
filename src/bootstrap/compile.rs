@@ -20,11 +20,11 @@ use serde_derive::Deserialize;
 
 use crate::builder::crate_description;
 use crate::builder::Cargo;
-use crate::builder::{Builder, Kind, RunConfig, ShouldRun, Step};
+use crate::builder::{Builder, Kind, PathSet, RunConfig, ShouldRun, Step, TaskPath};
 use crate::cache::{Interned, INTERNER};
 use crate::config::{LlvmLibunwind, RustcLto, TargetSelection};
 use crate::dist;
-use crate::native;
+use crate::llvm;
 use crate::tool::SourceType;
 use crate::util::get_clang_cl_resource_dir;
 use crate::util::{exe, is_debug_info, is_dylib, output, symlink_dir, t, up_to_date};
@@ -83,11 +83,11 @@ impl Step for Std {
         let target = self.target;
         let compiler = self.compiler;
 
-        // These artifacts were already copied (in `impl Step for Sysroot`).
-        // Don't recompile them.
+        // When using `download-rustc`, we already have artifacts for the host available
+        // (they were copied in `impl Step for Sysroot`). Don't recompile them.
         // NOTE: the ABI of the beta compiler is different from the ABI of the downloaded compiler,
         // so its artifacts can't be reused.
-        if builder.download_rustc() && compiler.stage != 0 {
+        if builder.download_rustc() && compiler.stage != 0 && target == builder.build.build {
             return;
         }
 
@@ -191,7 +191,7 @@ fn copy_and_stamp(
 }
 
 fn copy_llvm_libunwind(builder: &Builder<'_>, target: TargetSelection, libdir: &Path) -> PathBuf {
-    let libunwind_path = builder.ensure(native::Libunwind { target });
+    let libunwind_path = builder.ensure(llvm::Libunwind { target });
     let libunwind_source = libunwind_path.join("libunwind.a");
     let libunwind_target = libdir.join("libunwind.a");
     builder.copy(&libunwind_source, &libunwind_target);
@@ -266,7 +266,7 @@ fn copy_self_contained_objects(
                 DependencyType::TargetSelfContained,
             );
         }
-        let crt_path = builder.ensure(native::CrtBeginEnd { target });
+        let crt_path = builder.ensure(llvm::CrtBeginEnd { target });
         for &obj in &["crtbegin.o", "crtbeginS.o", "crtend.o", "crtendS.o"] {
             let src = crt_path.join(obj);
             let target = libdir_self_contained.join(obj);
@@ -338,6 +338,12 @@ pub fn std_cargo(builder: &Builder<'_>, target: TargetSelection, stage: u32, car
     } else {
         ""
     };
+
+    // `libtest` uses this to know whether or not to support
+    // `-Zunstable-options`.
+    if !builder.unstable_features() {
+        cargo.env("CFG_DISABLE_UNSTABLE_FEATURES", "1");
+    }
 
     let mut features = String::new();
 
@@ -468,7 +474,7 @@ fn copy_sanitizers(
     compiler: &Compiler,
     target: TargetSelection,
 ) -> Vec<PathBuf> {
-    let runtimes: Vec<native::SanitizerRuntime> = builder.ensure(native::Sanitizers { target });
+    let runtimes: Vec<llvm::SanitizerRuntime> = builder.ensure(llvm::Sanitizers { target });
 
     if builder.config.dry_run() {
         return Vec::new();
@@ -690,7 +696,7 @@ impl Step for Rustc {
         ));
 
         let mut cargo = builder.cargo(compiler, Mode::Rustc, SourceType::InTree, target, "build");
-        rustc_cargo(builder, &mut cargo, target);
+        rustc_cargo(builder, &mut cargo, target, compiler.stage);
 
         if builder.config.rust_profile_use.is_some()
             && builder.config.rust_profile_generate.is_some()
@@ -807,16 +813,21 @@ impl Step for Rustc {
     }
 }
 
-pub fn rustc_cargo(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
+pub fn rustc_cargo(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection, stage: u32) {
     cargo
         .arg("--features")
         .arg(builder.rustc_features(builder.kind))
         .arg("--manifest-path")
         .arg(builder.src.join("compiler/rustc/Cargo.toml"));
-    rustc_cargo_env(builder, cargo, target);
+    rustc_cargo_env(builder, cargo, target, stage);
 }
 
-pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
+pub fn rustc_cargo_env(
+    builder: &Builder<'_>,
+    cargo: &mut Cargo,
+    target: TargetSelection,
+    stage: u32,
+) {
     // Set some configuration variables picked up by build scripts and
     // the compiler alike
     cargo
@@ -861,83 +872,86 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
         cargo.env("RUSTC_VERIFY_LLVM_IR", "1");
     }
 
-    // Pass down configuration from the LLVM build into the build of
-    // rustc_llvm and rustc_codegen_llvm.
-    //
     // Note that this is disabled if LLVM itself is disabled or we're in a check
     // build. If we are in a check build we still go ahead here presuming we've
     // detected that LLVM is already built and good to go which helps prevent
     // busting caches (e.g. like #71152).
-    if builder.config.llvm_enabled()
-        && (builder.kind != Kind::Check
-            || crate::native::prebuilt_llvm_config(builder, target).is_ok())
-    {
-        if builder.is_rust_llvm(target) {
-            cargo.env("LLVM_RUSTLLVM", "1");
+    if builder.config.llvm_enabled() {
+        let building_is_expensive = crate::llvm::prebuilt_llvm_config(builder, target).is_err();
+        // `top_stage == stage` might be false for `check --stage 1`, if we are building the stage 1 compiler
+        let can_skip_build = builder.kind == Kind::Check && builder.top_stage == stage;
+        let should_skip_build = building_is_expensive && can_skip_build;
+        if !should_skip_build {
+            rustc_llvm_env(builder, cargo, target)
         }
-        let native::LlvmResult { llvm_config, .. } = builder.ensure(native::Llvm { target });
-        cargo.env("LLVM_CONFIG", &llvm_config);
-        if let Some(s) = target_config.and_then(|c| c.llvm_config.as_ref()) {
-            cargo.env("CFG_LLVM_ROOT", s);
-        }
+    }
+}
 
-        // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
-        // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by
-        // whitespace.
-        //
-        // For example:
-        // - on windows, when `clang-cl` is used with instrumentation, we need to manually add
-        // clang's runtime library resource directory so that the profiler runtime library can be
-        // found. This is to avoid the linker errors about undefined references to
-        // `__llvm_profile_instrument_memop` when linking `rustc_driver`.
-        let mut llvm_linker_flags = String::new();
-        if builder.config.llvm_profile_generate && target.contains("msvc") {
-            if let Some(ref clang_cl_path) = builder.config.llvm_clang_cl {
-                // Add clang's runtime library directory to the search path
-                let clang_rt_dir = get_clang_cl_resource_dir(clang_cl_path);
-                llvm_linker_flags.push_str(&format!("-L{}", clang_rt_dir.display()));
-            }
-        }
+/// Pass down configuration from the LLVM build into the build of
+/// rustc_llvm and rustc_codegen_llvm.
+fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
+    let target_config = builder.config.target_config.get(&target);
 
-        // The config can also specify its own llvm linker flags.
-        if let Some(ref s) = builder.config.llvm_ldflags {
-            if !llvm_linker_flags.is_empty() {
-                llvm_linker_flags.push_str(" ");
-            }
-            llvm_linker_flags.push_str(s);
-        }
+    if builder.is_rust_llvm(target) {
+        cargo.env("LLVM_RUSTLLVM", "1");
+    }
+    let llvm::LlvmResult { llvm_config, .. } = builder.ensure(llvm::Llvm { target });
+    cargo.env("LLVM_CONFIG", &llvm_config);
+    if let Some(s) = target_config.and_then(|c| c.llvm_config.as_ref()) {
+        cargo.env("CFG_LLVM_ROOT", s);
+    }
 
-        // Set the linker flags via the env var that `rustc_llvm`'s build script will read.
+    // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
+    // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by
+    // whitespace.
+    //
+    // For example:
+    // - on windows, when `clang-cl` is used with instrumentation, we need to manually add
+    // clang's runtime library resource directory so that the profiler runtime library can be
+    // found. This is to avoid the linker errors about undefined references to
+    // `__llvm_profile_instrument_memop` when linking `rustc_driver`.
+    let mut llvm_linker_flags = String::new();
+    if builder.config.llvm_profile_generate && target.contains("msvc") {
+        if let Some(ref clang_cl_path) = builder.config.llvm_clang_cl {
+            // Add clang's runtime library directory to the search path
+            let clang_rt_dir = get_clang_cl_resource_dir(clang_cl_path);
+            llvm_linker_flags.push_str(&format!("-L{}", clang_rt_dir.display()));
+        }
+    }
+
+    // The config can also specify its own llvm linker flags.
+    if let Some(ref s) = builder.config.llvm_ldflags {
         if !llvm_linker_flags.is_empty() {
-            cargo.env("LLVM_LINKER_FLAGS", llvm_linker_flags);
+            llvm_linker_flags.push_str(" ");
         }
+        llvm_linker_flags.push_str(s);
+    }
 
-        // Building with a static libstdc++ is only supported on linux right now,
-        // not for MSVC or macOS
-        if builder.config.llvm_static_stdcpp
-            && !target.contains("freebsd")
-            && !target.contains("msvc")
-            && !target.contains("apple")
-            && !target.contains("solaris")
-        {
-            let file = compiler_file(
-                builder,
-                builder.cxx(target).unwrap(),
-                target,
-                CLang::Cxx,
-                "libstdc++.a",
-            );
-            cargo.env("LLVM_STATIC_STDCPP", file);
-        }
-        if builder.llvm_link_shared() {
-            cargo.env("LLVM_LINK_SHARED", "1");
-        }
-        if builder.config.llvm_use_libcxx {
-            cargo.env("LLVM_USE_LIBCXX", "1");
-        }
-        if builder.config.llvm_optimize && !builder.config.llvm_release_debuginfo {
-            cargo.env("LLVM_NDEBUG", "1");
-        }
+    // Set the linker flags via the env var that `rustc_llvm`'s build script will read.
+    if !llvm_linker_flags.is_empty() {
+        cargo.env("LLVM_LINKER_FLAGS", llvm_linker_flags);
+    }
+
+    // Building with a static libstdc++ is only supported on linux right now,
+    // not for MSVC or macOS
+    if builder.config.llvm_static_stdcpp
+        && !target.contains("freebsd")
+        && !target.contains("msvc")
+        && !target.contains("apple")
+        && !target.contains("solaris")
+    {
+        let file =
+            compiler_file(builder, builder.cxx(target).unwrap(), target, CLang::Cxx, "libstdc++.a");
+        cargo.env("LLVM_STATIC_STDCPP", file);
+    }
+    if builder.llvm_link_shared() {
+        cargo.env("LLVM_LINK_SHARED", "1");
+    }
+    if builder.config.llvm_use_libcxx {
+        cargo.env("LLVM_USE_LIBCXX", "1");
+    }
+    if builder.config.llvm_optimize && !builder.config.llvm_release_debuginfo {
+        cargo.env("LLVM_NDEBUG", "1");
     }
 }
 
@@ -989,6 +1003,44 @@ pub struct CodegenBackend {
     pub backend: Interned<String>,
 }
 
+fn needs_codegen_config(run: &RunConfig<'_>) -> bool {
+    let mut needs_codegen_cfg = false;
+    for path_set in &run.paths {
+        needs_codegen_cfg = match path_set {
+            PathSet::Set(set) => set.iter().any(|p| is_codegen_cfg_needed(p, run)),
+            PathSet::Suite(suite) => is_codegen_cfg_needed(&suite, run),
+        }
+    }
+    needs_codegen_cfg
+}
+
+const CODEGEN_BACKEND_PREFIX: &str = "rustc_codegen_";
+
+fn is_codegen_cfg_needed(path: &TaskPath, run: &RunConfig<'_>) -> bool {
+    if path.path.to_str().unwrap().contains(&CODEGEN_BACKEND_PREFIX) {
+        let mut needs_codegen_backend_config = true;
+        for &backend in &run.builder.config.rust_codegen_backends {
+            if path
+                .path
+                .to_str()
+                .unwrap()
+                .ends_with(&(CODEGEN_BACKEND_PREFIX.to_owned() + &backend))
+            {
+                needs_codegen_backend_config = false;
+            }
+        }
+        if needs_codegen_backend_config {
+            run.builder.info(
+                "Warning: no codegen-backends config matched the requested path to build a codegen backend. \
+                Help: add backend to codegen-backends in config.toml.",
+            );
+            return true;
+        }
+    }
+
+    return false;
+}
+
 impl Step for CodegenBackend {
     type Output = ();
     const ONLY_HOSTS: bool = true;
@@ -1000,6 +1052,10 @@ impl Step for CodegenBackend {
     }
 
     fn make_run(run: RunConfig<'_>) {
+        if needs_codegen_config(&run) {
+            return;
+        }
+
         for &backend in &run.builder.config.rust_codegen_backends {
             if backend == "llvm" {
                 continue; // Already built as part of rustc
@@ -1042,7 +1098,7 @@ impl Step for CodegenBackend {
         cargo
             .arg("--manifest-path")
             .arg(builder.src.join(format!("compiler/rustc_codegen_{}/Cargo.toml", backend)));
-        rustc_cargo_env(builder, &mut cargo, target);
+        rustc_cargo_env(builder, &mut cargo, target, compiler.stage);
 
         let tmp_stamp = out_dir.join(".tmp.stamp");
 
@@ -1225,9 +1281,7 @@ impl Step for Sysroot {
             }
 
             // Copy the compiler into the correct sysroot.
-            let ci_rustc_dir =
-                builder.config.out.join(&*builder.config.build.triple).join("ci-rustc");
-            builder.cp_r(&ci_rustc_dir, &sysroot);
+            builder.cp_r(&builder.ci_rustc_dir(builder.build.build), &sysroot);
             return INTERNER.intern_path(sysroot);
         }
 
@@ -1329,7 +1383,10 @@ impl Step for Assemble {
 
         // If we're downloading a compiler from CI, we can use the same compiler for all stages other than 0.
         if builder.download_rustc() {
-            builder.ensure(Sysroot { compiler: target_compiler });
+            let sysroot = builder.ensure(Sysroot { compiler: target_compiler });
+            // Ensure that `libLLVM.so` ends up in the newly created target directory,
+            // so that tools using `rustc_private` can use it.
+            dist::maybe_install_llvm_target(builder, target_compiler.host, &sysroot);
             return target_compiler;
         }
 
@@ -1339,6 +1396,13 @@ impl Step for Assemble {
         // of the time but I think we do link to these for stage2/bin compilers
         // when not performing a full bootstrap).
         builder.ensure(Rustc::new(build_compiler, target_compiler.host));
+
+        // FIXME: For now patch over problems noted in #90244 by early returning here, even though
+        // we've not properly assembled the target sysroot. A full fix is pending further investigation,
+        // for now full bootstrap usage is rare enough that this is OK.
+        if target_compiler.stage >= 3 && !builder.config.full_bootstrap {
+            return target_compiler;
+        }
 
         for &backend in builder.config.rust_codegen_backends.iter() {
             if backend == "llvm" {
@@ -1353,7 +1417,7 @@ impl Step for Assemble {
         }
 
         let lld_install = if builder.config.lld_enabled {
-            Some(builder.ensure(native::Lld { target: target_compiler.host }))
+            Some(builder.ensure(llvm::Lld { target: target_compiler.host }))
         } else {
             None
         };
@@ -1417,8 +1481,8 @@ impl Step for Assemble {
         }
 
         if builder.config.rust_codegen_backends.contains(&INTERNER.intern_str("llvm")) {
-            let native::LlvmResult { llvm_config, .. } =
-                builder.ensure(native::Llvm { target: target_compiler.host });
+            let llvm::LlvmResult { llvm_config, .. } =
+                builder.ensure(llvm::Llvm { target: target_compiler.host });
             if !builder.config.dry_run() {
                 let llvm_bin_dir = output(Command::new(llvm_config).arg("--bindir"));
                 let llvm_bin_dir = Path::new(llvm_bin_dir.trim());

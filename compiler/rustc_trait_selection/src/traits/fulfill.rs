@@ -2,6 +2,7 @@ use crate::infer::{InferCtxt, TyOrConstInferVar};
 use rustc_data_structures::obligation_forest::ProcessResult;
 use rustc_data_structures::obligation_forest::{Error, ForestObligation, Outcome};
 use rustc_data_structures::obligation_forest::{ObligationForest, ObligationProcessor};
+use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_infer::traits::ProjectionCacheKey;
 use rustc_infer::traits::{SelectionError, TraitEngine, TraitObligation};
 use rustc_middle::mir::interpret::ErrorHandled;
@@ -132,8 +133,15 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentContext<'tcx> {
             .register_obligation(PendingPredicateObligation { obligation, stalled_on: vec![] });
     }
 
-    fn collect_remaining_errors(&mut self) -> Vec<FulfillmentError<'tcx>> {
-        self.predicates.to_errors(CodeAmbiguity).into_iter().map(to_fulfillment_error).collect()
+    fn collect_remaining_errors(
+        &mut self,
+        _infcx: &InferCtxt<'tcx>,
+    ) -> Vec<FulfillmentError<'tcx>> {
+        self.predicates
+            .to_errors(CodeAmbiguity { overflow: false })
+            .into_iter()
+            .map(to_fulfillment_error)
+            .collect()
     }
 
     fn select_where_possible(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>> {
@@ -209,6 +217,29 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
     type Obligation = PendingPredicateObligation<'tcx>;
     type Error = FulfillmentErrorCode<'tcx>;
     type OUT = Outcome<Self::Obligation, Self::Error>;
+
+    /// Compared to `needs_process_obligation` this and its callees
+    /// contain some optimizations that come at the price of false negatives.
+    ///
+    /// They
+    /// - reduce branching by covering only the most common case
+    /// - take a read-only view of the unification tables which allows skipping undo_log
+    ///   construction.
+    /// - bail out on value-cache misses in ena to avoid pointer chasing
+    /// - hoist RefCell locking out of the loop
+    #[inline]
+    fn skippable_obligations<'b>(
+        &'b self,
+        it: impl Iterator<Item = &'b Self::Obligation>,
+    ) -> usize {
+        let is_unchanged = self.selcx.infcx.is_ty_infer_var_definitely_unchanged();
+
+        it.take_while(|o| match o.stalled_on.as_slice() {
+            [o] => is_unchanged(*o),
+            _ => false,
+        })
+        .count()
+    }
 
     /// Identifies whether a predicate obligation needs processing.
     ///
@@ -337,8 +368,8 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::TypeWellFormedFromEnv(..) => {
                     bug!("TypeWellFormedFromEnv is only used for Chalk")
                 }
-                ty::PredicateKind::AliasEq(..) => {
-                    bug!("AliasEq is only used for new solver")
+                ty::PredicateKind::AliasRelate(..) => {
+                    bug!("AliasRelate is only used for new solver")
                 }
             },
             Some(pred) => match pred {
@@ -515,7 +546,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                                 if let Ok(new_obligations) = infcx
                                     .at(&obligation.cause, obligation.param_env)
                                     .trace(c1, c2)
-                                    .eq(a.substs, b.substs)
+                                    .eq(DefineOpaqueTypes::No, a.substs, b.substs)
                                 {
                                     return ProcessResult::Changed(mk_pending(
                                         new_obligations.into_obligations(),
@@ -524,8 +555,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                             }
                             (_, Unevaluated(_)) | (Unevaluated(_), _) => (),
                             (_, _) => {
-                                if let Ok(new_obligations) =
-                                    infcx.at(&obligation.cause, obligation.param_env).eq(c1, c2)
+                                if let Ok(new_obligations) = infcx
+                                    .at(&obligation.cause, obligation.param_env)
+                                    .eq(DefineOpaqueTypes::No, c1, c2)
                                 {
                                     return ProcessResult::Changed(mk_pending(
                                         new_obligations.into_obligations(),
@@ -565,12 +597,11 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
                     match (evaluate(c1), evaluate(c2)) {
                         (Ok(c1), Ok(c2)) => {
-                            match self
-                                .selcx
-                                .infcx
-                                .at(&obligation.cause, obligation.param_env)
-                                .eq(c1, c2)
-                            {
+                            match self.selcx.infcx.at(&obligation.cause, obligation.param_env).eq(
+                                DefineOpaqueTypes::No,
+                                c1,
+                                c2,
+                            ) {
                                 Ok(inf_ok) => {
                                     ProcessResult::Changed(mk_pending(inf_ok.into_obligations()))
                                 }
@@ -606,16 +637,15 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::TypeWellFormedFromEnv(..) => {
                     bug!("TypeWellFormedFromEnv is only used for Chalk")
                 }
-                ty::PredicateKind::AliasEq(..) => {
-                    bug!("AliasEq is only used for new solver")
+                ty::PredicateKind::AliasRelate(..) => {
+                    bug!("AliasRelate is only used for new solver")
                 }
                 ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(ct, ty)) => {
-                    match self
-                        .selcx
-                        .infcx
-                        .at(&obligation.cause, obligation.param_env)
-                        .eq(ct.ty(), ty)
-                    {
+                    match self.selcx.infcx.at(&obligation.cause, obligation.param_env).eq(
+                        DefineOpaqueTypes::No,
+                        ct.ty(),
+                        ty,
+                    ) {
                         Ok(inf_ok) => ProcessResult::Changed(mk_pending(inf_ok.into_obligations())),
                         Err(_) => ProcessResult::Error(FulfillmentErrorCode::CodeSelectionError(
                             SelectionError::Unimplemented,

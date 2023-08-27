@@ -17,7 +17,8 @@ use crate::mir::interpret::{
 };
 use crate::mir::interpret::{LitToConstError, LitToConstInput};
 use crate::mir::mono::CodegenUnit;
-use crate::query::Key;
+use crate::query::erase::{erase, restore, Erase};
+use crate::query::{AsLocalKey, Key};
 use crate::thir;
 use crate::traits::query::{
     CanonicalPredicateGoal, CanonicalProjectionGoal, CanonicalTyGoal,
@@ -41,7 +42,7 @@ use rustc_arena::TypedArena;
 use rustc_ast as ast;
 use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_attr as attr;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::Lrc;
@@ -50,11 +51,15 @@ use rustc_data_structures::unord::UnordSet;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, DocLinkResMap};
-use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, DefIdSet, LocalDefId};
+use rustc_hir::def_id::{
+    CrateNum, DefId, DefIdMap, DefIdSet, LocalDefId, LocalDefIdMap, LocalDefIdSet,
+};
 use rustc_hir::hir_id::OwnerId;
 use rustc_hir::lang_items::{LangItem, LanguageItems};
 use rustc_hir::{Crate, ItemLocalId, TraitCandidate};
 use rustc_index::vec::IndexVec;
+pub(crate) use rustc_query_system::query::QueryJobId;
+use rustc_query_system::query::*;
 use rustc_session::config::{EntryFnType, OptLevel, OutputFilenames, SymbolManglingVersion};
 use rustc_session::cstore::{CrateDepKind, CrateSource};
 use rustc_session::cstore::{ExternCrate, ForeignModule, LinkagePreference, NativeLib};
@@ -64,18 +69,19 @@ use rustc_span::symbol::Symbol;
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi;
 use rustc_target::spec::PanicStrategy;
+
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub(crate) use rustc_query_system::query::QueryJobId;
-use rustc_query_system::query::*;
-
 #[derive(Default)]
 pub struct QuerySystem<'tcx> {
     pub arenas: QueryArenas<'tcx>,
     pub caches: QueryCaches<'tcx>,
+    // Since we erase query value types we tell the typesystem about them with `PhantomData`.
+    _phantom_values: QueryPhantomValues<'tcx>,
 }
 
 #[derive(Copy, Clone)]
@@ -97,12 +103,26 @@ pub struct TyCtxtEnsure<'tcx> {
     pub tcx: TyCtxt<'tcx>,
 }
 
+#[derive(Copy, Clone)]
+pub struct TyCtxtEnsureWithValue<'tcx> {
+    pub tcx: TyCtxt<'tcx>,
+}
+
 impl<'tcx> TyCtxt<'tcx> {
     /// Returns a transparent wrapper for `TyCtxt`, which ensures queries
     /// are executed instead of just returning their results.
     #[inline(always)]
     pub fn ensure(self) -> TyCtxtEnsure<'tcx> {
         TyCtxtEnsure { tcx: self }
+    }
+
+    /// Returns a transparent wrapper for `TyCtxt`, which ensures queries
+    /// are executed instead of just returning their results.
+    ///
+    /// This version verifies that the computed result exists in the cache before returning.
+    #[inline(always)]
+    pub fn ensure_with_value(self) -> TyCtxtEnsureWithValue<'tcx> {
+        TyCtxtEnsureWithValue { tcx: self }
     }
 
     /// Returns a transparent wrapper for `TyCtxt` which uses
@@ -132,6 +152,20 @@ macro_rules! query_if_arena {
     };
     ([$other:tt $($modifiers:tt)*]$($args:tt)*) => {
         query_if_arena!([$($modifiers)*]$($args)*)
+    };
+}
+
+/// If `separate_provide_if_extern`, then the key can be projected to its
+/// local key via `<$K as AsLocalKey>::LocalKey`.
+macro_rules! local_key_if_separate_extern {
+    ([] $($K:tt)*) => {
+        $($K)*
+    };
+    ([(separate_provide_extern) $($rest:tt)*] $($K:tt)*) => {
+        <$($K)* as AsLocalKey>::LocalKey
+    };
+    ([$other:tt $($modifiers:tt)*] $($K:tt)*) => {
+        local_key_if_separate_extern!([$($modifiers)*] $($K)*)
     };
 }
 
@@ -196,6 +230,12 @@ macro_rules! define_callbacks {
             $(pub type $name<'tcx> = $($K)*;)*
         }
         #[allow(nonstandard_style, unused_lifetimes)]
+        pub mod query_keys_local {
+            use super::*;
+
+            $(pub type $name<'tcx> = local_key_if_separate_extern!([$($modifiers)*] $($K)*);)*
+        }
+        #[allow(nonstandard_style, unused_lifetimes)]
         pub mod query_values {
             use super::*;
 
@@ -227,8 +267,8 @@ macro_rules! define_callbacks {
                 pub fn $name<'tcx>(
                     _tcx: TyCtxt<'tcx>,
                     value: query_provided::$name<'tcx>,
-                ) -> query_values::$name<'tcx> {
-                    query_if_arena!([$($modifiers)*]
+                ) -> Erase<query_values::$name<'tcx>> {
+                    erase(query_if_arena!([$($modifiers)*]
                         {
                             if mem::needs_drop::<query_provided::$name<'tcx>>() {
                                 &*_tcx.query_system.arenas.$name.alloc(value)
@@ -237,7 +277,7 @@ macro_rules! define_callbacks {
                             }
                         }
                         (value)
-                    )
+                    ))
                 }
             )*
         }
@@ -246,9 +286,39 @@ macro_rules! define_callbacks {
             use super::*;
 
             $(
-                pub type $name<'tcx> = <<$($K)* as Key>::CacheSelector as CacheSelector<'tcx, $V>>::Cache;
+                pub type $name<'tcx> = <<$($K)* as Key>::CacheSelector as CacheSelector<'tcx, Erase<$V>>>::Cache;
             )*
         }
+
+        $(
+            // Ensure that keys grow no larger than 64 bytes
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            const _: () = {
+                if mem::size_of::<query_keys::$name<'static>>() > 64 {
+                    panic!("{}", concat!(
+                        "the query `",
+                        stringify!($name),
+                        "` has a key type `",
+                        stringify!($($K)*),
+                        "` that is too large"
+                    ));
+                }
+            };
+
+            // Ensure that values grow no larger than 64 bytes
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            const _: () = {
+                if mem::size_of::<query_values::$name<'static>>() > 64 {
+                    panic!("{}", concat!(
+                        "the query `",
+                        stringify!($name),
+                        "` has a value type `",
+                        stringify!($V),
+                        "` that is too large"
+                    ));
+                }
+            };
+        )*
 
         pub struct QueryArenas<'tcx> {
             $($(#[$attr])* pub $name: query_if_arena!([$($modifiers)*]
@@ -269,6 +339,11 @@ macro_rules! define_callbacks {
         }
 
         #[derive(Default)]
+        pub struct QueryPhantomValues<'tcx> {
+            $($(#[$attr])* pub $name: PhantomData<query_values::$name<'tcx>>,)*
+        }
+
+        #[derive(Default)]
         pub struct QueryCaches<'tcx> {
             $($(#[$attr])* pub $name: query_storage::$name<'tcx>,)*
         }
@@ -282,7 +357,31 @@ macro_rules! define_callbacks {
 
                 match try_get_cached(self.tcx, &self.tcx.query_system.caches.$name, &key) {
                     Some(_) => return,
-                    None => self.tcx.queries.$name(self.tcx, DUMMY_SP, key, QueryMode::Ensure),
+                    None => self.tcx.queries.$name(
+                        self.tcx,
+                        DUMMY_SP,
+                        key,
+                        QueryMode::Ensure { check_cache: false },
+                    ),
+                };
+            })*
+        }
+
+        impl<'tcx> TyCtxtEnsureWithValue<'tcx> {
+            $($(#[$attr])*
+            #[inline(always)]
+            pub fn $name(self, key: query_helper_param_ty!($($K)*)) {
+                let key = key.into_query_param();
+                opt_remap_env_constness!([$($modifiers)*][key]);
+
+                match try_get_cached(self.tcx, &self.tcx.query_system.caches.$name, &key) {
+                    Some(_) => return,
+                    None => self.tcx.queries.$name(
+                        self.tcx,
+                        DUMMY_SP,
+                        key,
+                        QueryMode::Ensure { check_cache: true },
+                    ),
                 };
             })*
         }
@@ -305,17 +404,17 @@ macro_rules! define_callbacks {
                 let key = key.into_query_param();
                 opt_remap_env_constness!([$($modifiers)*][key]);
 
-                match try_get_cached(self.tcx, &self.tcx.query_system.caches.$name, &key) {
+                restore::<$V>(match try_get_cached(self.tcx, &self.tcx.query_system.caches.$name, &key) {
                     Some(value) => value,
                     None => self.tcx.queries.$name(self.tcx, self.span, key, QueryMode::Get).unwrap(),
-                }
+                })
             })*
         }
 
         pub struct Providers {
             $(pub $name: for<'tcx> fn(
                 TyCtxt<'tcx>,
-                query_keys::$name<'tcx>,
+                query_keys_local::$name<'tcx>,
             ) -> query_provided::$name<'tcx>,)*
         }
 
@@ -325,17 +424,14 @@ macro_rules! define_callbacks {
 
         impl Default for Providers {
             fn default() -> Self {
-                use crate::query::Key;
-
                 Providers {
                     $($name: |_, key| bug!(
-                        "`tcx.{}({:?})` is not supported for {} crate;\n\
+                        "`tcx.{}({:?})` is not supported for this key;\n\
                         hint: Queries can be either made to the local crate, or the external crate. \
                         This error means you tried to use it for one that's not supported.\n\
                         If that's not the case, {} was likely never assigned to a provider function.\n",
                         stringify!($name),
                         key,
-                        if key.query_crate_is_local() { "local" } else { "external" },
                         stringify!($name),
                     ),)*
                 }
@@ -372,7 +468,7 @@ macro_rules! define_callbacks {
                 span: Span,
                 key: query_keys::$name<'tcx>,
                 mode: QueryMode,
-            ) -> Option<$V>;)*
+            ) -> Option<Erase<$V>>;)*
         }
     };
 }
@@ -399,11 +495,13 @@ macro_rules! define_feedable {
                 opt_remap_env_constness!([$($modifiers)*][key]);
 
                 let tcx = self.tcx;
-                let value = query_provided_to_value::$name(tcx, value);
+                let erased = query_provided_to_value::$name(tcx, value);
+                let value = restore::<$V>(erased);
                 let cache = &tcx.query_system.caches.$name;
 
                 match try_get_cached(tcx, cache, &key) {
                     Some(old) => {
+                        let old = restore::<$V>(old);
                         bug!(
                             "Trying to feed an already recorded value for query {} key={key:?}:\nold value: {old:?}\nnew value: {value:?}",
                             stringify!($name),
@@ -418,7 +516,7 @@ macro_rules! define_feedable {
                             &value,
                             hash_result!([$($modifiers)*]),
                         );
-                        cache.complete(key, value, dep_node_index);
+                        cache.complete(key, erased, dep_node_index);
                         value
                     }
                 }

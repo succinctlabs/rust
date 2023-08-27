@@ -4,7 +4,7 @@
 
 pub mod auto_trait;
 mod chalk_fulfill;
-mod coherence;
+pub(crate) mod coherence;
 pub mod const_evaluatable;
 mod engine;
 pub mod error_reporting;
@@ -28,9 +28,9 @@ use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_errors::ErrorGuaranteed;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::visit::{TypeVisitable, TypeVisitableExt};
-use rustc_middle::ty::{self, DefIdTree, ToPredicate, Ty, TyCtxt, TypeSuperVisitable};
+use rustc_middle::ty::{self, ToPredicate, Ty, TyCtxt, TypeSuperVisitable};
 use rustc_middle::ty::{InternalSubsts, SubstsRef};
-use rustc_span::def_id::{DefId, CRATE_DEF_ID};
+use rustc_span::def_id::DefId;
 use rustc_span::Span;
 
 use std::fmt::Debug;
@@ -58,17 +58,12 @@ pub use self::specialize::{specialization_graph, translate_substs, OverlapError}
 pub use self::structural_match::{
     search_for_adt_const_param_violation, search_for_structural_match_violation,
 };
-pub use self::util::{
-    elaborate_obligations, elaborate_predicates, elaborate_predicates_with_span,
-    elaborate_trait_ref, elaborate_trait_refs,
-};
+pub use self::util::elaborate;
 pub use self::util::{expand_trait_aliases, TraitAliasExpander};
-pub use self::util::{
-    get_vtable_index_of_object_method, impl_item_is_final, predicate_for_trait_def, upcast_choices,
-};
+pub use self::util::{get_vtable_index_of_object_method, impl_item_is_final, upcast_choices};
 pub use self::util::{
     supertrait_def_ids, supertraits, transitive_bounds, transitive_bounds_that_define_assoc_type,
-    SupertraitDefIds, Supertraits,
+    SupertraitDefIds,
 };
 
 pub use self::chalk_fulfill::FulfillmentContext as ChalkFulfillmentContext;
@@ -131,29 +126,23 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     ty: Ty<'tcx>,
     def_id: DefId,
-    span: Span,
 ) -> bool {
     let trait_ref = ty::Binder::dummy(infcx.tcx.mk_trait_ref(def_id, [ty]));
-    pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref.without_const(), span)
+    pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref.without_const())
 }
 
-#[instrument(level = "debug", skip(infcx, param_env, span, pred), ret)]
+/// FIXME(@lcnr): this function doesn't seem right and shouldn't exist?
+///
+/// Ping me on zulip if you want to use this method and need help with finding
+/// an appropriate replacement.
+#[instrument(level = "debug", skip(infcx, param_env, pred), ret)]
 fn pred_known_to_hold_modulo_regions<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     pred: impl ToPredicate<'tcx> + TypeVisitable<TyCtxt<'tcx>>,
-    span: Span,
 ) -> bool {
     let has_non_region_infer = pred.has_non_region_infer();
-    let obligation = Obligation {
-        param_env,
-        // We can use a dummy node-id here because we won't pay any mind
-        // to region obligations that arise (there shouldn't really be any
-        // anyhow).
-        cause: ObligationCause::misc(span, CRATE_DEF_ID),
-        recursion_depth: 0,
-        predicate: pred.to_predicate(infcx.tcx),
-    };
+    let obligation = Obligation::new(infcx.tcx, ObligationCause::dummy(), param_env, pred);
 
     let result = infcx.evaluate_obligation_no_overflow(&obligation);
     debug!(?result);
@@ -166,14 +155,13 @@ fn pred_known_to_hold_modulo_regions<'tcx>(
         // this function's result remains infallible, we must confirm
         // that guess. While imperfect, I believe this is sound.
 
-        // FIXME(@lcnr): this function doesn't seem right.
-        //
         // The handling of regions in this area of the code is terrible,
         // see issue #29149. We should be able to improve on this with
         // NLL.
-        let errors = fully_solve_obligation(infcx, obligation);
-
-        match &errors[..] {
+        let ocx = ObligationCtxt::new(infcx);
+        ocx.register_obligation(obligation);
+        let errors = ocx.select_all_or_error();
+        match errors.as_slice() {
             [] => true,
             errors => {
                 debug!(?errors);
@@ -210,7 +198,7 @@ fn do_normalize_predicates<'tcx>(
     let predicates = match fully_normalize(&infcx, cause, elaborated_env, predicates) {
         Ok(predicates) => predicates,
         Err(errors) => {
-            let reported = infcx.err_ctxt().report_fulfillment_errors(&errors, None);
+            let reported = infcx.err_ctxt().report_fulfillment_errors(&errors);
             return Err(reported);
         }
     };
@@ -276,9 +264,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     // and errors will get reported then; so outside of type inference we
     // can be sure that no errors should occur.
     let mut predicates: Vec<_> =
-        util::elaborate_predicates(tcx, unnormalized_env.caller_bounds().into_iter())
-            .map(|obligation| obligation.predicate)
-            .collect();
+        util::elaborate(tcx, unnormalized_env.caller_bounds().into_iter()).collect();
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}", predicates);
 
@@ -387,43 +373,6 @@ where
     let resolved_value = infcx.resolve_vars_if_possible(normalized_value);
     debug!(?resolved_value);
     Ok(resolved_value)
-}
-
-/// Process an obligation (and any nested obligations that come from it) to
-/// completion, returning any errors
-pub fn fully_solve_obligation<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    obligation: PredicateObligation<'tcx>,
-) -> Vec<FulfillmentError<'tcx>> {
-    fully_solve_obligations(infcx, [obligation])
-}
-
-/// Process a set of obligations (and any nested obligations that come from them)
-/// to completion
-pub fn fully_solve_obligations<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    obligations: impl IntoIterator<Item = PredicateObligation<'tcx>>,
-) -> Vec<FulfillmentError<'tcx>> {
-    let ocx = ObligationCtxt::new(infcx);
-    ocx.register_obligations(obligations);
-    ocx.select_all_or_error()
-}
-
-/// Process a bound (and any nested obligations that come from it) to completion.
-/// This is a convenience function for traits that have no generic arguments, such
-/// as auto traits, and builtin traits like Copy or Sized.
-pub fn fully_solve_bound<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    cause: ObligationCause<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    ty: Ty<'tcx>,
-    bound: DefId,
-) -> Vec<FulfillmentError<'tcx>> {
-    let tcx = infcx.tcx;
-    let trait_ref = tcx.mk_trait_ref(bound, [ty]);
-    let obligation = Obligation::new(tcx, cause, param_env, ty::Binder::dummy(trait_ref));
-
-    fully_solve_obligation(infcx, obligation)
 }
 
 /// Normalizes the predicates and checks whether they hold in an empty environment. If this

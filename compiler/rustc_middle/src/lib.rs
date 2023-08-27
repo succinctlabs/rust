@@ -33,13 +33,13 @@
 #![feature(generators)]
 #![feature(get_mut_unchecked)]
 #![feature(if_let_guard)]
+#![feature(inline_const)]
 #![feature(iter_from_generator)]
 #![feature(local_key_cell_methods)]
 #![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(extern_types)]
 #![feature(new_uninit)]
-#![feature(once_cell)]
 #![feature(let_chains)]
 #![feature(min_specialization)]
 #![feature(trusted_len)]
@@ -109,4 +109,4 @@ pub mod util {
 // Allows macros to refer to this crate as `::rustc_middle`
 extern crate self as rustc_middle;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }

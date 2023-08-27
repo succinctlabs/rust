@@ -7,8 +7,9 @@
 use crate::ty::{self, print::describe_as_module, TyCtxt};
 use rustc_span::def_id::LOCAL_CRATE;
 
+pub mod erase;
 mod keys;
-pub use keys::Key;
+pub use keys::{AsLocalKey, Key, LocalCrate};
 
 // Each of these queries corresponds to a function pointer field in the
 // `Providers` struct for requesting a value of that type, and a method
@@ -24,6 +25,15 @@ pub use keys::Key;
 rustc_queries! {
     query trigger_delay_span_bug(key: DefId) -> () {
         desc { "triggering a delay span bug" }
+    }
+
+    query registered_tools(_: ()) -> &'tcx ty::RegisteredTools {
+        arena_cache
+        desc { "compute registered tools for crate" }
+    }
+
+    query early_lint_checks(_: ()) -> () {
+        desc { "perform lints prior to macro expansion" }
     }
 
     query resolutions(_: ()) -> &'tcx ty::ResolverGlobalCtxt {
@@ -87,7 +97,7 @@ rustc_queries! {
 
     /// Gives access to the HIR ID for the given `LocalDefId` owner `key` if any.
     ///
-    /// Definitions that were generated with no HIR, would be feeded to return `None`.
+    /// Definitions that were generated with no HIR, would be fed to return `None`.
     query opt_local_def_id_to_hir_id(key: LocalDefId) -> Option<hir::HirId>{
         desc { |tcx| "getting HIR ID of `{}`", tcx.def_path_str(key.to_def_id()) }
         feedable
@@ -182,6 +192,7 @@ rustc_queries! {
     {
         desc { "determine whether the opaque is a type-alias impl trait" }
         separate_provide_extern
+        feedable
     }
 
     query unsizing_params_for_adt(key: DefId) -> &'tcx rustc_index::bit_set::BitSet<u32>
@@ -616,20 +627,26 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    query implied_predicates_of(key: DefId) -> ty::GenericPredicates<'tcx> {
+        desc { |tcx| "computing the implied predicates of `{}`", tcx.def_path_str(key) }
+        cache_on_disk_if { key.is_local() }
+        separate_provide_extern
+    }
+
     /// The `Option<Ident>` is the name of an associated type. If it is `None`, then this query
     /// returns the full set of predicates. If `Some<Ident>`, then the query returns only the
     /// subset of super-predicates that reference traits that define the given associated type.
     /// This is used to avoid cycles in resolving types like `T::Item`.
-    query super_predicates_that_define_assoc_type(key: (DefId, Option<rustc_span::symbol::Ident>)) -> ty::GenericPredicates<'tcx> {
-        desc { |tcx| "computing the super traits of `{}`{}",
+    query super_predicates_that_define_assoc_type(key: (DefId, rustc_span::symbol::Ident)) -> ty::GenericPredicates<'tcx> {
+        desc { |tcx| "computing the super traits of `{}` with associated type name `{}`",
             tcx.def_path_str(key.0),
-            if let Some(assoc_name) = key.1 { format!(" with associated type name `{}`", assoc_name) } else { "".to_string() },
+            key.1
         }
     }
 
     /// To avoid cycles within the predicates of a single item we compute
     /// per-type-parameter predicates for resolving `T::AssocTy`.
-    query type_param_predicates(key: (DefId, LocalDefId, rustc_span::symbol::Ident)) -> ty::GenericPredicates<'tcx> {
+    query type_param_predicates(key: (LocalDefId, LocalDefId, rustc_span::symbol::Ident)) -> ty::GenericPredicates<'tcx> {
         desc { |tcx| "computing the bounds for type parameter `{}`", tcx.hir().ty_param_name(key.1) }
     }
 
@@ -764,7 +781,7 @@ rustc_queries! {
     ///
     /// The map returned for `tcx.impl_item_implementor_ids(impl_id)` would be
     ///`{ trait_f: impl_f, trait_g: impl_g }`
-    query impl_item_implementor_ids(impl_id: DefId) -> &'tcx FxHashMap<DefId, DefId> {
+    query impl_item_implementor_ids(impl_id: DefId) -> &'tcx DefIdMap<DefId> {
         arena_cache
         desc { |tcx| "comparing impl items against trait for `{}`", tcx.def_path_str(impl_id) }
     }
@@ -775,7 +792,7 @@ rustc_queries! {
     /// if `fn_def_id` is the def id of a function defined inside an impl that implements a trait, then it
     /// creates and returns the associated items that correspond to each impl trait in return position
     /// of the implemented trait.
-    query associated_items_for_impl_trait_in_trait(fn_def_id: DefId) -> &'tcx [DefId] {
+    query associated_types_for_impl_traits_in_associated_fn(fn_def_id: DefId) -> &'tcx [DefId] {
         desc { |tcx| "creating associated items for impl trait in trait returned by `{}`", tcx.def_path_str(fn_def_id) }
         cache_on_disk_if { fn_def_id.is_local() }
         separate_provide_extern
@@ -783,10 +800,9 @@ rustc_queries! {
 
     /// Given an impl trait in trait `opaque_ty_def_id`, create and return the corresponding
     /// associated item.
-    query associated_item_for_impl_trait_in_trait(opaque_ty_def_id: LocalDefId) -> LocalDefId {
+    query associated_type_for_impl_trait_in_trait(opaque_ty_def_id: LocalDefId) -> LocalDefId {
         desc { |tcx| "creates the associated item corresponding to the opaque type `{}`", tcx.def_path_str(opaque_ty_def_id.to_def_id()) }
         cache_on_disk_if { true }
-        separate_provide_extern
     }
 
     /// Given an `impl_id`, return the trait it implements.
@@ -906,8 +922,8 @@ rustc_queries! {
     /// The second return value maps from ADTs to ignored derived traits (e.g. Debug and Clone) and
     /// their respective impl (i.e., part of the derive macro)
     query live_symbols_and_ignored_derived_traits(_: ()) -> &'tcx (
-        FxHashSet<LocalDefId>,
-        FxHashMap<LocalDefId, Vec<(DefId, DefId)>>
+        LocalDefIdSet,
+        LocalDefIdMap<Vec<(DefId, DefId)>>
     ) {
         arena_cache
         desc { "finding live symbols in crate" }
@@ -1105,9 +1121,9 @@ rustc_queries! {
         desc { "converting literal to mir constant" }
     }
 
-    query check_match(key: DefId) {
-        desc { |tcx| "match-checking `{}`", tcx.def_path_str(key) }
-        cache_on_disk_if { key.is_local() }
+    query check_match(key: LocalDefId) {
+        desc { |tcx| "match-checking `{}`", tcx.def_path_str(key.to_def_id()) }
+        cache_on_disk_if { true }
     }
 
     /// Performs part of the privacy check and computes effective visibilities.
@@ -1120,7 +1136,7 @@ rustc_queries! {
         desc { "checking for private elements in public interfaces" }
     }
 
-    query reachable_set(_: ()) -> &'tcx FxHashSet<LocalDefId> {
+    query reachable_set(_: ()) -> &'tcx LocalDefIdSet {
         arena_cache
         desc { "reachability" }
     }
@@ -1149,14 +1165,6 @@ rustc_queries! {
         desc { |tcx| "looking up definition kind of `{}`", tcx.def_path_str(def_id) }
         cache_on_disk_if { def_id.is_local() }
         separate_provide_extern
-        feedable
-    }
-
-    /// The `opt_rpitit_info` query returns the pair of the def id of the function where the RPIT
-    /// is defined and the opaque def id if any.
-    query opt_rpitit_info(def_id: DefId) -> Option<ty::ImplTraitInTraitData> {
-        desc { |tcx| "opt_rpitit_info `{}`", tcx.def_path_str(def_id) }
-        cache_on_disk_if { def_id.is_local() }
         feedable
     }
 
@@ -1229,7 +1237,7 @@ rustc_queries! {
         separate_provide_extern
     }
 
-    query asm_target_features(def_id: DefId) -> &'tcx FxHashSet<Symbol> {
+    query asm_target_features(def_id: DefId) -> &'tcx FxIndexSet<Symbol> {
         desc { |tcx| "computing target features for inline asm of `{}`", tcx.def_path_str(def_id) }
     }
 
@@ -1324,6 +1332,7 @@ rustc_queries! {
     /// might want to use `reveal_all()` method to change modes.
     query param_env(def_id: DefId) -> ty::ParamEnv<'tcx> {
         desc { |tcx| "computing normalized predicates of `{}`", tcx.def_path_str(def_id) }
+        feedable
     }
 
     /// Like `param_env`, but returns the `ParamEnv` in `Reveal::All` mode.
@@ -1505,10 +1514,6 @@ rustc_queries! {
     query in_scope_traits_map(_: hir::OwnerId)
         -> Option<&'tcx FxHashMap<ItemLocalId, Box<[TraitCandidate]>>> {
         desc { "getting traits in scope at a block" }
-    }
-
-    query module_reexports(def_id: LocalDefId) -> Option<&'tcx [ModChild]> {
-        desc { |tcx| "looking up reexports of module `{}`", tcx.def_path_str(def_id.to_def_id()) }
     }
 
     query impl_defaultness(def_id: DefId) -> hir::Defaultness {
@@ -1845,7 +1850,7 @@ rustc_queries! {
     query maybe_unused_trait_imports(_: ()) -> &'tcx FxIndexSet<LocalDefId> {
         desc { "fetching potentially unused trait imports" }
     }
-    query names_imported_by_glob_use(def_id: LocalDefId) -> &'tcx FxHashSet<Symbol> {
+    query names_imported_by_glob_use(def_id: LocalDefId) -> &'tcx UnordSet<Symbol> {
         desc { |tcx| "finding names imported by glob use for `{}`", tcx.def_path_str(def_id.to_def_id()) }
     }
 
@@ -2114,7 +2119,7 @@ rustc_queries! {
         desc { "raw operations for metadata file access" }
     }
 
-    query crate_for_resolver((): ()) -> &'tcx Steal<rustc_ast::ast::Crate> {
+    query crate_for_resolver((): ()) -> &'tcx Steal<(rustc_ast::Crate, rustc_ast::AttrVec)> {
         feedable
         no_hash
         desc { "the ast before macro expansion and name resolution" }
@@ -2213,7 +2218,7 @@ rustc_queries! {
     }
 
     /// Used in `super_combine_consts` to ICE if the type of the two consts are definitely not going to end up being
-    /// equal to eachother. This might return `Ok` even if the types are unequal, but will never return `Err` if
+    /// equal to eachother. This might return `Ok` even if the types are not equal, but will never return `Err` if
     /// the types might be equal.
     query check_tys_might_be_eq(arg: Canonical<'tcx, (ty::ParamEnv<'tcx>, Ty<'tcx>, Ty<'tcx>)>) -> Result<(), NoSolution> {
         desc { "check whether two const param are definitely not equal to eachother"}

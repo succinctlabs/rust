@@ -5,8 +5,7 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(is_terminal)]
-#![feature(once_cell)]
+#![feature(lazy_cell)]
 #![feature(decl_macro)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
@@ -20,7 +19,9 @@ pub extern crate rustc_plugin_impl as plugin;
 
 use rustc_ast as ast;
 use rustc_codegen_ssa::{traits::CodegenBackend, CodegenErrors, CodegenResults};
-use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
+use rustc_data_structures::profiling::{
+    get_resident_set_size, print_time_passes_entry, TimePassesFormat,
+};
 use rustc_data_structures::sync::SeqCst;
 use rustc_errors::registry::{InvalidErrorCode, Registry};
 use rustc_errors::{
@@ -35,15 +36,17 @@ use rustc_metadata::locator;
 use rustc_session::config::{nightly_options, CG_OPTIONS, Z_OPTIONS};
 use rustc_session::config::{ErrorOutputType, Input, OutputType, PrintRequest, TrimmedDefPaths};
 use rustc_session::cstore::MetadataLoader;
-use rustc_session::getopts;
+use rustc_session::getopts::{self, Matches};
 use rustc_session::lint::{Lint, LintId};
 use rustc_session::{config, Session};
 use rustc_session::{early_error, early_error_no_abort, early_warn};
 use rustc_span::source_map::{FileLoader, FileName};
 use rustc_span::symbol::sym;
 use rustc_target::json::ToJson;
+use rustc_target::spec::{Target, TargetTriple};
 
 use std::cmp::max;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -64,7 +67,7 @@ use crate::session_diagnostics::{
     RLinkWrongFileType, RlinkNotAFile, RlinkUnableToRead,
 };
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 pub static DEFAULT_LOCALE_RESOURCES: &[&str] = &[
     // tidy-alphabetical-start
@@ -161,7 +164,7 @@ pub trait Callbacks {
 
 #[derive(Default)]
 pub struct TimePassesCallbacks {
-    time_passes: bool,
+    time_passes: Option<TimePassesFormat>,
 }
 
 impl Callbacks for TimePassesCallbacks {
@@ -171,7 +174,8 @@ impl Callbacks for TimePassesCallbacks {
         // If a --print=... option has been given, we don't print the "total"
         // time because it will mess up the --print output. See #64339.
         //
-        self.time_passes = config.opts.prints.is_empty() && config.opts.unstable_opts.time_passes;
+        self.time_passes = (config.opts.prints.is_empty() && config.opts.unstable_opts.time_passes)
+            .then(|| config.opts.unstable_opts.time_passes_format);
         config.opts.trimmed_def_paths = TrimmedDefPaths::GoodPath;
     }
 }
@@ -331,6 +335,7 @@ fn run_compiler(
             if let Some(ppm) = &sess.opts.pretty {
                 if ppm.needs_ast_map() {
                     queries.global_ctxt()?.enter(|tcx| {
+                        tcx.ensure().early_lint_checks(());
                         pretty::print_after_hir_lowering(tcx, *ppm);
                         Ok(())
                     })?;
@@ -352,7 +357,7 @@ fn run_compiler(
 
             {
                 let plugins = queries.register_plugins()?;
-                let (_, lint_store) = &*plugins.borrow();
+                let (.., lint_store) = &*plugins.borrow();
 
                 // Lint plugins are registered; now we can process command line flags.
                 if sess.opts.describe_lints {
@@ -643,6 +648,15 @@ fn print_crate_info(
             TargetLibdir => println!("{}", sess.target_tlib_path.dir.display()),
             TargetSpec => {
                 println!("{}", serde_json::to_string_pretty(&sess.target.to_json()).unwrap());
+            }
+            AllTargetSpecs => {
+                let mut targets = BTreeMap::new();
+                for name in rustc_target::spec::TARGETS {
+                    let triple = TargetTriple::from_triple(name);
+                    let target = Target::expect_builtin(&triple);
+                    targets.insert(name, target.to_json());
+                }
+                println!("{}", serde_json::to_string_pretty(&targets).unwrap());
             }
             FileNames | CrateName => {
                 let Some(attrs) = attrs.as_ref() else {
@@ -941,6 +955,46 @@ Available lint options:
     }
 }
 
+/// Show help for flag categories shared between rustdoc and rustc.
+///
+/// Returns whether a help option was printed.
+pub fn describe_flag_categories(matches: &Matches) -> bool {
+    // Handle the special case of -Wall.
+    let wall = matches.opt_strs("W");
+    if wall.iter().any(|x| *x == "all") {
+        print_wall_help();
+        rustc_errors::FatalError.raise();
+    }
+
+    // Don't handle -W help here, because we might first load plugins.
+    let debug_flags = matches.opt_strs("Z");
+    if debug_flags.iter().any(|x| *x == "help") {
+        describe_debug_flags();
+        return true;
+    }
+
+    let cg_flags = matches.opt_strs("C");
+    if cg_flags.iter().any(|x| *x == "help") {
+        describe_codegen_flags();
+        return true;
+    }
+
+    if cg_flags.iter().any(|x| *x == "no-stack-check") {
+        early_warn(
+            ErrorOutputType::default(),
+            "the --no-stack-check flag is deprecated and does nothing",
+        );
+    }
+
+    if cg_flags.iter().any(|x| *x == "passes=list") {
+        let backend_name = debug_flags.iter().find_map(|x| x.strip_prefix("codegen-backend="));
+        get_codegen_backend(&None, backend_name).print_passes();
+        return true;
+    }
+
+    false
+}
+
 fn describe_debug_flags() {
     println!("\nAvailable options:\n");
     print_flag_list("-Z", config::Z_OPTIONS);
@@ -951,7 +1005,7 @@ fn describe_codegen_flags() {
     print_flag_list("-C", config::CG_OPTIONS);
 }
 
-pub fn print_flag_list<T>(
+fn print_flag_list<T>(
     cmdline_opt: &str,
     flag_list: &[(&'static str, T, &'static str, &'static str)],
 ) {
@@ -1044,37 +1098,7 @@ pub fn handle_options(args: &[String]) -> Option<getopts::Matches> {
         return None;
     }
 
-    // Handle the special case of -Wall.
-    let wall = matches.opt_strs("W");
-    if wall.iter().any(|x| *x == "all") {
-        print_wall_help();
-        rustc_errors::FatalError.raise();
-    }
-
-    // Don't handle -W help here, because we might first load plugins.
-    let debug_flags = matches.opt_strs("Z");
-    if debug_flags.iter().any(|x| *x == "help") {
-        describe_debug_flags();
-        return None;
-    }
-
-    let cg_flags = matches.opt_strs("C");
-
-    if cg_flags.iter().any(|x| *x == "help") {
-        describe_codegen_flags();
-        return None;
-    }
-
-    if cg_flags.iter().any(|x| *x == "no-stack-check") {
-        early_warn(
-            ErrorOutputType::default(),
-            "the --no-stack-check flag is deprecated and does nothing",
-        );
-    }
-
-    if cg_flags.iter().any(|x| *x == "passes=list") {
-        let backend_name = debug_flags.iter().find_map(|x| x.strip_prefix("codegen-backend="));
-        get_codegen_backend(&None, backend_name).print_passes();
+    if describe_flag_categories(&matches) {
         return None;
     }
 
@@ -1245,11 +1269,9 @@ pub fn report_ice(info: &panic::PanicInfo<'_>, bug_report_url: &str) {
     interface::try_print_query_stack(&handler, num_frames);
 
     #[cfg(windows)]
-    unsafe {
-        if env::var("RUSTC_BREAK_ON_ICE").is_ok() {
-            // Trigger a debugger if we crashed during bootstrap
-            winapi::um::debugapi::DebugBreak();
-        }
+    if env::var("RUSTC_BREAK_ON_ICE").is_ok() {
+        // Trigger a debugger if we crashed during bootstrap
+        unsafe { windows::Win32::System::Diagnostics::Debug::DebugBreak() };
     }
 }
 
@@ -1355,9 +1377,9 @@ pub fn main() -> ! {
         RunCompiler::new(&args, &mut callbacks).run()
     });
 
-    if callbacks.time_passes {
+    if let Some(format) = callbacks.time_passes {
         let end_rss = get_resident_set_size();
-        print_time_passes_entry("total", start_time.elapsed(), start_rss, end_rss);
+        print_time_passes_entry("total", start_time.elapsed(), start_rss, end_rss, format);
     }
 
     process::exit(exit_code)

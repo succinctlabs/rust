@@ -1,9 +1,7 @@
 //! Contains utility functions to generate suggestions.
 #![deny(clippy::missing_docs_in_private_items)]
 
-use crate::source::{
-    snippet, snippet_opt, snippet_with_applicability, snippet_with_context, snippet_with_macro_callsite,
-};
+use crate::source::{snippet, snippet_opt, snippet_with_applicability, snippet_with_context};
 use crate::ty::expr_sig;
 use crate::{get_parent_expr_for_hir, higher};
 use rustc_ast::util::parser::AssocOp;
@@ -89,12 +87,6 @@ impl<'a> Sugg<'a> {
         })
     }
 
-    /// Same as `hir`, but will use the pre expansion span if the `expr` was in a macro.
-    pub fn hir_with_macro_callsite(cx: &LateContext<'_>, expr: &hir::Expr<'_>, default: &'a str) -> Self {
-        let get_snippet = |span| snippet_with_macro_callsite(cx, span, default);
-        Self::hir_from_snippet(expr, get_snippet)
-    }
-
     /// Same as `hir`, but first walks the span up to the given context. This will result in the
     /// macro call, rather then the expansion, if the span is from a child context. If the span is
     /// not from a child context, it will be used directly instead.
@@ -133,7 +125,6 @@ impl<'a> Sugg<'a> {
 
         match expr.kind {
             hir::ExprKind::AddrOf(..)
-            | hir::ExprKind::Box(..)
             | hir::ExprKind::If(..)
             | hir::ExprKind::Let(..)
             | hir::ExprKind::Closure { .. }
@@ -188,7 +179,6 @@ impl<'a> Sugg<'a> {
         match expr.kind {
             _ if expr.span.ctxt() != ctxt => Sugg::NonParen(snippet_with_context(cx, expr.span, ctxt, default, app).0),
             ast::ExprKind::AddrOf(..)
-            | ast::ExprKind::Box(..)
             | ast::ExprKind::Closure { .. }
             | ast::ExprKind::If(..)
             | ast::ExprKind::Let(..)

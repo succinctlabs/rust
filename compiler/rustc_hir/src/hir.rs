@@ -328,7 +328,7 @@ pub struct GenericArgs<'hir> {
     /// Were arguments written in parenthesized form `Fn(T) -> U`?
     /// This is required mostly for pretty-printing and diagnostics,
     /// but also for changing lifetime elision rules to be "function-like".
-    pub parenthesized: bool,
+    pub parenthesized: GenericArgsParentheses,
     /// The span encompassing arguments and the surrounding brackets `<>` or `()`
     ///       Foo<A, B, AssocTy = D>           Fn(T, U, V) -> W
     ///          ^^^^^^^^^^^^^^^^^^^             ^^^^^^^^^
@@ -340,11 +340,16 @@ pub struct GenericArgs<'hir> {
 
 impl<'hir> GenericArgs<'hir> {
     pub const fn none() -> Self {
-        Self { args: &[], bindings: &[], parenthesized: false, span_ext: DUMMY_SP }
+        Self {
+            args: &[],
+            bindings: &[],
+            parenthesized: GenericArgsParentheses::No,
+            span_ext: DUMMY_SP,
+        }
     }
 
     pub fn inputs(&self) -> &[Ty<'hir>] {
-        if self.parenthesized {
+        if self.parenthesized == GenericArgsParentheses::ParenSugar {
             for arg in self.args {
                 match arg {
                     GenericArg::Lifetime(_) => {}
@@ -415,6 +420,17 @@ impl<'hir> GenericArgs<'hir> {
     pub fn is_empty(&self) -> bool {
         self.args.is_empty()
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Encodable, Hash, Debug)]
+#[derive(HashStable_Generic)]
+pub enum GenericArgsParentheses {
+    No,
+    /// Bounds for `feature(return_type_notation)`, like `T: Trait<method(..): Send>`,
+    /// where the args are explicitly elided with `..`
+    ReturnTypeNotation,
+    /// parenthesized function-family traits, like `T: Fn(u32) -> i32`
+    ParenSugar,
 }
 
 /// A modifier on a bound, currently this is only used for `?Sized`, where the
@@ -815,12 +831,13 @@ pub struct ParentedNode<'tcx> {
 #[derive(Debug)]
 pub struct AttributeMap<'tcx> {
     pub map: SortedMap<ItemLocalId, &'tcx [Attribute]>,
-    pub hash: Fingerprint,
+    // Only present when the crate hash is needed.
+    pub opt_hash: Option<Fingerprint>,
 }
 
 impl<'tcx> AttributeMap<'tcx> {
     pub const EMPTY: &'static AttributeMap<'static> =
-        &AttributeMap { map: SortedMap::new(), hash: Fingerprint::ZERO };
+        &AttributeMap { map: SortedMap::new(), opt_hash: Some(Fingerprint::ZERO) };
 
     #[inline]
     pub fn get(&self, id: ItemLocalId) -> &'tcx [Attribute] {
@@ -832,10 +849,9 @@ impl<'tcx> AttributeMap<'tcx> {
 /// These nodes are mapped by `ItemLocalId` alongside the index of their parent node.
 /// The HIR tree, including bodies, is pre-hashed.
 pub struct OwnerNodes<'tcx> {
-    /// Pre-computed hash of the full HIR.
-    pub hash_including_bodies: Fingerprint,
-    /// Pre-computed hash of the item signature, without recursing into the body.
-    pub hash_without_bodies: Fingerprint,
+    /// Pre-computed hash of the full HIR. Used in the crate hash. Only present
+    /// when incr. comp. is enabled.
+    pub opt_hash_including_bodies: Option<Fingerprint>,
     /// Full HIR for the current owner.
     // The zeroth node's parent should never be accessed: the owner's parent is computed by the
     // hir_owner_parent query. It is set to `ItemLocalId::INVALID` to force an ICE if accidentally
@@ -872,8 +888,7 @@ impl fmt::Debug for OwnerNodes<'_> {
                     .collect::<Vec<_>>(),
             )
             .field("bodies", &self.bodies)
-            .field("hash_without_bodies", &self.hash_without_bodies)
-            .field("hash_including_bodies", &self.hash_including_bodies)
+            .field("opt_hash_including_bodies", &self.opt_hash_including_bodies)
             .finish()
     }
 }
@@ -940,7 +955,8 @@ impl<T> MaybeOwner<T> {
 #[derive(Debug)]
 pub struct Crate<'hir> {
     pub owners: IndexVec<LocalDefId, MaybeOwner<&'hir OwnerInfo<'hir>>>,
-    pub hir_hash: Fingerprint,
+    // Only present when incr. comp. is enabled.
+    pub opt_hir_hash: Option<Fingerprint>,
 }
 
 #[derive(Debug, HashStable_Generic)]
@@ -1673,7 +1689,6 @@ pub struct Expr<'hir> {
 impl Expr<'_> {
     pub fn precedence(&self) -> ExprPrecedence {
         match self.kind {
-            ExprKind::Box(_) => ExprPrecedence::Box,
             ExprKind::ConstBlock(_) => ExprPrecedence::ConstBlock,
             ExprKind::Array(_) => ExprPrecedence::Array,
             ExprKind::Call(..) => ExprPrecedence::Call,
@@ -1763,7 +1778,6 @@ impl Expr<'_> {
             | ExprKind::Lit(_)
             | ExprKind::ConstBlock(..)
             | ExprKind::Unary(..)
-            | ExprKind::Box(..)
             | ExprKind::AddrOf(..)
             | ExprKind::Binary(..)
             | ExprKind::Yield(..)
@@ -1851,7 +1865,6 @@ impl Expr<'_> {
             | ExprKind::InlineAsm(..)
             | ExprKind::AssignOp(..)
             | ExprKind::ConstBlock(..)
-            | ExprKind::Box(..)
             | ExprKind::Binary(..)
             | ExprKind::Yield(..)
             | ExprKind::DropTemps(..)
@@ -1862,8 +1875,7 @@ impl Expr<'_> {
     /// To a first-order approximation, is this a pattern?
     pub fn is_approximately_pattern(&self) -> bool {
         match &self.kind {
-            ExprKind::Box(_)
-            | ExprKind::Array(_)
+            ExprKind::Array(_)
             | ExprKind::Call(..)
             | ExprKind::Tup(_)
             | ExprKind::Lit(_)
@@ -1910,8 +1922,6 @@ pub fn is_range_literal(expr: &Expr<'_>) -> bool {
 
 #[derive(Debug, HashStable_Generic)]
 pub enum ExprKind<'hir> {
-    /// A `box x` expression.
-    Box(&'hir Expr<'hir>),
     /// Allow anonymous constants from an inline `const` block
     ConstBlock(AnonConst),
     /// An array (e.g., `[a, b, c, d]`).

@@ -96,20 +96,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let t = self.resolve_vars_if_possible(t);
         t.error_reported()?;
 
-        if self.type_is_sized_modulo_regions(self.param_env, t, span) {
+        if self.type_is_sized_modulo_regions(self.param_env, t) {
             return Ok(Some(PointerKind::Thin));
         }
 
         Ok(match *t.kind() {
             ty::Slice(_) | ty::Str => Some(PointerKind::Length),
             ty::Dynamic(ref tty, _, ty::Dyn) => Some(PointerKind::VTable(tty.principal_def_id())),
-            ty::Adt(def, substs) if def.is_struct() => match def.non_enum_variant().fields.last() {
-                None => Some(PointerKind::Thin),
-                Some(f) => {
-                    let field_ty = self.field_ty(span, f, substs);
-                    self.pointer_kind(field_ty, span)?
+            ty::Adt(def, substs) if def.is_struct() => {
+                match def.non_enum_variant().fields.raw.last() {
+                    None => Some(PointerKind::Thin),
+                    Some(f) => {
+                        let field_ty = self.field_ty(span, f, substs);
+                        self.pointer_kind(field_ty, span)?
+                    }
                 }
-            },
+            }
             ty::Tuple(fields) => match fields.last() {
                 None => Some(PointerKind::Thin),
                 Some(&f) => self.pointer_kind(f, span)?,
@@ -722,7 +724,7 @@ impl<'a, 'tcx> CastCheck<'tcx> {
 
         debug!("check_cast({}, {:?} as {:?})", self.expr.hir_id, self.expr_ty, self.cast_ty);
 
-        if !fcx.type_is_sized_modulo_regions(fcx.param_env, self.cast_ty, self.span)
+        if !fcx.type_is_sized_modulo_regions(fcx.param_env, self.cast_ty)
             && !self.cast_ty.has_infer_types()
         {
             self.report_cast_to_unsized_type(fcx);

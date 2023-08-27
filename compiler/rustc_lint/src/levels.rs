@@ -3,7 +3,7 @@ use crate::{
     fluent_generated as fluent,
     late::unerased_lint_store,
     lints::{
-        DeprecatedLintName, IgnoredUnlessCrateSpecified, OverruledAtributeLint,
+        DeprecatedLintName, IgnoredUnlessCrateSpecified, OverruledAttributeLint,
         RenamedOrRemovedLint, RenamedOrRemovedLintSuggestion, UnknownLint, UnknownLintSuggestion,
     },
 };
@@ -128,7 +128,7 @@ fn lint_expectations(tcx: TyCtxt<'_>, (): ()) -> Vec<(LintExpectationId, LintExp
         },
         warn_about_weird_lints: false,
         store,
-        registered_tools: &tcx.resolutions(()).registered_tools,
+        registered_tools: &tcx.registered_tools(()),
     };
 
     builder.add_command_line();
@@ -156,7 +156,7 @@ fn shallow_lint_levels_on(tcx: TyCtxt<'_>, owner: hir::OwnerId) -> ShallowLintLe
         },
         warn_about_weird_lints: false,
         store,
-        registered_tools: &tcx.resolutions(()).registered_tools,
+        registered_tools: &tcx.registered_tools(()),
     };
 
     if owner == hir::CRATE_OWNER_ID {
@@ -266,12 +266,12 @@ impl LintLevelsProvider for QueryMapExpectationsWrapper<'_> {
         let LintExpectationId::Stable { attr_id: Some(attr_id), hir_id, attr_index, .. } = id else { bug!("unstable expectation id should already be mapped") };
         let key = LintExpectationId::Unstable { attr_id, lint_index: None };
 
-        if !self.unstable_to_stable_ids.contains_key(&key) {
-            self.unstable_to_stable_ids.insert(
-                key,
-                LintExpectationId::Stable { hir_id, attr_index, lint_index: None, attr_id: None },
-            );
-        }
+        self.unstable_to_stable_ids.entry(key).or_insert(LintExpectationId::Stable {
+            hir_id,
+            attr_index,
+            lint_index: None,
+            attr_id: None,
+        });
 
         self.expectations.push((id.normalize(), expectation));
     }
@@ -612,7 +612,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                     self.emit_spanned_lint(
                         FORBIDDEN_LINT_GROUPS,
                         src.span().into(),
-                        OverruledAtributeLint {
+                        OverruledAttributeLint {
                             overruled: src.span(),
                             lint_level: level.as_str(),
                             lint_source: src.name(),

@@ -21,25 +21,24 @@ use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LocalDefId, LOCAL_CRATE};
 use rustc_hir::PredicateOrigin;
 use rustc_hir_analysis::hir_ty_to_ty;
 use rustc_infer::infer::region_constraints::{Constraint, RegionConstraintData};
+use rustc_middle::metadata::Reexport;
 use rustc_middle::middle::resolve_bound_vars as rbv;
 use rustc_middle::ty::fold::TypeFolder;
 use rustc_middle::ty::InternalSubsts;
 use rustc_middle::ty::TypeVisitableExt;
-use rustc_middle::ty::{self, AdtKind, DefIdTree, EarlyBinder, Ty, TyCtxt};
+use rustc_middle::ty::{self, AdtKind, EarlyBinder, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
 use rustc_span::hygiene::{AstPass, MacroKind};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{self, ExpnKind};
 
-use std::assert_matches::assert_matches;
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
-use std::default::Default;
 use std::hash::Hash;
 use std::mem;
 use thin_vec::ThinVec;
 
-use crate::clean::inline::merge_attrs;
 use crate::core::{self, DocContext, ImplTraitParam};
 use crate::formats::item_type::ItemType;
 use crate::visit_ast::Module as DocModule;
@@ -270,15 +269,7 @@ fn clean_where_predicate<'tcx>(
             let bound_params = wbp
                 .bound_generic_params
                 .iter()
-                .map(|param| {
-                    // Higher-ranked params must be lifetimes.
-                    // Higher-ranked lifetimes can't have bounds.
-                    assert_matches!(
-                        param,
-                        hir::GenericParam { kind: hir::GenericParamKind::Lifetime { .. }, .. }
-                    );
-                    Lifetime(param.name.ident().name)
-                })
+                .map(|param| clean_generic_param(cx, None, param))
                 .collect();
             WherePredicate::BoundPredicate {
                 ty: clean_ty(wbp.bounded_ty, cx),
@@ -324,7 +315,7 @@ pub(crate) fn clean_predicate<'tcx>(
         ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(..)) => None,
 
         ty::PredicateKind::Subtype(..)
-        | ty::PredicateKind::AliasEq(..)
+        | ty::PredicateKind::AliasRelate(..)
         | ty::PredicateKind::Coerce(..)
         | ty::PredicateKind::ObjectSafe(..)
         | ty::PredicateKind::ClosureKind(..)
@@ -410,7 +401,7 @@ fn clean_projection_predicate<'tcx>(
         .collect_referenced_late_bound_regions(&pred)
         .into_iter()
         .filter_map(|br| match br {
-            ty::BrNamed(_, name) if br.is_named() => Some(Lifetime(name)),
+            ty::BrNamed(_, name) if br.is_named() => Some(GenericParamDef::lifetime(name)),
             _ => None,
         })
         .collect();
@@ -427,7 +418,7 @@ fn clean_projection<'tcx>(
     cx: &mut DocContext<'tcx>,
     def_id: Option<DefId>,
 ) -> Type {
-    if cx.tcx.def_kind(ty.skip_binder().def_id) == DefKind::ImplTraitPlaceholder {
+    if cx.tcx.is_impl_trait_in_trait(ty.skip_binder().def_id) {
         let bounds = cx
             .tcx
             .explicit_item_bounds(ty.skip_binder().def_id)
@@ -508,7 +499,6 @@ fn clean_generic_param_def<'tcx>(
         ty::GenericParamDefKind::Const { has_default } => (
             def.name,
             GenericParamDefKind::Const {
-                did: def.def_id,
                 ty: Box::new(clean_middle_ty(
                     ty::Binder::dummy(
                         cx.tcx
@@ -578,7 +568,6 @@ fn clean_generic_param<'tcx>(
         hir::GenericParamKind::Const { ty, default } => (
             param.name.ident().name,
             GenericParamDefKind::Const {
-                did: param.def_id.to_def_id(),
                 ty: Box::new(clean_ty(ty, cx)),
                 default: default
                     .map(|ct| Box::new(ty::Const::from_anon_const(cx.tcx, ct.def_id).to_string())),
@@ -831,7 +820,7 @@ fn clean_ty_generics<'tcx>(
                         p.get_bound_params()
                             .into_iter()
                             .flatten()
-                            .map(|param| GenericParamDef::lifetime(param.0))
+                            .cloned()
                             .collect(),
                     ));
                 }
@@ -919,6 +908,38 @@ fn clean_ty_generics<'tcx>(
     }
 }
 
+fn clean_proc_macro<'tcx>(
+    item: &hir::Item<'tcx>,
+    name: &mut Symbol,
+    kind: MacroKind,
+    cx: &mut DocContext<'tcx>,
+) -> ItemKind {
+    let attrs = cx.tcx.hir().attrs(item.hir_id());
+    if kind == MacroKind::Derive &&
+        let Some(derive_name) = attrs
+            .lists(sym::proc_macro_derive)
+            .find_map(|mi| mi.ident())
+    {
+        *name = derive_name.name;
+    }
+
+    let mut helpers = Vec::new();
+    for mi in attrs.lists(sym::proc_macro_derive) {
+        if !mi.has_name(sym::attributes) {
+            continue;
+        }
+
+        if let Some(list) = mi.meta_item_list() {
+            for inner_mi in list {
+                if let Some(ident) = inner_mi.ident() {
+                    helpers.push(ident.name);
+                }
+            }
+        }
+    }
+    ProcMacroItem(ProcMacro { kind, helpers })
+}
+
 fn clean_fn_or_proc_macro<'tcx>(
     item: &hir::Item<'tcx>,
     sig: &hir::FnSig<'tcx>,
@@ -940,31 +961,7 @@ fn clean_fn_or_proc_macro<'tcx>(
         }
     });
     match macro_kind {
-        Some(kind) => {
-            if kind == MacroKind::Derive {
-                *name = attrs
-                    .lists(sym::proc_macro_derive)
-                    .find_map(|mi| mi.ident())
-                    .expect("proc-macro derives require a name")
-                    .name;
-            }
-
-            let mut helpers = Vec::new();
-            for mi in attrs.lists(sym::proc_macro_derive) {
-                if !mi.has_name(sym::attributes) {
-                    continue;
-                }
-
-                if let Some(list) = mi.meta_item_list() {
-                    for inner_mi in list {
-                        if let Some(ident) = inner_mi.ident() {
-                            helpers.push(ident.name);
-                        }
-                    }
-                }
-            }
-            ProcMacroItem(ProcMacro { kind, helpers })
-        }
+        Some(kind) => clean_proc_macro(item, name, kind, cx),
         None => {
             let mut func = clean_function(cx, sig, generics, FunctionArgs::Body(body_id));
             clean_fn_decl_legacy_const_generics(&mut func, attrs);
@@ -2013,7 +2010,8 @@ fn clean_generic_args<'tcx>(
     generic_args: &hir::GenericArgs<'tcx>,
     cx: &mut DocContext<'tcx>,
 ) -> GenericArgs {
-    if generic_args.parenthesized {
+    // FIXME(return_type_notation): Fix RTN parens rendering
+    if generic_args.parenthesized == hir::GenericArgsParentheses::ParenSugar {
         let output = clean_ty(generic_args.bindings[0].ty(), cx);
         let output = if output != Type::Tuple(Vec::new()) { Some(Box::new(output)) } else { None };
         let inputs =
@@ -2066,110 +2064,44 @@ fn clean_bare_fn_ty<'tcx>(
     BareFunctionDecl { unsafety: bare_fn.unsafety, abi: bare_fn.abi, decl, generic_params }
 }
 
-/// This visitor is used to go through only the "top level" of a item and not enter any sub
-/// item while looking for a given `Ident` which is stored into `item` if found.
-struct OneLevelVisitor<'hir> {
-    map: rustc_middle::hir::map::Map<'hir>,
-    item: Option<&'hir hir::Item<'hir>>,
-    looking_for: Ident,
+pub(crate) fn reexport_chain<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    import_def_id: LocalDefId,
     target_def_id: LocalDefId,
-}
-
-impl<'hir> OneLevelVisitor<'hir> {
-    fn new(map: rustc_middle::hir::map::Map<'hir>, target_def_id: LocalDefId) -> Self {
-        Self { map, item: None, looking_for: Ident::empty(), target_def_id }
-    }
-
-    fn reset(&mut self, looking_for: Ident) {
-        self.looking_for = looking_for;
-        self.item = None;
-    }
-}
-
-impl<'hir> hir::intravisit::Visitor<'hir> for OneLevelVisitor<'hir> {
-    type NestedFilter = rustc_middle::hir::nested_filter::All;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.map
-    }
-
-    fn visit_item(&mut self, item: &'hir hir::Item<'hir>) {
-        if self.item.is_none()
-            && item.ident == self.looking_for
-            && (matches!(item.kind, hir::ItemKind::Use(_, _))
-                || item.owner_id.def_id == self.target_def_id)
+) -> &'tcx [Reexport] {
+    for child in tcx.module_children_reexports(tcx.local_parent(import_def_id)) {
+        if child.res.opt_def_id() == Some(target_def_id.to_def_id())
+            && child.reexport_chain[0].id() == Some(import_def_id.to_def_id())
         {
-            self.item = Some(item);
+            return &child.reexport_chain;
         }
     }
+    &[]
 }
 
-/// Because a `Use` item directly links to the imported item, we need to manually go through each
-/// import one by one. To do so, we go to the parent item and look for the `Ident` into it. Then,
-/// if we found the "end item" (the imported one), we stop there because we don't need its
-/// documentation. Otherwise, we repeat the same operation until we find the "end item".
+/// Collect attributes from the whole import chain.
 fn get_all_import_attributes<'hir>(
-    mut item: &hir::Item<'hir>,
-    tcx: TyCtxt<'hir>,
+    cx: &mut DocContext<'hir>,
+    import_def_id: LocalDefId,
     target_def_id: LocalDefId,
-    attributes: &mut Vec<ast::Attribute>,
     is_inline: bool,
-) {
+) -> Vec<(Cow<'hir, ast::Attribute>, Option<DefId>)> {
+    let mut attrs = Vec::new();
     let mut first = true;
-    let hir_map = tcx.hir();
-    let mut visitor = OneLevelVisitor::new(hir_map, target_def_id);
-    let mut visited = FxHashSet::default();
-
-    // If the item is an import and has at least a path with two parts, we go into it.
-    while let hir::ItemKind::Use(path, _) = item.kind && visited.insert(item.hir_id()) {
+    for def_id in reexport_chain(cx.tcx, import_def_id, target_def_id)
+        .iter()
+        .flat_map(|reexport| reexport.id())
+    {
+        let import_attrs = inline::load_attrs(cx, def_id);
         if first {
             // This is the "original" reexport so we get all its attributes without filtering them.
-            attributes.extend_from_slice(hir_map.attrs(item.hir_id()));
+            attrs = import_attrs.iter().map(|attr| (Cow::Borrowed(attr), Some(def_id))).collect();
             first = false;
         } else {
-            add_without_unwanted_attributes(attributes, hir_map.attrs(item.hir_id()), is_inline);
-        }
-
-        let def_id = if let [.., parent_segment, _] = &path.segments {
-            match parent_segment.res {
-                hir::def::Res::Def(_, def_id) => def_id,
-                _ if parent_segment.ident.name == kw::Crate => {
-                    // In case the "parent" is the crate, it'll give `Res::Err` so we need to
-                    // circumvent it this way.
-                    tcx.parent(item.owner_id.def_id.to_def_id())
-                }
-                _ => break,
-            }
-        } else {
-            // If the path doesn't have a parent, then the parent is the current module.
-            tcx.parent(item.owner_id.def_id.to_def_id())
-        };
-
-        let Some(parent) = hir_map.get_if_local(def_id) else { break };
-
-        // We get the `Ident` we will be looking for into `item`.
-        let looking_for = path.segments[path.segments.len() - 1].ident;
-        visitor.reset(looking_for);
-
-        match parent {
-            hir::Node::Item(parent_item) => {
-                hir::intravisit::walk_item(&mut visitor, parent_item);
-            }
-            hir::Node::Crate(m) => {
-                hir::intravisit::walk_mod(
-                    &mut visitor,
-                    m,
-                    tcx.local_def_id_to_hir_id(def_id.as_local().unwrap()),
-                );
-            }
-            _ => break,
-        }
-        if let Some(i) = visitor.item {
-            item = i;
-        } else {
-            break;
+            add_without_unwanted_attributes(&mut attrs, import_attrs, is_inline, Some(def_id));
         }
     }
+    attrs
 }
 
 fn filter_tokens_from_list(
@@ -2215,17 +2147,24 @@ fn filter_tokens_from_list(
 /// * `doc(inline)`
 /// * `doc(no_inline)`
 /// * `doc(hidden)`
-fn add_without_unwanted_attributes(
-    attrs: &mut Vec<ast::Attribute>,
-    new_attrs: &[ast::Attribute],
+fn add_without_unwanted_attributes<'hir>(
+    attrs: &mut Vec<(Cow<'hir, ast::Attribute>, Option<DefId>)>,
+    new_attrs: &'hir [ast::Attribute],
     is_inline: bool,
+    import_parent: Option<DefId>,
 ) {
-    // If it's `#[doc(inline)]`, we don't want all attributes, otherwise we keep everything.
+    // If it's not `#[doc(inline)]`, we don't want all attributes, otherwise we keep everything.
     if !is_inline {
-        attrs.extend_from_slice(new_attrs);
+        for attr in new_attrs {
+            attrs.push((Cow::Borrowed(attr), import_parent));
+        }
         return;
     }
     for attr in new_attrs {
+        if matches!(attr.kind, ast::AttrKind::DocComment(..)) {
+            attrs.push((Cow::Borrowed(attr), import_parent));
+            continue;
+        }
         let mut attr = attr.clone();
         match attr.kind {
             ast::AttrKind::Normal(ref mut normal) => {
@@ -2252,18 +2191,15 @@ fn add_without_unwanted_attributes(
                                     )
                                 });
                             args.tokens = TokenStream::new(tokens);
-                            attrs.push(attr);
+                            attrs.push((Cow::Owned(attr), import_parent));
                         }
                         ast::AttrArgs::Empty | ast::AttrArgs::Eq(..) => {
-                            attrs.push(attr);
-                            continue;
+                            attrs.push((Cow::Owned(attr), import_parent));
                         }
                     }
                 }
             }
-            ast::AttrKind::DocComment(..) => {
-                attrs.push(attr);
-            }
+            _ => unreachable!(),
         }
     }
 }
@@ -2318,15 +2254,16 @@ fn clean_maybe_renamed_item<'tcx>(
                 fields: variant_data.fields().iter().map(|x| clean_field(x, cx)).collect(),
             }),
             ItemKind::Impl(impl_) => return clean_impl(impl_, item.owner_id.def_id, cx),
-            // proc macros can have a name set by attributes
-            ItemKind::Fn(ref sig, generics, body_id) => {
-                clean_fn_or_proc_macro(item, sig, generics, body_id, &mut name, cx)
-            }
-            ItemKind::Macro(ref macro_def, _) => {
+            ItemKind::Macro(ref macro_def, MacroKind::Bang) => {
                 let ty_vis = cx.tcx.visibility(def_id);
                 MacroItem(Macro {
                     source: display_macro_source(cx, name, macro_def, def_id, ty_vis),
                 })
+            }
+            ItemKind::Macro(_, macro_kind) => clean_proc_macro(item, &mut name, macro_kind, cx),
+            // proc macros can have a name set by attributes
+            ItemKind::Fn(ref sig, generics, body_id) => {
+                clean_fn_or_proc_macro(item, sig, generics, body_id, &mut name, cx)
             }
             ItemKind::Trait(_, _, generics, bounds, item_ids) => {
                 let items = item_ids
@@ -2350,26 +2287,28 @@ fn clean_maybe_renamed_item<'tcx>(
             _ => unreachable!("not yet converted"),
         };
 
-        let mut import_attrs = Vec::new();
-        let mut target_attrs = Vec::new();
-        if let Some(import_id) = import_id &&
-            let Some(hir::Node::Item(use_node)) = cx.tcx.hir().find_by_def_id(import_id)
-        {
-            let is_inline = inline::load_attrs(cx, import_id.to_def_id()).lists(sym::doc).get_word_attr(sym::inline).is_some();
-            // Then we get all the various imports' attributes.
-            get_all_import_attributes(use_node, cx.tcx, item.owner_id.def_id, &mut import_attrs, is_inline);
-            add_without_unwanted_attributes(&mut target_attrs, inline::load_attrs(cx, def_id), is_inline);
+        let target_attrs = inline::load_attrs(cx, def_id);
+        let attrs = if let Some(import_id) = import_id {
+            let is_inline = inline::load_attrs(cx, import_id.to_def_id())
+                .lists(sym::doc)
+                .get_word_attr(sym::inline)
+                .is_some();
+            let mut attrs =
+                get_all_import_attributes(cx, import_id, item.owner_id.def_id, is_inline);
+            add_without_unwanted_attributes(&mut attrs, target_attrs, is_inline, None);
+            attrs
         } else {
             // We only keep the item's attributes.
-            target_attrs.extend_from_slice(inline::load_attrs(cx, def_id));
-        }
+            target_attrs.iter().map(|attr| (Cow::Borrowed(attr), None)).collect()
+        };
 
-        let import_parent = import_id.map(|import_id| cx.tcx.local_parent(import_id).to_def_id());
-        let (attrs, cfg) =  merge_attrs(cx, import_parent, &target_attrs, Some(&import_attrs));
+        let cfg = attrs.cfg(cx.tcx, &cx.cache.hidden_cfg);
+        let attrs =
+            Attributes::from_ast_iter(attrs.iter().map(|(attr, did)| (&**attr, *did)), false);
 
         let mut item =
             Item::from_def_id_and_attrs_and_parts(def_id, Some(name), kind, Box::new(attrs), cfg);
-        item.inline_stmt_id = import_id.map(|def_id| def_id.to_def_id());
+        item.inline_stmt_id = import_id.map(|local| local.to_def_id());
         vec![item]
     })
 }
@@ -2450,22 +2389,17 @@ fn clean_extern_crate<'tcx>(
                     Some(l) => attr::list_contains_name(&l, sym::inline),
                     None => false,
                 }
-        });
+        })
+        && !cx.output_format.is_json();
 
     let krate_owner_def_id = krate.owner_id.to_def_id();
     if please_inline {
-        let mut visited = DefIdSet::default();
-
-        let res = Res::Def(DefKind::Mod, crate_def_id);
-
         if let Some(items) = inline::try_inline(
             cx,
-            cx.tcx.parent_module(krate.hir_id()).to_def_id(),
-            Some(krate_owner_def_id),
-            res,
+            Res::Def(DefKind::Mod, crate_def_id),
             name,
-            Some(attrs),
-            &mut visited,
+            Some((attrs, Some(krate_owner_def_id))),
+            &mut Default::default(),
         ) {
             return items;
         }
@@ -2589,17 +2523,13 @@ fn clean_use_statement_inner<'tcx>(
             denied = true;
         }
         if !denied {
-            let mut visited = DefIdSet::default();
             let import_def_id = import.owner_id.to_def_id();
-
             if let Some(mut items) = inline::try_inline(
                 cx,
-                cx.tcx.parent_module(import.hir_id()).to_def_id(),
-                Some(import_def_id),
                 path.res,
                 name,
-                Some(attrs),
-                &mut visited,
+                Some((attrs, Some(import_def_id))),
+                &mut Default::default(),
             ) {
                 items.push(Item::from_def_id_and_parts(
                     import_def_id,

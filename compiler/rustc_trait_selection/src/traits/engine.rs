@@ -6,12 +6,14 @@ use super::{ChalkFulfillmentContext, FulfillmentContext};
 use crate::solve::FulfillmentCtxt as NextFulfillmentCtxt;
 use crate::traits::NormalizeExt;
 use rustc_data_structures::fx::FxIndexSet;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::at::ToTrace;
 use rustc_infer::infer::canonical::{
     Canonical, CanonicalQueryResponse, CanonicalVarValues, QueryResponse,
 };
-use rustc_infer::infer::{InferCtxt, InferOk};
+use rustc_infer::infer::outlives::env::OutlivesEnvironment;
+use rustc_infer::infer::{DefineOpaqueTypes, InferCtxt, InferOk};
 use rustc_infer::traits::query::Fallible;
 use rustc_infer::traits::{
     FulfillmentError, Obligation, ObligationCause, PredicateObligation, TraitEngineExt as _,
@@ -128,8 +130,7 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
     {
         self.infcx
             .at(cause, param_env)
-            .define_opaque_types(true)
-            .eq_exp(a_is_expected, a, b)
+            .eq_exp(DefineOpaqueTypes::Yes, a_is_expected, a, b)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
@@ -142,8 +143,7 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
     ) -> Result<(), TypeError<'tcx>> {
         self.infcx
             .at(cause, param_env)
-            .define_opaque_types(true)
-            .eq(expected, actual)
+            .eq(DefineOpaqueTypes::Yes, expected, actual)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
@@ -157,8 +157,7 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
     ) -> Result<(), TypeError<'tcx>> {
         self.infcx
             .at(cause, param_env)
-            .define_opaque_types(true)
-            .sup(expected, actual)
+            .sub(DefineOpaqueTypes::Yes, expected, actual)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
@@ -172,17 +171,35 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
     ) -> Result<(), TypeError<'tcx>> {
         self.infcx
             .at(cause, param_env)
-            .define_opaque_types(true)
-            .sup(expected, actual)
+            .sup(DefineOpaqueTypes::Yes, expected, actual)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
+    #[must_use]
     pub fn select_where_possible(&self) -> Vec<FulfillmentError<'tcx>> {
         self.engine.borrow_mut().select_where_possible(self.infcx)
     }
 
+    #[must_use]
     pub fn select_all_or_error(&self) -> Vec<FulfillmentError<'tcx>> {
         self.engine.borrow_mut().select_all_or_error(self.infcx)
+    }
+
+    /// Resolves regions and reports errors.
+    ///
+    /// Takes ownership of the context as doing trait solving afterwards
+    /// will result in region constraints getting ignored.
+    pub fn resolve_regions_and_report_errors(
+        self,
+        generic_param_scope: LocalDefId,
+        outlives_env: &OutlivesEnvironment<'tcx>,
+    ) -> Result<(), ErrorGuaranteed> {
+        let errors = self.infcx.resolve_regions(&outlives_env);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.infcx.err_ctxt().report_region_errors(generic_param_scope, &errors))
+        }
     }
 
     pub fn assumed_wf_types(

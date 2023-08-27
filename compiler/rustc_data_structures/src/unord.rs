@@ -109,6 +109,12 @@ impl<T, I: Iterator<Item = T>> UnordItems<T, I> {
     }
 }
 
+impl<T> UnordItems<T, std::iter::Empty<T>> {
+    pub fn empty() -> Self {
+        UnordItems(std::iter::empty())
+    }
+}
+
 impl<'a, T: Clone + 'a, I: Iterator<Item = &'a T>> UnordItems<&'a T, I> {
     #[inline]
     pub fn cloned(self) -> UnordItems<T, impl Iterator<Item = T>> {
@@ -130,6 +136,20 @@ impl<T: Ord, I: Iterator<Item = T>> UnordItems<T, I> {
     {
         let mut items: Vec<T> = self.0.collect();
         items.sort_by_cached_key(|x| x.to_stable_hash_key(hcx));
+        items
+    }
+
+    #[inline]
+    pub fn into_sorted_stable_ord(self, use_stable_sort: bool) -> Vec<T>
+    where
+        T: Ord + StableOrd,
+    {
+        let mut items: Vec<T> = self.0.collect();
+        if use_stable_sort {
+            items.sort();
+        } else {
+            items.sort_unstable()
+        }
         items
     }
 
@@ -176,6 +196,11 @@ impl<V: Eq + Hash> UnordSet<V> {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
     pub fn insert(&mut self, v: V) -> bool {
         self.inner.insert(v)
     }
@@ -199,7 +224,7 @@ impl<V: Eq + Hash> UnordSet<V> {
     }
 
     #[inline]
-    pub fn items<'a>(&'a self) -> UnordItems<&'a V, impl Iterator<Item = &'a V>> {
+    pub fn items(&self) -> UnordItems<&V, impl Iterator<Item = &V>> {
         UnordItems(self.inner.iter())
     }
 
@@ -253,7 +278,7 @@ impl<V: Eq + Hash> UnordSet<V> {
     // We can safely extend this UnordSet from a set of unordered values because that
     // won't expose the internal ordering anywhere.
     #[inline]
-    pub fn extend<I: Iterator<Item = V>>(&mut self, items: UnordItems<V, I>) {
+    pub fn extend_unord<I: Iterator<Item = V>>(&mut self, items: UnordItems<V, I>) {
         self.inner.extend(items.0)
     }
 
@@ -274,6 +299,12 @@ impl<V: Hash + Eq> FromIterator<V> for UnordSet<V> {
     #[inline]
     fn from_iter<T: IntoIterator<Item = V>>(iter: T) -> Self {
         UnordSet { inner: FxHashSet::from_iter(iter) }
+    }
+}
+
+impl<V: Hash + Eq> From<FxHashSet<V>> for UnordSet<V> {
+    fn from(value: FxHashSet<V>) -> Self {
+        UnordSet { inner: value }
     }
 }
 
@@ -384,7 +415,7 @@ impl<K: Eq + Hash, V> UnordMap<K, V> {
     }
 
     #[inline]
-    pub fn items<'a>(&'a self) -> UnordItems<(&'a K, &'a V), impl Iterator<Item = (&'a K, &'a V)>> {
+    pub fn items(&self) -> UnordItems<(&K, &V), impl Iterator<Item = (&K, &V)>> {
         UnordItems(self.inner.iter())
     }
 

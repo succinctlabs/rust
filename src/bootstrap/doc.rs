@@ -696,7 +696,7 @@ impl Step for Rustc {
         cargo.rustdocflag("-Znormalize-docs");
         cargo.rustdocflag("--show-type-layout");
         cargo.rustdocflag("--generate-link-to-definition");
-        compile::rustc_cargo(builder, &mut cargo, target);
+        compile::rustc_cargo(builder, &mut cargo, target, compiler.stage);
         cargo.arg("-Zunstable-options");
         cargo.arg("-Zskip-rustdoc-fingerprint");
 
@@ -882,6 +882,7 @@ tool_doc!(
         // "cargo-credential-wincred",
     ]
 );
+tool_doc!(Tidy, "tidy", "src/tools/tidy", ["tidy"]);
 
 #[derive(Ord, PartialOrd, Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorIndex {
@@ -1026,10 +1027,11 @@ impl Step for RustcBook {
         if self.validate {
             cmd.arg("--validate");
         }
-        if !builder.unstable_features() {
-            // We need to validate nightly features, even on the stable channel.
-            cmd.env("RUSTC_BOOTSTRAP", "1");
-        }
+        // We need to validate nightly features, even on the stable channel.
+        // Set this unconditionally as the stage0 compiler may be being used to
+        // document.
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+
         // If the lib directories are in an unusual location (changed in
         // config.toml), then this needs to explicitly update the dylib search
         // path.

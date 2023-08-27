@@ -13,7 +13,7 @@
 //! instance, a walker looking for item names in a module will miss all of
 //! those that are created by the expansion of a macro.
 
-use crate::ast::*;
+use crate::{ast::*, StaticItem};
 
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
@@ -305,8 +305,9 @@ pub fn walk_item<'a, V: Visitor<'a>>(visitor: &mut V, item: &'a Item) {
     match &item.kind {
         ItemKind::ExternCrate(_) => {}
         ItemKind::Use(use_tree) => visitor.visit_use_tree(use_tree, item.id, false),
-        ItemKind::Static(typ, _, expr) | ItemKind::Const(_, typ, expr) => {
-            visitor.visit_ty(typ);
+        ItemKind::Static(box StaticItem { ty, mutability: _, expr })
+        | ItemKind::Const(box ConstItem { ty, expr, .. }) => {
+            visitor.visit_ty(ty);
             walk_list!(visitor, visit_expr, expr);
         }
         ItemKind::Fn(box Fn { defaultness: _, generics, sig, body }) => {
@@ -673,7 +674,7 @@ pub fn walk_assoc_item<'a, V: Visitor<'a>>(visitor: &mut V, item: &'a AssocItem,
     visitor.visit_ident(ident);
     walk_list!(visitor, visit_attribute, attrs);
     match kind {
-        AssocItemKind::Const(_, ty, expr) => {
+        AssocItemKind::Const(box ConstItem { ty, expr, .. }) => {
             visitor.visit_ty(ty);
             walk_list!(visitor, visit_expr, expr);
         }
@@ -772,7 +773,6 @@ pub fn walk_expr<'a, V: Visitor<'a>>(visitor: &mut V, expression: &'a Expr) {
     walk_list!(visitor, visit_attribute, expression.attrs.iter());
 
     match &expression.kind {
-        ExprKind::Box(subexpression) => visitor.visit_expr(subexpression),
         ExprKind::Array(subexpressions) => {
             walk_list!(visitor, visit_expr, subexpressions);
         }
@@ -861,7 +861,7 @@ pub fn walk_expr<'a, V: Visitor<'a>>(visitor: &mut V, expression: &'a Expr) {
             walk_list!(visitor, visit_label, opt_label);
             visitor.visit_block(block);
         }
-        ExprKind::Async(_, _, body) => {
+        ExprKind::Async(_, body) => {
             visitor.visit_block(body);
         }
         ExprKind::Await(expr) => visitor.visit_expr(expr),

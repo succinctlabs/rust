@@ -231,7 +231,8 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
     }
 }
 
-/// Derive macro generating an impl of the trait `PartialEq`.
+/// Derive macro generating an impl of the trait [`PartialEq`].
+/// The behavior of this macro is described in detail [here](PartialEq#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics, structural_match)]
@@ -297,7 +298,7 @@ pub trait Eq: PartialEq<Self> {
     fn assert_receiver_is_total_eq(&self) {}
 }
 
-/// Derive macro generating an impl of the trait `Eq`.
+/// Derive macro generating an impl of the trait [`Eq`].
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics, derive_eq, structural_match, no_coverage)]
@@ -800,10 +801,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
         Self: Sized,
         Self: ~const Destruct,
     {
-        match self.cmp(&other) {
-            Ordering::Less | Ordering::Equal => other,
-            Ordering::Greater => self,
-        }
+        max_by(self, other, Ord::cmp)
     }
 
     /// Compares and returns the minimum of two values.
@@ -824,10 +822,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
         Self: Sized,
         Self: ~const Destruct,
     {
-        match self.cmp(&other) {
-            Ordering::Less | Ordering::Equal => self,
-            Ordering::Greater => other,
-        }
+        min_by(self, other, Ord::cmp)
     }
 
     /// Restrict a value to a certain interval.
@@ -865,7 +860,8 @@ pub trait Ord: Eq + PartialOrd<Self> {
     }
 }
 
-/// Derive macro generating an impl of the trait `Ord`.
+/// Derive macro generating an impl of the trait [`Ord`].
+/// The behavior of this macro is described in detail [here](Ord#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
@@ -1144,7 +1140,8 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     }
 }
 
-/// Derive macro generating an impl of the trait `PartialOrd`.
+/// Derive macro generating an impl of the trait [`PartialOrd`].
+/// The behavior of this macro is described in detail [here](PartialOrd#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
@@ -1190,7 +1187,12 @@ pub const fn min<T: ~const Ord + ~const Destruct>(v1: T, v2: T) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "92391")]
+pub const fn min_by<T, F: ~const FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T
+where
+    T: ~const Destruct,
+    F: ~const Destruct,
+{
     match compare(&v1, &v2) {
         Ordering::Less | Ordering::Equal => v1,
         Ordering::Greater => v2,
@@ -1212,8 +1214,14 @@ pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn min_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
-    min_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
+#[rustc_const_unstable(feature = "const_cmp", issue = "92391")]
+pub const fn min_by_key<T, F: ~const FnMut(&T) -> K, K: ~const Ord>(v1: T, v2: T, mut f: F) -> T
+where
+    T: ~const Destruct,
+    F: ~const Destruct,
+    K: ~const Destruct,
+{
+    min_by(v1, v2, const |v1, v2| f(v1).cmp(&f(v2)))
 }
 
 /// Compares and returns the maximum of two values.
@@ -1254,7 +1262,12 @@ pub const fn max<T: ~const Ord + ~const Destruct>(v1: T, v2: T) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "92391")]
+pub const fn max_by<T, F: ~const FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T
+where
+    T: ~const Destruct,
+    F: ~const Destruct,
+{
     match compare(&v1, &v2) {
         Ordering::Less | Ordering::Equal => v2,
         Ordering::Greater => v1,
@@ -1276,8 +1289,14 @@ pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn max_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
-    max_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
+#[rustc_const_unstable(feature = "const_cmp", issue = "92391")]
+pub const fn max_by_key<T, F: ~const FnMut(&T) -> K, K: ~const Ord>(v1: T, v2: T, mut f: F) -> T
+where
+    T: ~const Destruct,
+    F: ~const Destruct,
+    K: ~const Destruct,
+{
+    max_by(v1, v2, const |v1, v2| f(v1).cmp(&f(v2)))
 }
 
 // Implementation of PartialEq, Eq, PartialOrd and Ord for primitive types

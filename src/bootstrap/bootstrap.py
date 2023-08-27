@@ -304,6 +304,7 @@ def default_build_triple(verbose):
         'i486': 'i686',
         'i686': 'i686',
         'i786': 'i686',
+        'loongarch64': 'loongarch64',
         'm68k': 'm68k',
         'powerpc': 'powerpc',
         'powerpc64': 'powerpc64',
@@ -741,6 +742,9 @@ class RustBuild(object):
         env["LIBRARY_PATH"] = os.path.join(self.bin_root(), "lib") + \
             (os.pathsep + env["LIBRARY_PATH"]) \
             if "LIBRARY_PATH" in env else ""
+        env["LIBPATH"] = os.path.join(self.bin_root(), "lib") + \
+            (os.pathsep + env["LIBPATH"]) \
+            if "LIBPATH" in env else ""
 
         # Export Stage0 snapshot compiler related env variables
         build_section = "target.{}".format(self.build)

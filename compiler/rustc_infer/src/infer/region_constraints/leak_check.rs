@@ -290,9 +290,9 @@ impl<'me, 'tcx> LeakCheck<'me, 'tcx> {
     ) -> TypeError<'tcx> {
         debug!("error: placeholder={:?}, other_region={:?}", placeholder, other_region);
         if self.overly_polymorphic {
-            TypeError::RegionsOverlyPolymorphic(placeholder.name, other_region)
+            TypeError::RegionsOverlyPolymorphic(placeholder.bound.kind, other_region)
         } else {
-            TypeError::RegionsInsufficientlyPolymorphic(placeholder.name, other_region)
+            TypeError::RegionsInsufficientlyPolymorphic(placeholder.bound.kind, other_region)
         }
     }
 }
@@ -423,9 +423,6 @@ impl<'tcx> MiniGraph<'tcx> {
                 }
                 &AddConstraint(Constraint::RegSubReg(a, b)) => {
                     each_edge(a, b);
-                }
-                &AddGiven(a, b) => {
-                    each_edge(a, tcx.mk_re_var(b));
                 }
                 &AddVerify(i) => span_bug!(
                     verifys[i].origin.span(),

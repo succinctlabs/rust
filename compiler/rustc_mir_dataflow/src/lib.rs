@@ -3,7 +3,6 @@
 #![feature(exact_size_is_empty)]
 #![feature(let_chains)]
 #![feature(min_specialization)]
-#![feature(once_cell)]
 #![feature(stmt_expr_attributes)]
 #![feature(trusted_step)]
 #![recursion_limit = "256"]
@@ -46,7 +45,7 @@ pub mod storage;
 pub mod un_derefer;
 pub mod value_analysis;
 
-fluent_messages! { "../locales/en-US.ftl" }
+fluent_messages! { "../messages.ftl" }
 
 pub(crate) mod indexes {
     pub(crate) use super::move_paths::MovePathIndex;

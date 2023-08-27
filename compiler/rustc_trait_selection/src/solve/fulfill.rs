@@ -1,6 +1,8 @@
 use std::mem;
 
 use rustc_infer::infer::InferCtxt;
+use rustc_infer::traits::solve::MaybeCause;
+use rustc_infer::traits::Obligation;
 use rustc_infer::traits::{
     query::NoSolution, FulfillmentError, FulfillmentErrorCode, MismatchedProjectionTypes,
     PredicateObligation, SelectionError, TraitEngine,
@@ -40,13 +42,31 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentCtxt<'tcx> {
         self.obligations.push(obligation);
     }
 
-    fn collect_remaining_errors(&mut self) -> Vec<FulfillmentError<'tcx>> {
+    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<FulfillmentError<'tcx>> {
         self.obligations
             .drain(..)
-            .map(|obligation| FulfillmentError {
-                obligation: obligation.clone(),
-                code: FulfillmentErrorCode::CodeAmbiguity,
-                root_obligation: obligation,
+            .map(|obligation| {
+                let code =
+                    infcx.probe(|_| match infcx.evaluate_root_goal(obligation.clone().into()) {
+                        Ok((_, Certainty::Maybe(MaybeCause::Ambiguity), _)) => {
+                            FulfillmentErrorCode::CodeAmbiguity { overflow: false }
+                        }
+                        Ok((_, Certainty::Maybe(MaybeCause::Overflow), _)) => {
+                            FulfillmentErrorCode::CodeAmbiguity { overflow: true }
+                        }
+                        Ok((_, Certainty::Yes, _)) => {
+                            bug!("did not expect successful goal when collecting ambiguity errors")
+                        }
+                        Err(_) => {
+                            bug!("did not expect selection error when collecting ambiguity errors")
+                        }
+                    });
+
+                FulfillmentError {
+                    obligation: obligation.clone(),
+                    code,
+                    root_obligation: obligation,
+                }
             })
             .collect()
     }
@@ -61,7 +81,7 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentCtxt<'tcx> {
             let mut has_changed = false;
             for obligation in mem::take(&mut self.obligations) {
                 let goal = obligation.clone().into();
-                let (changed, certainty) = match infcx.evaluate_root_goal(goal) {
+                let (changed, certainty, nested_goals) = match infcx.evaluate_root_goal(goal) {
                     Ok(result) => result,
                     Err(NoSolution) => {
                         errors.push(FulfillmentError {
@@ -73,7 +93,7 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentCtxt<'tcx> {
                                         MismatchedProjectionTypes { err: TypeError::Mismatch },
                                     )
                                 }
-                                ty::PredicateKind::AliasEq(_, _) => {
+                                ty::PredicateKind::AliasRelate(_, _, _) => {
                                     FulfillmentErrorCode::CodeProjectionError(
                                         MismatchedProjectionTypes { err: TypeError::Mismatch },
                                     )
@@ -125,7 +145,16 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentCtxt<'tcx> {
                         continue;
                     }
                 };
-
+                // Push any nested goals that we get from unifying our canonical response
+                // with our obligation onto the fulfillment context.
+                self.obligations.extend(nested_goals.into_iter().map(|goal| {
+                    Obligation::new(
+                        infcx.tcx,
+                        obligation.cause.clone(),
+                        goal.param_env,
+                        goal.predicate,
+                    )
+                }));
                 has_changed |= changed;
                 match certainty {
                     Certainty::Yes => {}
@@ -149,6 +178,6 @@ impl<'tcx> TraitEngine<'tcx> for FulfillmentCtxt<'tcx> {
         &mut self,
         _: &InferCtxt<'tcx>,
     ) -> Vec<PredicateObligation<'tcx>> {
-        unimplemented!()
+        std::mem::take(&mut self.obligations)
     }
 }

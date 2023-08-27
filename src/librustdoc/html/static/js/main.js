@@ -1,19 +1,8 @@
 // Local js definitions:
 /* global addClass, getSettingValue, hasClass, searchState */
-/* global onEach, onEachLazy, removeClass */
+/* global onEach, onEachLazy, removeClass, getVar */
 
 "use strict";
-
-// Get a value from the rustdoc-vars div, which is used to convey data from
-// Rust to the JS. If there is no such element, return null.
-function getVar(name) {
-    const el = document.getElementById("rustdoc-vars");
-    if (el) {
-        return el.attributes["data-" + name].value;
-    } else {
-        return null;
-    }
-}
 
 // Given a basename (e.g. "storage") and an extension (e.g. ".js"), return a URL
 // for a resource under the root-path, with the resource-suffix.
@@ -187,6 +176,15 @@ function loadCss(cssUrl) {
     document.getElementsByTagName("head")[0].appendChild(link);
 }
 
+function preLoadCss(cssUrl) {
+    // https://developer.mozilla.org/en-US/docs/Web/HTML/Link_types/preload
+    const link = document.createElement("link");
+    link.href = cssUrl;
+    link.rel = "preload";
+    link.as = "style";
+    document.getElementsByTagName("head")[0].appendChild(link);
+}
+
 (function() {
     const isHelpPage = window.location.pathname.endsWith("/help.html");
 
@@ -207,6 +205,23 @@ function loadCss(cssUrl) {
         // hopefully be loaded when the JS will generate the settings content.
         loadCss(getVar("static-root-path") + getVar("settings-css"));
         loadScript(getVar("static-root-path") + getVar("settings-js"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-light-css"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-dark-css"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-ayu-css"));
+        // Pre-load all theme CSS files, so that switching feels seamless.
+        //
+        // When loading settings.html as a standalone page, the equivalent HTML is
+        // generated in context.rs.
+        setTimeout(() => {
+            const themes = getVar("themes").split(",");
+            for (const theme of themes) {
+                // if there are no themes, do nothing
+                // "".split(",") == [""]
+                if (theme !== "") {
+                    preLoadCss(getVar("root-path") + theme + ".css");
+                }
+            }
+        }, 0);
     };
 
     window.searchState = {
@@ -311,16 +326,6 @@ function loadCss(cssUrl) {
         },
     };
 
-    function getPageId() {
-        if (window.location.hash) {
-            const tmp = window.location.hash.replace(/^#/, "");
-            if (tmp.length > 0) {
-                return tmp;
-            }
-        }
-        return null;
-    }
-
     const toggleAllDocsId = "toggle-all-docs";
     let savedHash = "";
 
@@ -341,12 +346,12 @@ function loadCss(cssUrl) {
             }
         }
         // This part is used in case an element is not visible.
-        if (savedHash !== window.location.hash) {
-            savedHash = window.location.hash;
-            if (savedHash.length === 0) {
-                return;
+        const pageId = window.location.hash.replace(/^#/, "");
+        if (savedHash !== pageId) {
+            savedHash = pageId;
+            if (pageId !== "") {
+                expandSection(pageId);
             }
-            expandSection(savedHash.slice(1)); // we remove the '#'
         }
     }
 
@@ -685,11 +690,6 @@ function loadCss(cssUrl) {
             }
 
         });
-
-        const pageId = getPageId();
-        if (pageId !== null) {
-            expandSection(pageId);
-        }
     }());
 
     window.rustdoc_add_line_numbers_to_examples = () => {
@@ -725,65 +725,18 @@ function loadCss(cssUrl) {
         window.rustdoc_add_line_numbers_to_examples();
     }
 
-    let oldSidebarScrollPosition = null;
-
-    // Scroll locking used both here and in source-script.js
-
-    window.rustdocMobileScrollLock = function() {
-        const mobile_topbar = document.querySelector(".mobile-topbar");
-        if (window.innerWidth <= window.RUSTDOC_MOBILE_BREAKPOINT) {
-            // This is to keep the scroll position on mobile.
-            oldSidebarScrollPosition = window.scrollY;
-            document.body.style.width = `${document.body.offsetWidth}px`;
-            document.body.style.position = "fixed";
-            document.body.style.top = `-${oldSidebarScrollPosition}px`;
-            if (mobile_topbar) {
-                mobile_topbar.style.top = `${oldSidebarScrollPosition}px`;
-                mobile_topbar.style.position = "relative";
-            }
-        } else {
-            oldSidebarScrollPosition = null;
-        }
-    };
-
-    window.rustdocMobileScrollUnlock = function() {
-        const mobile_topbar = document.querySelector(".mobile-topbar");
-        if (oldSidebarScrollPosition !== null) {
-            // This is to keep the scroll position on mobile.
-            document.body.style.width = "";
-            document.body.style.position = "";
-            document.body.style.top = "";
-            if (mobile_topbar) {
-                mobile_topbar.style.top = "";
-                mobile_topbar.style.position = "";
-            }
-            // The scroll position is lost when resetting the style, hence why we store it in
-            // `oldSidebarScrollPosition`.
-            window.scrollTo(0, oldSidebarScrollPosition);
-            oldSidebarScrollPosition = null;
-        }
-    };
-
     function showSidebar() {
         window.hideAllModals(false);
-        window.rustdocMobileScrollLock();
         const sidebar = document.getElementsByClassName("sidebar")[0];
         addClass(sidebar, "shown");
     }
 
     function hideSidebar() {
-        window.rustdocMobileScrollUnlock();
         const sidebar = document.getElementsByClassName("sidebar")[0];
         removeClass(sidebar, "shown");
     }
 
     window.addEventListener("resize", () => {
-        if (window.innerWidth > window.RUSTDOC_MOBILE_BREAKPOINT &&
-            oldSidebarScrollPosition !== null) {
-            // If the user opens the sidebar in "mobile" mode, and then grows the browser window,
-            // we need to switch away from mobile mode and make the main content area scrollable.
-            hideSidebar();
-        }
         if (window.CURRENT_TOOLTIP_ELEMENT) {
             // As a workaround to the behavior of `contains: layout` used in doc togglers,
             // tooltip popovers are positioned using javascript.
@@ -996,9 +949,7 @@ function loadCss(cssUrl) {
              <code>enum</code>, <code>trait</code>, <code>type</code>, <code>macro</code>, \
              and <code>const</code>.",
             "Search functions by type signature (e.g., <code>vec -&gt; usize</code> or \
-             <code>-&gt; vec</code>)",
-            "Search multiple things at once by splitting your query with comma (e.g., \
-             <code>str,u8</code> or <code>String,struct:Vec,test</code>)",
+             <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
              your request: <code>\"string\"</code>",
             "Look for items inside another one by searching for a path: <code>vec::Vec</code>",

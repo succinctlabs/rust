@@ -9,10 +9,10 @@
 use itertools::{Either, Itertools};
 use rustc_ast::ptr::P;
 use rustc_ast::visit::{self, AssocCtxt, BoundKind, FnCtxt, FnKind, Visitor};
-use rustc_ast::walk_list;
 use rustc_ast::*;
+use rustc_ast::{walk_list, StaticItem};
 use rustc_ast_pretty::pprust::{self, State};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_macros::Subdiagnostic;
 use rustc_parse::validate_attr;
 use rustc_session::lint::builtin::{
@@ -240,16 +240,12 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    fn invalid_visibility(&self, vis: &Visibility, note: Option<errors::InvalidVisibilityNote>) {
+    fn visibility_not_permitted(&self, vis: &Visibility, note: errors::VisibilityNotPermittedNote) {
         if let VisibilityKind::Inherited = vis.kind {
             return;
         }
 
-        self.session.emit_err(errors::InvalidVisibility {
-            span: vis.span,
-            implied: vis.kind.is_pub().then_some(vis.span),
-            note,
-        });
+        self.session.emit_err(errors::VisibilityNotPermitted { span: vis.span, note });
     }
 
     fn check_decl_no_pat(decl: &FnDecl, mut report_err: impl FnMut(Span, Option<Ident>, bool)) {
@@ -643,7 +639,7 @@ fn validate_generic_param_order(
     span: Span,
 ) {
     let mut max_param: Option<ParamKindOrd> = None;
-    let mut out_of_order = FxHashMap::default();
+    let mut out_of_order = FxIndexMap::default();
     let mut param_idents = Vec::with_capacity(generics.len());
 
     for (idx, param) in generics.iter().enumerate() {
@@ -691,7 +687,7 @@ fn validate_generic_param_order(
                 GenericParamKind::Lifetime => (),
                 GenericParamKind::Const { ty: _, kw_span: _, default: Some(default) } => {
                     ordered_params += " = ";
-                    ordered_params += &pprust::expr_to_string(&*default.value);
+                    ordered_params += &pprust::expr_to_string(&default.value);
                 }
                 GenericParamKind::Const { ty: _, kw_span: _, default: None } => (),
             }
@@ -799,11 +795,11 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_item(&mut self, item: &'a Item) {
-        if item.attrs.iter().any(|attr| self.session.is_proc_macro_attr(attr)) {
+        if item.attrs.iter().any(|attr| attr.is_proc_macro_attr()) {
             self.has_proc_macro_decls = true;
         }
 
-        if self.session.contains_name(&item.attrs, sym::no_mangle) {
+        if attr::contains_name(&item.attrs, sym::no_mangle) {
             self.check_nomangle_item_asciionly(item.ident, item.span);
         }
 
@@ -819,7 +815,10 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 items,
             }) => {
                 self.with_in_trait_impl(true, Some(*constness), |this| {
-                    this.invalid_visibility(&item.vis, None);
+                    this.visibility_not_permitted(
+                        &item.vis,
+                        errors::VisibilityNotPermittedNote::TraitImpl,
+                    );
                     if let TyKind::Err = self_ty.kind {
                         this.err_handler().emit_err(errors::ObsoleteAuto { span: item.span });
                     }
@@ -866,9 +865,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         only_trait: only_trait.then_some(()),
                     };
 
-                self.invalid_visibility(
+                self.visibility_not_permitted(
                     &item.vis,
-                    Some(errors::InvalidVisibilityNote::IndividualImplItems),
+                    errors::VisibilityNotPermittedNote::IndividualImplItems,
                 );
                 if let &Unsafe::Yes(span) = unsafety {
                     self.err_handler().emit_err(errors::InherentImplCannotUnsafe {
@@ -924,9 +923,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             }
             ItemKind::ForeignMod(ForeignMod { abi, unsafety, .. }) => {
                 let old_item = mem::replace(&mut self.extern_mod, Some(item));
-                self.invalid_visibility(
+                self.visibility_not_permitted(
                     &item.vis,
-                    Some(errors::InvalidVisibilityNote::IndividualForeignItems),
+                    errors::VisibilityNotPermittedNote::IndividualForeignItems,
                 );
                 if let &Unsafe::Yes(span) = unsafety {
                     self.err_handler().emit_err(errors::UnsafeItem { span, kind: "extern block" });
@@ -940,9 +939,15 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             }
             ItemKind::Enum(def, _) => {
                 for variant in &def.variants {
-                    self.invalid_visibility(&variant.vis, None);
+                    self.visibility_not_permitted(
+                        &variant.vis,
+                        errors::VisibilityNotPermittedNote::EnumVariant,
+                    );
                     for field in variant.data.fields() {
-                        self.invalid_visibility(&field.vis, None);
+                        self.visibility_not_permitted(
+                            &field.vis,
+                            errors::VisibilityNotPermittedNote::EnumVariant,
+                        );
                     }
                 }
             }
@@ -973,7 +978,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 }
                 // Ensure that `path` attributes on modules are recorded as used (cf. issue #35584).
                 if !matches!(mod_kind, ModKind::Loaded(_, Inline::Yes, _))
-                    && !self.session.contains_name(&item.attrs, sym::path)
+                    && !attr::contains_name(&item.attrs, sym::path)
                 {
                     self.check_mod_file_item_asciionly(item.ident);
                 }
@@ -983,14 +988,14 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     self.err_handler().emit_err(errors::FieldlessUnion { span: item.span });
                 }
             }
-            ItemKind::Const(def, .., None) => {
-                self.check_defaultness(item.span, *def);
+            ItemKind::Const(box ConstItem { defaultness, expr: None, .. }) => {
+                self.check_defaultness(item.span, *defaultness);
                 self.session.emit_err(errors::ConstWithoutBody {
                     span: item.span,
                     replace_span: self.ending_semi_or_hi(item.span),
                 });
             }
-            ItemKind::Static(.., None) => {
+            ItemKind::Static(box StaticItem { expr: None, .. }) => {
                 self.session.emit_err(errors::StaticWithoutBody {
                     span: item.span,
                     replace_span: self.ending_semi_or_hi(item.span),
@@ -1248,7 +1253,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_assoc_item(&mut self, item: &'a AssocItem, ctxt: AssocCtxt) {
-        if self.session.contains_name(&item.attrs, sym::no_mangle) {
+        if attr::contains_name(&item.attrs, sym::no_mangle) {
             self.check_nomangle_item_asciionly(item.ident, item.span);
         }
 
@@ -1258,13 +1263,11 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
 
         if ctxt == AssocCtxt::Impl {
             match &item.kind {
-                AssocItemKind::Const(_, _, body) => {
-                    if body.is_none() {
-                        self.session.emit_err(errors::AssocConstWithoutBody {
-                            span: item.span,
-                            replace_span: self.ending_semi_or_hi(item.span),
-                        });
-                    }
+                AssocItemKind::Const(box ConstItem { expr: None, .. }) => {
+                    self.session.emit_err(errors::AssocConstWithoutBody {
+                        span: item.span,
+                        replace_span: self.ending_semi_or_hi(item.span),
+                    });
                 }
                 AssocItemKind::Fn(box Fn { body, .. }) => {
                     if body.is_none() {
@@ -1302,7 +1305,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         }
 
         if ctxt == AssocCtxt::Trait || self.in_trait_impl {
-            self.invalid_visibility(&item.vis, None);
+            self.visibility_not_permitted(&item.vis, errors::VisibilityNotPermittedNote::TraitImpl);
             if let AssocItemKind::Fn(box Fn { sig, .. }) = &item.kind {
                 self.check_trait_fn_not_const(sig.header.constness);
             }
@@ -1392,11 +1395,13 @@ fn deny_equality_constraints(
                                             }
                                         },
                                         empty_args => {
-                                            *empty_args = AngleBracketedArgs {
-                                                span: ident.span,
-                                                args: thin_vec![arg],
-                                            }
-                                            .into();
+                                            *empty_args = Some(
+                                                AngleBracketedArgs {
+                                                    span: ident.span,
+                                                    args: thin_vec![arg],
+                                                }
+                                                .into(),
+                                            );
                                         }
                                     }
                                     err.assoc = Some(errors::AssociatedSuggestion {

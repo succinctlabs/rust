@@ -162,7 +162,7 @@
 pub use StaticFields::*;
 pub use SubstructureFields::*;
 
-use crate::deriving;
+use crate::{deriving, errors};
 use rustc_ast::ptr::P;
 use rustc_ast::{
     self as ast, BindingAnnotation, ByRef, EnumDef, Expr, GenericArg, GenericParamKind, Generics,
@@ -415,7 +415,7 @@ fn find_type_parameters(
         }
 
         fn visit_mac_call(&mut self, mac: &ast::MacCall) {
-            self.cx.span_err(mac.span(), "`derive` cannot be used on items with type macros");
+            self.cx.emit_err(errors::DeriveMacroCall { span: mac.span() });
         }
     }
 
@@ -488,7 +488,7 @@ impl<'a> TraitDef<'a> {
                                 is_packed,
                             )
                         } else {
-                            cx.span_err(mitem.span, "this trait cannot be derived for unions");
+                            cx.emit_err(errors::DeriveUnion { span: mitem.span });
                             return;
                         }
                     }
@@ -1052,6 +1052,7 @@ impl<'a> MethodDef<'a> {
     ///         ::core::hash::Hash::hash(&{ self.y }, state)
     ///     }
     /// }
+    /// ```
     fn expand_struct_method_body<'b>(
         &self,
         cx: &mut ExtCtxt<'_>,

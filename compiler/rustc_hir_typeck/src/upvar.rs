@@ -49,8 +49,7 @@ use rustc_span::{BytePos, Pos, Span, Symbol};
 use rustc_trait_selection::infer::InferCtxtExt;
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_index::vec::Idx;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::FIRST_VARIANT;
 
 use std::iter;
 
@@ -424,7 +423,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // closures. We want to make sure any adjustment that might make us move the place into
                 // the closure gets handled.
                 let (place, capture_kind) =
-                    restrict_precision_for_drop_types(self, place, capture_kind, usage_span);
+                    restrict_precision_for_drop_types(self, place, capture_kind);
 
                 capture_info.capture_kind = capture_kind;
                 (place, capture_info)
@@ -712,10 +711,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
 
-                unreachable!(
-                    "we captured two identical projections: capture1 = {:?}, capture2 = {:?}",
-                    capture1, capture2
+                self.tcx.sess.delay_span_bug(
+                    closure_span,
+                    &format!(
+                        "two identical projections: ({:?}, {:?})",
+                        capture1.place.projections, capture2.place.projections
+                    ),
                 );
+                std::cmp::Ordering::Equal
             });
         }
 
@@ -1402,7 +1405,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         ProjectionKind::Field(..)
                     ))
                 );
-                def.variants().get(VariantIdx::new(0)).unwrap().fields.iter().enumerate().any(
+                def.variants().get(FIRST_VARIANT).unwrap().fields.iter_enumerated().any(
                     |(i, field)| {
                         let paths_using_field = captured_by_move_projs
                             .iter()
@@ -1410,7 +1413,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 if let ProjectionKind::Field(field_idx, _) =
                                     projs.first().unwrap().kind
                                 {
-                                    if (field_idx as usize) == i { Some(&projs[1..]) } else { None }
+                                    if field_idx == i { Some(&projs[1..]) } else { None }
                                 } else {
                                     unreachable!();
                                 }
@@ -1443,7 +1446,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .filter_map(|projs| {
                             if let ProjectionKind::Field(field_idx, _) = projs.first().unwrap().kind
                             {
-                                if (field_idx as usize) == i { Some(&projs[1..]) } else { None }
+                                if field_idx.index() == i { Some(&projs[1..]) } else { None }
                             } else {
                                 unreachable!();
                             }
@@ -1498,7 +1501,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     fn should_log_capture_analysis(&self, closure_def_id: LocalDefId) -> bool {
-        self.tcx.has_attr(closure_def_id.to_def_id(), sym::rustc_capture_analysis)
+        self.tcx.has_attr(closure_def_id, sym::rustc_capture_analysis)
     }
 
     fn log_capture_analysis_first_pass(
@@ -1822,9 +1825,8 @@ fn restrict_precision_for_drop_types<'a, 'tcx>(
     fcx: &'a FnCtxt<'a, 'tcx>,
     mut place: Place<'tcx>,
     mut curr_mode: ty::UpvarCapture,
-    span: Span,
 ) -> (Place<'tcx>, ty::UpvarCapture) {
-    let is_copy_type = fcx.infcx.type_is_copy_modulo_regions(fcx.param_env, place.ty(), span);
+    let is_copy_type = fcx.infcx.type_is_copy_modulo_regions(fcx.param_env, place.ty());
 
     if let (false, UpvarCapture::ByValue) = (is_copy_type, curr_mode) {
         for i in 0..place.projections.len() {
@@ -1891,14 +1893,13 @@ fn restrict_capture_precision(
 
     for (i, proj) in place.projections.iter().enumerate() {
         match proj.kind {
-            ProjectionKind::Index => {
-                // Arrays are completely captured, so we drop Index projections
+            ProjectionKind::Index | ProjectionKind::Subslice => {
+                // Arrays are completely captured, so we drop Index and Subslice projections
                 truncate_place_to_len_and_update_capture_kind(&mut place, &mut curr_mode, i);
                 return (place, curr_mode);
             }
             ProjectionKind::Deref => {}
             ProjectionKind::Field(..) => {} // ignore
-            ProjectionKind::Subslice => {}  // We never capture this
         }
     }
 

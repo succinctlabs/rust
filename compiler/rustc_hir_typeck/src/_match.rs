@@ -299,7 +299,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             {
                 // check that the `if` expr without `else` is the fn body's expr
                 if expr.span == sp {
-                    return self.get_fn_decl(hir_id).and_then(|(fn_decl, _)| {
+                    return self.get_fn_decl(hir_id).and_then(|(_, fn_decl, _)| {
                         let span = fn_decl.output.span();
                         let snippet = self.tcx.sess.source_map().span_to_snippet(span).ok()?;
                         Some((span, format!("expected `{snippet}` because of this return type")))
@@ -538,8 +538,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 // FIXME(rpitit): This will need to be fixed when we move to associated types
                                 assert!(matches!(
                                     *trait_pred.trait_ref.self_ty().kind(),
-                                    ty::Alias(_, ty::AliasTy { def_id, substs, .. })
-                                    if def_id == rpit_def_id && substs == substs
+                                    ty::Alias(_, ty::AliasTy { def_id, substs: alias_substs, .. })
+                                    if def_id == rpit_def_id && substs == alias_substs
                                 ));
                                 ty::PredicateKind::Clause(ty::Clause::Trait(
                                     trait_pred.with_self_ty(self.tcx, ty),
@@ -548,8 +548,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             ty::PredicateKind::Clause(ty::Clause::Projection(mut proj_pred)) => {
                                 assert!(matches!(
                                     *proj_pred.projection_ty.self_ty().kind(),
-                                    ty::Alias(_, ty::AliasTy { def_id, substs, .. })
-                                    if def_id == rpit_def_id && substs == substs
+                                    ty::Alias(_, ty::AliasTy { def_id, substs: alias_substs, .. })
+                                    if def_id == rpit_def_id && substs == alias_substs
                                 ));
                                 proj_pred = proj_pred.with_self_ty(self.tcx, ty);
                                 ty::PredicateKind::Clause(ty::Clause::Projection(proj_pred))

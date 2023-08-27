@@ -19,13 +19,13 @@ use rustc_hir_analysis::astconv::{
 };
 use rustc_infer::infer::canonical::{Canonical, OriginalQueryValues, QueryResponse};
 use rustc_infer::infer::error_reporting::TypeAnnotationNeeded::E0282;
-use rustc_infer::infer::InferResult;
+use rustc_infer::infer::{DefineOpaqueTypes, InferResult};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, AutoBorrowMutability};
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::visit::{TypeVisitable, TypeVisitableExt};
 use rustc_middle::ty::{
-    self, AdtKind, CanonicalUserType, DefIdTree, GenericParamDefKind, Ty, TyCtxt, UserType,
+    self, AdtKind, CanonicalUserType, GenericParamDefKind, Ty, TyCtxt, UserType,
 };
 use rustc_middle::ty::{GenericArgKind, SubstsRef, UserSelfTy, UserSubsts};
 use rustc_session::lint;
@@ -33,6 +33,7 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::Span;
+use rustc_target::abi::FieldIdx;
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
 use rustc_trait_selection::traits::{self, NormalizeExt, ObligationCauseCode, ObligationCtxt};
 
@@ -147,7 +148,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    pub fn write_field_index(&self, hir_id: hir::HirId, index: usize) {
+    pub fn write_field_index(&self, hir_id: hir::HirId, index: FieldIdx) {
         self.typeck_results.borrow_mut().field_indices_mut().insert(hir_id, index);
     }
 
@@ -301,16 +302,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
         def_id: DefId,
         substs: SubstsRef<'tcx>,
-    ) -> (ty::InstantiatedPredicates<'tcx>, Vec<Span>) {
+    ) -> ty::InstantiatedPredicates<'tcx> {
         let bounds = self.tcx.predicates_of(def_id);
-        let spans: Vec<Span> = bounds.predicates.iter().map(|(_, span)| *span).collect();
         let result = bounds.instantiate(self.tcx, substs);
         let result = self.normalize(span, result);
-        debug!(
-            "instantiate_bounds(bounds={:?}, substs={:?}) = {:?}, {:?}",
-            bounds, substs, result, spans,
-        );
-        (result, spans)
+        debug!("instantiate_bounds(bounds={:?}, substs={:?}) = {:?}", bounds, substs, result);
+        result
     }
 
     pub(in super::super) fn normalize<T>(&self, span: Span, value: T) -> T
@@ -562,7 +559,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let span = self.tcx.hir().body(body_id).value.span;
             let ok = self
                 .at(&self.misc(span), self.param_env)
-                .eq(interior, witness)
+                .eq(DefineOpaqueTypes::No, interior, witness)
                 .expect("Failed to unify generator interior type");
             let mut obligations = ok.obligations;
 
@@ -581,11 +578,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     pub(in super::super) fn report_ambiguity_errors(&self) {
-        let mut errors = self.fulfillment_cx.borrow_mut().collect_remaining_errors();
+        let mut errors = self.fulfillment_cx.borrow_mut().collect_remaining_errors(self);
 
         if !errors.is_empty() {
             self.adjust_fulfillment_errors_for_expr_obligation(&mut errors);
-            self.err_ctxt().report_fulfillment_errors(&errors, self.inh.body_id);
+            self.err_ctxt().report_fulfillment_errors(&errors);
         }
     }
 
@@ -598,7 +595,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if !result.is_empty() {
             mutate_fulfillment_errors(&mut result);
             self.adjust_fulfillment_errors_for_expr_obligation(&mut result);
-            self.err_ctxt().report_fulfillment_errors(&result, self.inh.body_id);
+            self.err_ctxt().report_fulfillment_errors(&result);
         }
     }
 
@@ -670,7 +667,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 | ty::PredicateKind::Clause(ty::Clause::TypeOutlives(..))
                 | ty::PredicateKind::WellFormed(..)
                 | ty::PredicateKind::ObjectSafe(..)
-                | ty::PredicateKind::AliasEq(..)
+                | ty::PredicateKind::AliasRelate(..)
                 | ty::PredicateKind::ConstEvaluatable(..)
                 | ty::PredicateKind::ConstEquate(..)
                 // N.B., this predicate is created by breaking down a
@@ -902,56 +899,74 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         )
     }
 
-    /// Given a function `Node`, return its `FnDecl` if it exists, or `None` otherwise.
+    /// Given a function `Node`, return its  `HirId` and `FnDecl` if it exists. Given a closure
+    /// that is the child of a function, return that function's `HirId` and `FnDecl` instead.
+    /// This may seem confusing at first, but this is used in diagnostics for `async fn`,
+    /// for example, where most of the type checking actually happens within a nested closure,
+    /// but we often want access to the parent function's signature.
+    ///
+    /// Otherwise, return false.
     pub(in super::super) fn get_node_fn_decl(
         &self,
         node: Node<'tcx>,
-    ) -> Option<(&'tcx hir::FnDecl<'tcx>, Ident, bool)> {
+    ) -> Option<(hir::HirId, &'tcx hir::FnDecl<'tcx>, Ident, bool)> {
         match node {
-            Node::Item(&hir::Item { ident, kind: hir::ItemKind::Fn(ref sig, ..), .. }) => {
+            Node::Item(&hir::Item {
+                ident,
+                kind: hir::ItemKind::Fn(ref sig, ..),
+                owner_id,
+                ..
+            }) => {
                 // This is less than ideal, it will not suggest a return type span on any
                 // method called `main`, regardless of whether it is actually the entry point,
                 // but it will still present it as the reason for the expected type.
-                Some((&sig.decl, ident, ident.name != sym::main))
+                Some((
+                    hir::HirId::make_owner(owner_id.def_id),
+                    &sig.decl,
+                    ident,
+                    ident.name != sym::main,
+                ))
             }
             Node::TraitItem(&hir::TraitItem {
                 ident,
                 kind: hir::TraitItemKind::Fn(ref sig, ..),
+                owner_id,
                 ..
-            }) => Some((&sig.decl, ident, true)),
+            }) => Some((hir::HirId::make_owner(owner_id.def_id), &sig.decl, ident, true)),
             Node::ImplItem(&hir::ImplItem {
                 ident,
                 kind: hir::ImplItemKind::Fn(ref sig, ..),
+                owner_id,
                 ..
-            }) => Some((&sig.decl, ident, false)),
-            Node::Expr(&hir::Expr {
-                hir_id,
-                kind: hir::ExprKind::Closure(..),
-                ..
-            }) if let Some(Node::Expr(&hir::Expr {
-                hir_id,
-                kind: hir::ExprKind::Call(..),
-                ..
-            })) = self.tcx.hir().find_parent(hir_id) &&
-            let Some(Node::Item(&hir::Item {
+            }) => Some((hir::HirId::make_owner(owner_id.def_id), &sig.decl, ident, false)),
+            Node::Expr(&hir::Expr { hir_id, kind: hir::ExprKind::Closure(..), .. })
+                if let Some(Node::Item(&hir::Item {
+                    ident,
+                    kind: hir::ItemKind::Fn(ref sig, ..),
+                    owner_id,
+                    ..
+                })) = self.tcx.hir().find_parent(hir_id) => Some((
+                hir::HirId::make_owner(owner_id.def_id),
+                &sig.decl,
                 ident,
-                kind: hir::ItemKind::Fn(ref sig, ..),
-                ..
-            })) = self.tcx.hir().find_parent(hir_id) => {
-                Some((&sig.decl, ident, ident.name != sym::main))
-            },
+                ident.name != sym::main,
+            )),
             _ => None,
         }
     }
 
-    /// Given a `HirId`, return the `FnDecl` of the method it is enclosed by and whether a
+    /// Given a `HirId`, return the `HirId` of the enclosing function, its `FnDecl`, and whether a
     /// suggestion can be made, `None` otherwise.
-    pub fn get_fn_decl(&self, blk_id: hir::HirId) -> Option<(&'tcx hir::FnDecl<'tcx>, bool)> {
+    pub fn get_fn_decl(
+        &self,
+        blk_id: hir::HirId,
+    ) -> Option<(hir::HirId, &'tcx hir::FnDecl<'tcx>, bool)> {
         // Get enclosing Fn, if it is a function or a trait method, unless there's a `loop` or
         // `while` before reaching it, as block tail returns are not available in them.
         self.tcx.hir().get_return_block(blk_id).and_then(|blk_id| {
             let parent = self.tcx.hir().get(blk_id);
-            self.get_node_fn_decl(parent).map(|(fn_decl, _, is_main)| (fn_decl, is_main))
+            self.get_node_fn_decl(parent)
+                .map(|(fn_id, fn_decl, _, is_main)| (fn_id, fn_decl, is_main))
         })
     }
 
@@ -959,44 +974,75 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         err: &mut Diagnostic,
         expr: &hir::Expr<'_>,
-        expected: Ty<'tcx>,
+        expected: Option<Ty<'tcx>>,
         found: Ty<'tcx>,
     ) {
         if found != self.tcx.types.unit {
             return;
         }
-        if let ExprKind::MethodCall(path_segment, rcvr, ..) = expr.kind {
-            if self
-                .typeck_results
+
+        let ExprKind::MethodCall(path_segment, rcvr, ..) = expr.kind else {
+            return;
+        };
+
+        let rcvr_has_the_expected_type = self
+            .typeck_results
+            .borrow()
+            .expr_ty_adjusted_opt(rcvr)
+            .and_then(|ty| expected.map(|expected_ty| expected_ty.peel_refs() == ty.peel_refs()))
+            .unwrap_or(false);
+
+        let prev_call_mutates_and_returns_unit = || {
+            self.typeck_results
                 .borrow()
-                .expr_ty_adjusted_opt(rcvr)
-                .map_or(true, |ty| expected.peel_refs() != ty.peel_refs())
-            {
-                return;
-            }
-            let mut sp = MultiSpan::from_span(path_segment.ident.span);
-            sp.push_span_label(
-                path_segment.ident.span,
-                format!(
-                    "this call modifies {} in-place",
-                    match rcvr.kind {
-                        ExprKind::Path(QPath::Resolved(
-                            None,
-                            hir::Path { segments: [segment], .. },
-                        )) => format!("`{}`", segment.ident),
-                        _ => "its receiver".to_string(),
-                    }
-                ),
-            );
+                .type_dependent_def_id(expr.hir_id)
+                .map(|def_id| self.tcx.fn_sig(def_id).skip_binder().skip_binder())
+                .and_then(|sig| sig.inputs_and_output.split_last())
+                .map(|(output, inputs)| {
+                    output.is_unit()
+                        && inputs
+                            .get(0)
+                            .and_then(|self_ty| self_ty.ref_mutability())
+                            .map_or(false, rustc_ast::Mutability::is_mut)
+                })
+                .unwrap_or(false)
+        };
+
+        if !(rcvr_has_the_expected_type || prev_call_mutates_and_returns_unit()) {
+            return;
+        }
+
+        let mut sp = MultiSpan::from_span(path_segment.ident.span);
+        sp.push_span_label(
+            path_segment.ident.span,
+            format!(
+                "this call modifies {} in-place",
+                match rcvr.kind {
+                    ExprKind::Path(QPath::Resolved(
+                        None,
+                        hir::Path { segments: [segment], .. },
+                    )) => format!("`{}`", segment.ident),
+                    _ => "its receiver".to_string(),
+                }
+            ),
+        );
+
+        let modifies_rcvr_note =
+            format!("method `{}` modifies its receiver in-place", path_segment.ident);
+        if rcvr_has_the_expected_type {
             sp.push_span_label(
                 rcvr.span,
                 "you probably want to use this value after calling the method...",
             );
+            err.span_note(sp, &modifies_rcvr_note);
+            err.note(&format!("...instead of the `()` output of method `{}`", path_segment.ident));
+        } else if let ExprKind::MethodCall(..) = rcvr.kind {
             err.span_note(
                 sp,
-                &format!("method `{}` modifies its receiver in-place", path_segment.ident),
+                modifies_rcvr_note.clone() + ", it is not meant to be used in method chains.",
             );
-            err.note(&format!("...instead of the `()` output of method `{}`", path_segment.ident));
+        } else {
+            err.span_note(sp, &modifies_rcvr_note);
         }
     }
 
@@ -1319,7 +1365,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // This also occurs for an enum variant on a type alias.
             let impl_ty = self.normalize(span, tcx.type_of(impl_def_id).subst(tcx, substs));
             let self_ty = self.normalize(span, self_ty);
-            match self.at(&self.misc(span), self.param_env).eq(impl_ty, self_ty) {
+            match self.at(&self.misc(span), self.param_env).eq(
+                DefineOpaqueTypes::No,
+                impl_ty,
+                self_ty,
+            ) {
                 Ok(ok) => self.register_infer_ok_obligations(ok),
                 Err(_) => {
                     self.tcx.sess.delay_span_bug(
@@ -1367,41 +1417,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) {
         let param_env = self.param_env;
 
-        let remap = match self.tcx.def_kind(def_id) {
-            // Associated consts have `Self: ~const Trait` bounds that should be satisfiable when
-            // `Self: Trait` is satisfied because it does not matter whether the impl is `const`.
-            // Therefore we have to remap the param env here to be non-const.
-            hir::def::DefKind::AssocConst => true,
-            hir::def::DefKind::AssocFn
-                if self.tcx.def_kind(self.tcx.parent(def_id)) == hir::def::DefKind::Trait =>
-            {
-                // N.B.: All callsites to this function involve checking a path expression.
-                //
-                // When instantiating a trait method as a function item, it does not actually matter whether
-                // the trait is `const` or not, or whether `where T: ~const Tr` needs to be satisfied as
-                // `const`. If we were to introduce instantiating trait methods as `const fn`s, we would
-                // check that after this, either via a bound `where F: ~const FnOnce` or when coercing to a
-                // `const fn` pointer.
-                //
-                // FIXME(fee1-dead) FIXME(const_trait_impl): update this doc when trait methods can satisfy
-                // `~const FnOnce` or can be coerced to `const fn` pointer.
-                true
-            }
-            _ => false,
-        };
-        let (bounds, _) = self.instantiate_bounds(span, def_id, &substs);
+        let bounds = self.instantiate_bounds(span, def_id, &substs);
 
-        for mut obligation in traits::predicates_for_generics(
+        for obligation in traits::predicates_for_generics(
             |idx, predicate_span| {
                 traits::ObligationCause::new(span, self.body_id, code(idx, predicate_span))
             },
             param_env,
             bounds,
         ) {
-            if remap {
-                obligation = obligation.without_const(self.tcx);
-            }
-            self.register_predicate(obligation);
+            // N.B. We are remapping all predicates to non-const since we don't know if we just
+            // want them as function pointers or we are calling them from a const-context. The
+            // actual checking will occur in `rustc_const_eval::transform::check_consts`.
+            self.register_predicate(obligation.without_const(self.tcx));
         }
     }
 
@@ -1415,7 +1443,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         } else {
             let e = self.tainted_by_errors().unwrap_or_else(|| {
                 self.err_ctxt()
-                    .emit_inference_failure_err((**self).body_id, sp, ty.into(), E0282, true)
+                    .emit_inference_failure_err(self.body_id, sp, ty.into(), E0282, true)
                     .emit()
             });
             let err = self.tcx.ty_error(e);

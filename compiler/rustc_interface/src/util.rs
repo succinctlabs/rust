@@ -34,7 +34,7 @@ pub type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
 /// specific features (SSE, NEON etc.).
 ///
 /// This is performed by checking whether a set of permitted features
-/// is available on the target machine, by querying LLVM.
+/// is available on the target machine, by querying the codegen backend.
 pub fn add_configuration(
     cfg: &mut CrateConfig,
     sess: &mut Session,
@@ -110,7 +110,7 @@ pub fn create_session(
     add_configuration(&mut cfg, &mut sess, &*codegen_backend);
 
     let mut check_cfg = config::to_crate_check_config(check_cfg);
-    check_cfg.fill_well_known();
+    check_cfg.fill_well_known(&sess.target);
 
     sess.parse_sess.config = cfg;
     sess.parse_sess.check_config = check_cfg;
@@ -183,7 +183,7 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
                     .try_collect_active_jobs()
                     .expect("active jobs shouldn't be locked in deadlock handler")
             });
-            let registry = rustc_rayon_core::Registry::current();
+            let registry = rayon_core::Registry::current();
             thread::spawn(move || deadlock(query_map, &registry));
         });
     if let Some(size) = get_stack_size() {
@@ -505,7 +505,7 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
                 .opts
                 .crate_name
                 .clone()
-                .or_else(|| rustc_attr::find_crate_name(sess, attrs).map(|n| n.to_string()))
+                .or_else(|| rustc_attr::find_crate_name(attrs).map(|n| n.to_string()))
                 .unwrap_or_else(|| sess.io.input.filestem().to_owned());
 
             OutputFilenames::new(

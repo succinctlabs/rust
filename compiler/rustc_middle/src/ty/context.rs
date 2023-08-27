@@ -8,26 +8,26 @@ use crate::arena::Arena;
 use crate::dep_graph::{DepGraph, DepKindStruct};
 use crate::infer::canonical::CanonicalVarInfo;
 use crate::lint::struct_lint_level;
+use crate::metadata::ModChild;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrs;
 use crate::middle::resolve_bound_vars;
 use crate::middle::stability;
 use crate::mir::interpret::{self, Allocation, ConstAllocation};
-use crate::mir::{
-    Body, BorrowCheckResult, Field, Local, Place, PlaceElem, ProjectionKind, Promoted,
-};
+use crate::mir::{Body, BorrowCheckResult, Local, Place, PlaceElem, ProjectionKind, Promoted};
+use crate::query::LocalCrate;
 use crate::thir::Thir;
 use crate::traits;
+use crate::traits::solve;
 use crate::traits::solve::{ExternalConstraints, ExternalConstraintsData};
 use crate::ty::query::{self, TyCtxtAt};
 use crate::ty::{
-    self, AdtDef, AdtDefData, AdtKind, Binder, Const, ConstData, DefIdTree, FloatTy, FloatVar,
-    FloatVid, GenericParamDefKind, ImplPolarity, InferTy, IntTy, IntVar, IntVid, List, ParamConst,
-    ParamTy, PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind, Region, RegionKind,
-    ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVar, TyVid, TypeAndMut, TypeckResults, UintTy,
-    Visibility,
+    self, AdtDef, AdtDefData, AdtKind, Binder, Const, ConstData, FloatTy, FloatVar, FloatVid,
+    GenericParamDefKind, ImplPolarity, InferTy, IntTy, IntVar, IntVid, List, ParamConst, ParamTy,
+    PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind, Region, RegionKind, ReprOptions,
+    TraitObjectVisitor, Ty, TyKind, TyVar, TyVid, TypeAndMut, TypeckResults, UintTy, Visibility,
 };
 use crate::ty::{GenericArg, InternalSubsts, SubstsRef};
-use rustc_ast as ast;
+use rustc_ast::{self as ast, attr};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::intern::Interned;
@@ -37,6 +37,7 @@ use rustc_data_structures::sharded::{IntoPointer, ShardedHashMap};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{self, Lock, Lrc, MappedReadGuard, ReadGuard, WorkerLocal};
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::{
     DecorateLint, DiagnosticBuilder, DiagnosticMessage, ErrorGuaranteed, MultiSpan,
 };
@@ -63,13 +64,14 @@ use rustc_span::def_id::{DefPathHash, StableCrateId};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
-use rustc_target::abi::{Layout, LayoutS, TargetDataLayout, VariantIdx};
+use rustc_target::abi::{FieldIdx, Layout, LayoutS, TargetDataLayout, VariantIdx};
 use rustc_target::spec::abi;
 use rustc_type_ir::sty::TyKind::*;
 use rustc_type_ir::WithCachedTypeInfo;
 use rustc_type_ir::{CollectAndApply, DynKind, Interner, TypeFlags};
 
 use std::any::Any;
+use std::assert_matches::debug_assert_matches;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt;
@@ -310,7 +312,7 @@ pub struct CommonLifetimes<'tcx> {
     pub re_vars: Vec<Region<'tcx>>,
 
     /// Pre-interned values of the form:
-    /// `ReLateBound(DebruijnIndex(i), BoundRegion { var: v, kind: BrAnon(v, None) })`
+    /// `ReLateBound(DebruijnIndex(i), BoundRegion { var: v, kind: BrAnon(None) })`
     /// for small values of `i` and `v`.
     pub re_late_bounds: Vec<Vec<Region<'tcx>>>,
 }
@@ -385,10 +387,7 @@ impl<'tcx> CommonLifetimes<'tcx> {
                     .map(|v| {
                         mk(ty::ReLateBound(
                             ty::DebruijnIndex::from(i),
-                            ty::BoundRegion {
-                                var: ty::BoundVar::from(v),
-                                kind: ty::BrAnon(v, None),
-                            },
+                            ty::BoundRegion { var: ty::BoundVar::from(v), kind: ty::BrAnon(None) },
                         ))
                     })
                     .collect()
@@ -536,6 +535,9 @@ pub struct GlobalCtxt<'tcx> {
     /// for things that do not have to do with the parameters in scope.
     /// Merge this with `selection_cache`?
     pub evaluation_cache: traits::EvaluationCache<'tcx>,
+
+    /// Caches the results of goal evaluation in the new solver.
+    pub new_solver_evaluation_cache: solve::EvaluationCache<'tcx>,
 
     /// Data layout specification for the current target.
     pub data_layout: TargetDataLayout,
@@ -712,6 +714,7 @@ impl<'tcx> TyCtxt<'tcx> {
             pred_rcache: Default::default(),
             selection_cache: Default::default(),
             evaluation_cache: Default::default(),
+            new_solver_evaluation_cache: Default::default(),
             data_layout,
             alloc_map: Lock::new(interpret::AllocMap::new()),
         }
@@ -922,7 +925,7 @@ impl<'tcx> TyCtxt<'tcx> {
             crate_name,
             // Don't print the whole stable crate id. That's just
             // annoying in debug output.
-            stable_crate_id.to_u64() >> 8 * 6,
+            stable_crate_id.to_u64() >> (8 * 6),
             self.def_path(def_id).to_string_no_crate_verbose()
         )
     }
@@ -2044,6 +2047,12 @@ impl<'tcx> TyCtxt<'tcx> {
 
     #[inline]
     pub fn mk_alias(self, kind: ty::AliasKind, alias_ty: ty::AliasTy<'tcx>) -> Ty<'tcx> {
+        debug_assert_matches!(
+            (kind, self.def_kind(alias_ty.def_id)),
+            (ty::Opaque, DefKind::OpaqueTy)
+                | (ty::Projection, DefKind::AssocTy)
+                | (ty::Opaque | ty::Projection, DefKind::ImplTraitPlaceholder)
+        );
         self.mk_ty_from_kind(Alias(kind, alias_ty))
     }
 
@@ -2064,10 +2073,9 @@ impl<'tcx> TyCtxt<'tcx> {
         bound_region: ty::BoundRegion,
     ) -> Region<'tcx> {
         // Use a pre-interned one when possible.
-        if let ty::BoundRegion { var, kind: ty::BrAnon(v, None) } = bound_region
-            && var.as_u32() == v
+        if let ty::BoundRegion { var, kind: ty::BrAnon(None) } = bound_region
             && let Some(inner) = self.lifetimes.re_late_bounds.get(debruijn.as_usize())
-            && let Some(re) = inner.get(v as usize).copied()
+            && let Some(re) = inner.get(var.as_usize()).copied()
         {
             re
         } else {
@@ -2112,7 +2120,7 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    pub fn mk_place_field(self, place: Place<'tcx>, f: Field, ty: Ty<'tcx>) -> Place<'tcx> {
+    pub fn mk_place_field(self, place: Place<'tcx>, f: FieldIdx, ty: Ty<'tcx>) -> Place<'tcx> {
         self.mk_place_elem(place, PlaceElem::Field(f, ty))
     }
 
@@ -2372,7 +2380,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn in_scope_traits(self, id: HirId) -> Option<&'tcx [TraitCandidate]> {
         let map = self.in_scope_traits_map(id.owner)?;
         let candidates = map.get(&id.local_id)?;
-        Some(&*candidates)
+        Some(candidates)
     }
 
     pub fn named_bound_var(self, id: HirId) -> Option<resolve_bound_vars::ResolvedArg> {
@@ -2440,6 +2448,40 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn trait_solver_next(self) -> bool {
         self.sess.opts.unstable_opts.trait_solver == rustc_session::config::TraitSolver::Next
     }
+
+    pub fn lower_impl_trait_in_trait_to_assoc_ty(self) -> bool {
+        self.sess.opts.unstable_opts.lower_impl_trait_in_trait_to_assoc_ty
+    }
+
+    pub fn is_impl_trait_in_trait(self, def_id: DefId) -> bool {
+        if self.lower_impl_trait_in_trait_to_assoc_ty() {
+            self.opt_rpitit_info(def_id).is_some()
+        } else {
+            self.def_kind(def_id) == DefKind::ImplTraitPlaceholder
+        }
+    }
+
+    /// Named module children from all items except `use` and `extern crate` imports.
+    ///
+    /// In addition to regular items this list also includes struct or variant constructors, and
+    /// items inside `extern {}` blocks because all of them introduce names into parent module.
+    /// For non-reexported children every such name is associated with a separate `DefId`.
+    ///
+    /// Module here is understood in name resolution sense - it can be a `mod` item,
+    /// or a crate root, or an enum, or a trait.
+    pub fn module_children_non_reexports(self, def_id: LocalDefId) -> &'tcx [LocalDefId] {
+        self.resolutions(()).module_children_non_reexports.get(&def_id).map_or(&[], |v| &v[..])
+    }
+
+    /// Named module children from `use` and `extern crate` imports.
+    ///
+    /// Reexported names are not associated with individual `DefId`s,
+    /// e.g. a glob import can introduce a lot of names, all with the same `DefId`.
+    /// That's why the list needs to contain `ModChild` structures describing all the names
+    /// individually instead of `DefId`s.
+    pub fn module_children_reexports(self, def_id: LocalDefId) -> &'tcx [ModChild] {
+        self.resolutions(()).module_children_reexports.get(&def_id).map_or(&[], |v| &v[..])
+    }
 }
 
 impl<'tcx> TyCtxtAt<'tcx> {
@@ -2482,26 +2524,21 @@ pub struct DeducedParamAttrs {
 }
 
 pub fn provide(providers: &mut ty::query::Providers) {
-    providers.module_reexports =
-        |tcx, id| tcx.resolutions(()).reexport_map.get(&id).map(|v| &v[..]);
     providers.maybe_unused_trait_imports =
         |tcx, ()| &tcx.resolutions(()).maybe_unused_trait_imports;
     providers.names_imported_by_glob_use = |tcx, id| {
-        tcx.arena.alloc(tcx.resolutions(()).glob_map.get(&id).cloned().unwrap_or_default())
+        tcx.arena.alloc(UnordSet::from(
+            tcx.resolutions(()).glob_map.get(&id).cloned().unwrap_or_default(),
+        ))
     };
 
     providers.extern_mod_stmt_cnum =
         |tcx, id| tcx.resolutions(()).extern_crate_map.get(&id).cloned();
-    providers.is_panic_runtime = |tcx, cnum| {
-        assert_eq!(cnum, LOCAL_CRATE);
-        tcx.sess.contains_name(tcx.hir().krate_attrs(), sym::panic_runtime)
-    };
-    providers.is_compiler_builtins = |tcx, cnum| {
-        assert_eq!(cnum, LOCAL_CRATE);
-        tcx.sess.contains_name(tcx.hir().krate_attrs(), sym::compiler_builtins)
-    };
-    providers.has_panic_handler = |tcx, cnum| {
-        assert_eq!(cnum, LOCAL_CRATE);
+    providers.is_panic_runtime =
+        |tcx, LocalCrate| attr::contains_name(tcx.hir().krate_attrs(), sym::panic_runtime);
+    providers.is_compiler_builtins =
+        |tcx, LocalCrate| attr::contains_name(tcx.hir().krate_attrs(), sym::compiler_builtins);
+    providers.has_panic_handler = |tcx, LocalCrate| {
         // We want to check if the panic handler was defined in this crate
         tcx.lang_items().panic_impl().map_or(false, |did| did.is_local())
     };

@@ -4,7 +4,7 @@
 //! to help with the tedium.
 
 use crate::mir::interpret;
-use crate::mir::{Field, ProjectionKind};
+use crate::mir::ProjectionKind;
 use crate::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable};
 use crate::ty::print::{with_no_trimmed_paths, FmtPrinter, Printer};
 use crate::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
@@ -68,7 +68,7 @@ impl<'tcx> fmt::Debug for ty::adjustment::Adjustment<'tcx> {
 impl fmt::Debug for ty::BoundRegionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ty::BrAnon(n, span) => write!(f, "BrAnon({n:?}, {span:?})"),
+            ty::BrAnon(span) => write!(f, "BrAnon({span:?})"),
             ty::BrNamed(did, name) => {
                 if did.is_crate_root() {
                     write!(f, "BrNamed({})", name)
@@ -177,7 +177,9 @@ impl<'tcx> fmt::Debug for ty::PredicateKind<'tcx> {
                 write!(f, "TypeWellFormedFromEnv({:?})", ty)
             }
             ty::PredicateKind::Ambiguous => write!(f, "Ambiguous"),
-            ty::PredicateKind::AliasEq(t1, t2) => write!(f, "AliasEq({t1:?}, {t2:?})"),
+            ty::PredicateKind::AliasRelate(t1, t2, dir) => {
+                write!(f, "AliasRelate({t1:?}, {dir:?}, {t2:?})")
+            }
         }
     }
 }
@@ -215,6 +217,7 @@ CloneLiftImpls! {
 // implementation and traversal implementations (the latter only for
 // TyCtxt<'_> interners).
 TrivialTypeTraversalAndLiftImpls! {
+    ::rustc_target::abi::FieldIdx,
     ::rustc_target::abi::VariantIdx,
     crate::middle::region::Scope,
     crate::ty::FloatTy,
@@ -250,8 +253,9 @@ TrivialTypeTraversalAndLiftImpls! {
     crate::ty::AssocItem,
     crate::ty::AssocKind,
     crate::ty::AliasKind,
-    crate::ty::Placeholder<crate::ty::BoundRegionKind>,
-    crate::ty::Placeholder<crate::ty::BoundTyKind>,
+    crate::ty::AliasRelationDirection,
+    crate::ty::Placeholder<crate::ty::BoundRegion>,
+    crate::ty::Placeholder<crate::ty::BoundTy>,
     crate::ty::ClosureKind,
     crate::ty::FreeRegion,
     crate::ty::InferTy,
@@ -265,7 +269,6 @@ TrivialTypeTraversalAndLiftImpls! {
     ::rustc_span::Span,
     ::rustc_span::symbol::Ident,
     ::rustc_errors::ErrorGuaranteed,
-    Field,
     interpret::Scalar,
     rustc_target::abi::Size,
     ty::BoundVar,

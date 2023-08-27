@@ -22,7 +22,6 @@ use rustc_hir::def::{self, CtorKind, DefKind, LifetimeRes, PartialRes, PerNS};
 use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_hir::{BindingAnnotation, PrimTy, TraitCandidate};
 use rustc_middle::middle::resolve_bound_vars::Set1;
-use rustc_middle::ty::DefIdTree;
 use rustc_middle::{bug, span_bug};
 use rustc_session::config::{CrateType, ResolveDocLinks};
 use rustc_session::lint;
@@ -121,6 +120,12 @@ impl ConstantHasGenerics {
 pub(crate) enum ConstantItemKind {
     Const,
     Static,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum RecordPartialRes {
+    Yes,
+    No,
 }
 
 /// The rib kind restricts certain accesses,
@@ -591,10 +596,9 @@ struct LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
     parent_scope: ParentScope<'a>,
 
     /// The current set of local scopes for types and values.
-    /// FIXME #4948: Reuse ribs to avoid allocation.
     ribs: PerNS<Vec<Rib<'a>>>,
 
-    /// Previous poped `rib`, only used for diagnostic.
+    /// Previous popped `rib`, only used for diagnostic.
     last_block_rib: Option<Rib<'a>>,
 
     /// The current set of local scopes, for labels.
@@ -1219,7 +1223,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             lifetime_ribs: Vec::new(),
             lifetime_elision_candidates: None,
             current_trait_ref: None,
-            diagnostic_metadata: Box::new(DiagnosticMetadata::default()),
+            diagnostic_metadata: Default::default(),
             // errors at module scope should always be reported
             in_func_body: false,
             lifetime_uses: Default::default(),
@@ -1479,8 +1483,9 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                                     } else {
                                         LifetimeUseSet::Many
                                     }),
-                                    LifetimeRibKind::Generics { .. } => None,
-                                    LifetimeRibKind::ConstGeneric | LifetimeRibKind::AnonConst => {
+                                    LifetimeRibKind::Generics { .. }
+                                    | LifetimeRibKind::ConstGeneric => None,
+                                    LifetimeRibKind::AnonConst => {
                                         span_bug!(ident.span, "unexpected rib kind: {:?}", rib.kind)
                                     }
                                 })
@@ -1671,8 +1676,12 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             // Figure out if this is a type/trait segment,
             // which may need lifetime elision performed.
             let type_def_id = match partial_res.base_res() {
-                Res::Def(DefKind::AssocTy, def_id) if i + 2 == proj_start => self.r.parent(def_id),
-                Res::Def(DefKind::Variant, def_id) if i + 1 == proj_start => self.r.parent(def_id),
+                Res::Def(DefKind::AssocTy, def_id) if i + 2 == proj_start => {
+                    self.r.tcx.parent(def_id)
+                }
+                Res::Def(DefKind::Variant, def_id) if i + 1 == proj_start => {
+                    self.r.tcx.parent(def_id)
+                }
                 Res::Def(DefKind::Struct, def_id)
                 | Res::Def(DefKind::Union, def_id)
                 | Res::Def(DefKind::Enum, def_id)
@@ -2342,7 +2351,8 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 });
             }
 
-            ItemKind::Static(ref ty, _, ref expr) | ItemKind::Const(_, ref ty, ref expr) => {
+            ItemKind::Static(box ast::StaticItem { ref ty, ref expr, .. })
+            | ItemKind::Const(box ast::ConstItem { ref ty, ref expr, .. }) => {
                 self.with_static_rib(|this| {
                     this.with_lifetime_rib(LifetimeRibKind::Elided(LifetimeRes::Static), |this| {
                         this.visit_ty(ty);
@@ -2417,8 +2427,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     .iter()
                     .rfind(|r| matches!(r.kind, ItemRibKind(_)))
                     .expect("associated item outside of an item");
-                seen_bindings
-                    .extend(parent_rib.bindings.iter().map(|(ident, _)| (*ident, ident.span)));
+                seen_bindings.extend(parent_rib.bindings.keys().map(|ident| (*ident, ident.span)));
             };
             add_bindings_for_ns(ValueNS);
             add_bindings_for_ns(TypeNS);
@@ -2621,11 +2630,11 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         for item in trait_items {
             self.resolve_doc_links(&item.attrs, MaybeExported::Ok(item.id));
             match &item.kind {
-                AssocItemKind::Const(_, ty, default) => {
+                AssocItemKind::Const(box ast::ConstItem { ty, expr, .. }) => {
                     self.visit_ty(ty);
                     // Only impose the restrictions of `ConstRibKind` for an
                     // actual constant expression in a provided default.
-                    if let Some(expr) = default {
+                    if let Some(expr) = expr {
                         // We allow arbitrary const expressions inside of associated consts,
                         // even if they are potentially not const evaluatable.
                         //
@@ -2678,6 +2687,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 &path,
                 PathSource::Trait(AliasPossibility::No),
                 Finalize::new(trait_ref.ref_id, trait_ref.path.span),
+                RecordPartialRes::Yes,
             );
             self.diagnostic_metadata.currently_processing_impl_trait = None;
             if let Some(def_id) = res.expect_full_res().opt_def_id() {
@@ -2796,7 +2806,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         use crate::ResolutionError::*;
         self.resolve_doc_links(&item.attrs, MaybeExported::ImplItem(trait_id.ok_or(&item.vis)));
         match &item.kind {
-            AssocItemKind::Const(_, ty, default) => {
+            AssocItemKind::Const(box ast::ConstItem { ty, expr, .. }) => {
                 debug!("resolve_implementation AssocItemKind::Const");
                 // If this is a trait impl, ensure the const
                 // exists in trait
@@ -2811,7 +2821,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 );
 
                 self.visit_ty(ty);
-                if let Some(expr) = default {
+                if let Some(expr) = expr {
                     // We allow arbitrary const expressions inside of associated consts,
                     // even if they are potentially not const evaluatable.
                     //
@@ -3373,7 +3383,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                         participle: "defined",
                         article: res.article(),
                         shadowed_binding: res,
-                        shadowed_binding_span: self.r.opt_span(def_id).expect("const parameter defined outside of local crate"),
+                        shadowed_binding_span: self.r.def_span(def_id),
                     }
                 );
                 None
@@ -3416,6 +3426,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             &Segment::from_path(path),
             source,
             Finalize::new(id, path.span),
+            RecordPartialRes::Yes,
         );
     }
 
@@ -3426,6 +3437,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         path: &[Segment],
         source: PathSource<'ast>,
         finalize: Finalize,
+        record_partial_res: RecordPartialRes,
     ) -> PartialRes {
         let ns = source.namespace();
 
@@ -3454,8 +3466,8 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                         sugg.to_string(),
                         Applicability::MaybeIncorrect,
                     ))
-                } else if res.is_none() && matches!(source, PathSource::Type) {
-                    this.report_missing_type_error(path)
+                } else if res.is_none() && let PathSource::Type | PathSource::Expr(_) = source {
+                    this.suggest_adding_generic_parameter(path, source)
                 } else {
                     None
                 };
@@ -3632,7 +3644,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             _ => report_errors(self, None),
         };
 
-        if !matches!(source, PathSource::TraitItem(..)) {
+        if record_partial_res == RecordPartialRes::Yes {
             // Avoid recording definition of `A::B` in `<T as A>::B::C`.
             self.r.record_partial_res(node_id, partial_res);
             self.resolve_elided_lifetimes_in_path(node_id, partial_res, path, source, path_span);
@@ -3736,7 +3748,25 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 )));
             }
 
-            // Make sure `A::B` in `<T as A::B>::C` is a trait item.
+            let num_privacy_errors = self.r.privacy_errors.len();
+            // Make sure that `A` in `<T as A>::B::C` is a trait.
+            let trait_res = self.smart_resolve_path_fragment(
+                &None,
+                &path[..qself.position],
+                PathSource::Trait(AliasPossibility::No),
+                Finalize::new(finalize.node_id, qself.path_span),
+                RecordPartialRes::No,
+            );
+
+            if trait_res.expect_full_res() == Res::Err {
+                return Ok(Some(trait_res));
+            }
+
+            // Truncate additional privacy errors reported above,
+            // because they'll be recomputed below.
+            self.r.privacy_errors.truncate(num_privacy_errors);
+
+            // Make sure `A::B` in `<T as A>::B::C` is a trait item.
             //
             // Currently, `path` names the full item (`A::B::C`, in
             // our example). so we extract the prefix of that that is
@@ -3749,6 +3779,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 &path[..=qself.position],
                 PathSource::TraitItem(ns),
                 Finalize::with_root_span(finalize.node_id, finalize.path_span, qself.path_span),
+                RecordPartialRes::No,
             );
 
             // The remaining segments (the `C` in our example) will
@@ -4233,7 +4264,10 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             {
                 return;
             }
-            ResolveDocLinks::Exported if !maybe_exported.eval(self.r) => {
+            ResolveDocLinks::Exported
+                if !maybe_exported.eval(self.r)
+                    && !rustdoc::has_primitive_or_keyword_docs(attrs) =>
+            {
                 return;
             }
             ResolveDocLinks::ExportedMetadata

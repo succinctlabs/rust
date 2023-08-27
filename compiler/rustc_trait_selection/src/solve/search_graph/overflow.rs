@@ -1,10 +1,11 @@
 use rustc_infer::infer::canonical::Canonical;
 use rustc_infer::traits::query::NoSolution;
+use rustc_middle::traits::solve::{Certainty, MaybeCause, QueryResult};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Limit;
 
 use super::SearchGraph;
-use crate::solve::{response_no_constraints, Certainty, EvalCtxt, MaybeCause, QueryResult};
+use crate::solve::{response_no_constraints, EvalCtxt};
 
 /// When detecting a solver overflow, we return ambiguity. Overflow can be
 /// *hidden* by either a fatal error in an **AND** or a trivial success in an **OR**.
@@ -44,7 +45,7 @@ impl OverflowData {
     /// Updating the current limit when hitting overflow.
     fn deal_with_overflow(&mut self) {
         // When first hitting overflow we reduce the overflow limit
-        // for all future goals to prevent hangs if there's an exponental
+        // for all future goals to prevent hangs if there's an exponential
         // blowup.
         self.current_limit.0 = self.default_limit.0 / 8;
     }
@@ -71,6 +72,27 @@ pub(in crate::solve) trait OverflowHandler<'tcx> {
         self.search_graph().overflow_data.additional_depth = start_depth;
         self.search_graph().overflow_data.deal_with_overflow();
         on_overflow(self)
+    }
+
+    // Increment the `additional_depth` by one and evaluate `body`, or `on_overflow`
+    // if the depth is overflown.
+    fn with_incremented_depth<T>(
+        &mut self,
+        on_overflow: impl FnOnce(&mut Self) -> T,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let depth = self.search_graph().stack.len();
+        self.search_graph().overflow_data.additional_depth += 1;
+
+        let result = if self.search_graph().overflow_data.has_overflow(depth) {
+            self.search_graph().overflow_data.deal_with_overflow();
+            on_overflow(self)
+        } else {
+            body(self)
+        };
+
+        self.search_graph().overflow_data.additional_depth -= 1;
+        result
     }
 }
 

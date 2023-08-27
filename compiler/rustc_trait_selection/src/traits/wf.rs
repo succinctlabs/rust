@@ -191,8 +191,8 @@ pub fn predicate_obligations<'tcx>(
         ty::PredicateKind::TypeWellFormedFromEnv(..) => {
             bug!("TypeWellFormedFromEnv is only used for Chalk")
         }
-        ty::PredicateKind::AliasEq(..) => {
-            bug!("We should only wf check where clauses and `AliasEq` is not a `Clause`")
+        ty::PredicateKind::AliasRelate(..) => {
+            bug!("We should only wf check where clauses and `AliasRelate` is not a `Clause`")
         }
     }
 
@@ -364,7 +364,7 @@ impl<'tcx> WfPredicates<'tcx> {
         };
 
         if let Elaborate::All = elaborate {
-            let implied_obligations = traits::util::elaborate_obligations(tcx, obligations);
+            let implied_obligations = traits::util::elaborate(tcx, obligations);
             let implied_obligations = implied_obligations.map(extend);
             self.out.extend(implied_obligations);
         } else {
@@ -920,10 +920,10 @@ pub(crate) fn required_region_bounds<'tcx>(
 ) -> Vec<ty::Region<'tcx>> {
     assert!(!erased_self_ty.has_escaping_bound_vars());
 
-    traits::elaborate_predicates(tcx, predicates)
-        .filter_map(|obligation| {
-            debug!(?obligation);
-            match obligation.predicate.kind().skip_binder() {
+    traits::elaborate(tcx, predicates)
+        .filter_map(|pred| {
+            debug!(?pred);
+            match pred.kind().skip_binder() {
                 ty::PredicateKind::Clause(ty::Clause::Projection(..))
                 | ty::PredicateKind::Clause(ty::Clause::Trait(..))
                 | ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(..))
@@ -936,7 +936,7 @@ pub(crate) fn required_region_bounds<'tcx>(
                 | ty::PredicateKind::ConstEvaluatable(..)
                 | ty::PredicateKind::ConstEquate(..)
                 | ty::PredicateKind::Ambiguous
-                | ty::PredicateKind::AliasEq(..)
+                | ty::PredicateKind::AliasRelate(..)
                 | ty::PredicateKind::TypeWellFormedFromEnv(..) => None,
                 ty::PredicateKind::Clause(ty::Clause::TypeOutlives(ty::OutlivesPredicate(
                     ref t,

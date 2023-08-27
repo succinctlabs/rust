@@ -312,14 +312,14 @@ impl<CTX> HashStable<CTX> for ::std::num::NonZeroUsize {
 
 impl<CTX> HashStable<CTX> for f32 {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        let val: u32 = unsafe { ::std::mem::transmute(*self) };
+        let val: u32 = self.to_bits();
         val.hash_stable(ctx, hasher);
     }
 }
 
 impl<CTX> HashStable<CTX> for f64 {
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        let val: u64 = unsafe { ::std::mem::transmute(*self) };
+        let val: u64 = self.to_bits();
         val.hash_stable(ctx, hasher);
     }
 }
@@ -617,18 +617,10 @@ where
     }
 }
 
-impl<K, R, HCX> HashStable<HCX> for ::std::collections::HashSet<K, R>
-where
-    K: ToStableHashKey<HCX> + Eq,
-    R: BuildHasher,
-{
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
-        stable_hash_reduce(hcx, hasher, self.iter(), self.len(), |hasher, hcx, key| {
-            let key = key.to_stable_hash_key(hcx);
-            key.hash_stable(hcx, hasher);
-        });
-    }
-}
+// It is not safe to implement HashStable for HashSet or any other collection type
+// with unstable but observable iteration order.
+// See https://github.com/rust-lang/compiler-team/issues/533 for further information.
+impl<V, HCX> !HashStable<HCX> for std::collections::HashSet<V> {}
 
 impl<K, V, HCX> HashStable<HCX> for ::std::collections::BTreeMap<K, V>
 where

@@ -38,7 +38,7 @@ pub const SIGRTMAX: i32 = 42;
 
 /// Extra data stored with each stack frame
 pub struct FrameExtra<'tcx> {
-    /// Extra data for Stacked Borrows.
+    /// Extra data for the Borrow Tracker.
     pub borrow_tracker: Option<borrow_tracker::FrameState>,
 
     /// If this is Some(), then this is a special "catch unwind" frame (the frame of `try_fn`
@@ -146,7 +146,7 @@ impl fmt::Display for MiriMemoryKind {
 pub enum Provenance {
     Concrete {
         alloc_id: AllocId,
-        /// Stacked Borrows tag.
+        /// Borrow Tracker tag.
         tag: BorTag,
     },
     Wildcard,
@@ -195,7 +195,7 @@ impl fmt::Debug for Provenance {
                 } else {
                     write!(f, "[{alloc_id:?}]")?;
                 }
-                // Print Stacked Borrows tag.
+                // Print Borrow Tracker tag.
                 write!(f, "{tag:?}")?;
             }
             Provenance::Wildcard => {
@@ -812,7 +812,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     }
 
     #[inline(always)]
-    fn enforce_validity(ecx: &MiriInterpCx<'mir, 'tcx>) -> bool {
+    fn enforce_validity(ecx: &MiriInterpCx<'mir, 'tcx>, _layout: TyAndLayout<'tcx>) -> bool {
         ecx.machine.validate
     }
 
@@ -822,7 +822,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     }
 
     #[inline(always)]
-    fn ignore_checkable_overflow_assertions(ecx: &MiriInterpCx<'mir, 'tcx>) -> bool {
+    fn ignore_optional_overflow_checks(ecx: &MiriInterpCx<'mir, 'tcx>) -> bool {
         !ecx.tcx.sess.overflow_checks()
     }
 
@@ -834,7 +834,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         ecx.find_mir_or_eval_fn(instance, abi, args, dest, ret, unwind)
     }
@@ -847,7 +847,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.call_dlsym(fn_val, abi, args, dest, ret)
     }
@@ -859,7 +859,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.call_intrinsic(instance, args, dest, ret, unwind)
     }
@@ -868,7 +868,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     fn assert_panic(
         ecx: &mut MiriInterpCx<'mir, 'tcx>,
         msg: &mir::AssertMessage<'tcx>,
-        unwind: Option<mir::BasicBlock>,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.assert_panic(msg, unwind)
     }

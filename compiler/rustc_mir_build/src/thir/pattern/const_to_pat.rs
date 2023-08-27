@@ -1,14 +1,15 @@
 use rustc_hir as hir;
 use rustc_index::vec::Idx;
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
-use rustc_middle::mir::{self, Field};
+use rustc_infer::traits::Obligation;
+use rustc_middle::mir;
 use rustc_middle::thir::{FieldPat, Pat, PatKind};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::lint;
 use rustc_span::Span;
-use rustc_trait_selection::traits::predicate_for_trait_def;
+use rustc_target::abi::FieldIdx;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
-use rustc_trait_selection::traits::{self, ObligationCause, PredicateObligation};
+use rustc_trait_selection::traits::{self, ObligationCause};
 
 use std::cell::Cell;
 
@@ -58,8 +59,6 @@ struct ConstToPat<'tcx> {
     // inference context used for checking `T: Structural` bounds.
     infcx: InferCtxt<'tcx>,
 
-    include_lint_checks: bool,
-
     treat_byte_string_as_slice: bool,
 }
 
@@ -92,7 +91,6 @@ impl<'tcx> ConstToPat<'tcx> {
             span,
             infcx,
             param_env: pat_ctxt.param_env,
-            include_lint_checks: pat_ctxt.include_lint_checks,
             saw_const_match_error: Cell::new(false),
             saw_const_match_lint: Cell::new(false),
             behind_reference: Cell::new(false),
@@ -133,7 +131,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 })
             });
 
-        if self.include_lint_checks && !self.saw_const_match_error.get() {
+        if !self.saw_const_match_error.get() {
             // If we were able to successfully convert the const to some pat,
             // double-check that all types in the const implement `Structural`.
 
@@ -189,17 +187,15 @@ impl<'tcx> ConstToPat<'tcx> {
         // using `PartialEq::eq` in this scenario in the past.)
         let partial_eq_trait_id =
             self.tcx().require_lang_item(hir::LangItem::PartialEq, Some(self.span));
-        let obligation: PredicateObligation<'_> = predicate_for_trait_def(
+        let partial_eq_obligation = Obligation::new(
             self.tcx(),
+            ObligationCause::dummy(),
             self.param_env,
-            ObligationCause::misc(self.span, self.id.owner.def_id),
-            partial_eq_trait_id,
-            0,
-            [ty, ty],
+            self.tcx().mk_trait_ref(partial_eq_trait_id, [ty, ty]),
         );
-        // FIXME: should this call a `predicate_must_hold` variant instead?
 
-        let has_impl = self.infcx.predicate_may_hold(&obligation);
+        // FIXME: should this call a `predicate_must_hold` variant instead?
+        let has_impl = self.infcx.predicate_may_hold(&partial_eq_obligation);
 
         // Note: To fix rust-lang/rust#65466, we could just remove this type
         // walk hack for function pointers, and unconditionally error
@@ -220,7 +216,7 @@ impl<'tcx> ConstToPat<'tcx> {
     ) -> Result<Vec<FieldPat<'tcx>>, FallbackToConstRef> {
         vals.enumerate()
             .map(|(idx, val)| {
-                let field = Field::new(idx);
+                let field = FieldIdx::new(idx);
                 Ok(FieldPat { field, pattern: self.recur(val, false)? })
             })
             .collect()
@@ -240,21 +236,19 @@ impl<'tcx> ConstToPat<'tcx> {
 
         let kind = match cv.ty().kind() {
             ty::Float(_) => {
-                if self.include_lint_checks {
                     tcx.emit_spanned_lint(
                         lint::builtin::ILLEGAL_FLOATING_POINT_LITERAL_PATTERN,
                         id,
                         span,
                         FloatPattern,
                     );
-                }
                 PatKind::Constant { value: cv }
             }
             ty::Adt(adt_def, _) if adt_def.is_union() => {
                 // Matching on union fields is unsafe, we can't hide it in constants
                 self.saw_const_match_error.set(true);
                 let err = UnionPattern { span };
-                tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                tcx.sess.emit_err(err);
                 PatKind::Wild
             }
             ty::Adt(..)
@@ -268,7 +262,7 @@ impl<'tcx> ConstToPat<'tcx> {
             {
                 self.saw_const_match_error.set(true);
                 let err = TypeNotStructural { span, non_sm_ty };
-                tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                tcx.sess.emit_err(err);
                 PatKind::Wild
             }
             // If the type is not structurally comparable, just emit the constant directly,
@@ -281,8 +275,7 @@ impl<'tcx> ConstToPat<'tcx> {
             // Backwards compatibility hack because we can't cause hard errors on these
             // types, so we compare them via `PartialEq::eq` at runtime.
             ty::Adt(..) if !self.type_marked_structural(cv.ty()) && self.behind_reference.get() => {
-                if self.include_lint_checks
-                    && !self.saw_const_match_error.get()
+                if !self.saw_const_match_error.get()
                     && !self.saw_const_match_lint.get()
                 {
                     self.saw_const_match_lint.set(true);
@@ -306,7 +299,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 );
                 self.saw_const_match_error.set(true);
                 let err = TypeNotStructural { span, non_sm_ty: cv.ty() };
-                tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                tcx.sess.emit_err(err);
                 PatKind::Wild
             }
             ty::Adt(adt_def, substs) if adt_def.is_enum() => {
@@ -340,7 +333,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 ty::Dynamic(..) => {
                     self.saw_const_match_error.set(true);
                     let err = InvalidPattern { span, non_sm_ty: cv.ty() };
-                    tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                    tcx.sess.emit_err(err);
                     PatKind::Wild
                 }
                 // `&str` is represented as `ConstValue::Slice`, let's keep using this
@@ -407,8 +400,7 @@ impl<'tcx> ConstToPat<'tcx> {
                 // to figure out how to get a reference again.
                 ty::Adt(_, _) if !self.type_marked_structural(*pointee_ty) => {
                     if self.behind_reference.get() {
-                        if self.include_lint_checks
-                            && !self.saw_const_match_error.get()
+                        if !self.saw_const_match_error.get()
                             && !self.saw_const_match_lint.get()
                         {
                            self.saw_const_match_lint.set(true);
@@ -424,7 +416,7 @@ impl<'tcx> ConstToPat<'tcx> {
                         if !self.saw_const_match_error.get() {
                             self.saw_const_match_error.set(true);
                             let err = TypeNotStructural { span, non_sm_ty: *pointee_ty };
-                            tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                            tcx.sess.emit_err(err);
                         }
                         PatKind::Wild
                     }
@@ -438,7 +430,7 @@ impl<'tcx> ConstToPat<'tcx> {
                         // (except slices, which are handled in a separate arm above).
 
                         let err = UnsizedPattern { span, non_sm_ty: *pointee_ty };
-                        tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                        tcx.sess.emit_err(err);
 
                         PatKind::Wild
                     } else {
@@ -466,8 +458,7 @@ impl<'tcx> ConstToPat<'tcx> {
             // compilation choices change the runtime behaviour of the match.
             // See https://github.com/rust-lang/rust/issues/70861 for examples.
             ty::FnPtr(..) | ty::RawPtr(..) => {
-                if self.include_lint_checks
-                    && !self.saw_const_match_error.get()
+                if !self.saw_const_match_error.get()
                     && !self.saw_const_match_lint.get()
                 {
                     self.saw_const_match_lint.set(true);
@@ -483,13 +474,12 @@ impl<'tcx> ConstToPat<'tcx> {
             _ => {
                 self.saw_const_match_error.set(true);
                 let err = InvalidPattern { span, non_sm_ty: cv.ty() };
-                    tcx.sess.create_err(err).emit_unless(!self.include_lint_checks);
+                    tcx.sess.emit_err(err);
                 PatKind::Wild
             }
         };
 
-        if self.include_lint_checks
-            && !self.saw_const_match_error.get()
+        if !self.saw_const_match_error.get()
             && !self.saw_const_match_lint.get()
             && mir_structural_match_violation
             // FIXME(#73448): Find a way to bring const qualification into parity with

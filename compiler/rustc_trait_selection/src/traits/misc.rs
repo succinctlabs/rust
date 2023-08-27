@@ -87,7 +87,12 @@ pub fn type_allowed_to_implement_copy<'tcx>(
             };
             let ty = ocx.normalize(&normalization_cause, param_env, unnormalized_ty);
             let normalization_errors = ocx.select_where_possible();
-            if !normalization_errors.is_empty() {
+
+            // NOTE: The post-normalization type may also reference errors,
+            // such as when we project to a missing type or we have a mismatch
+            // between expected and found const-generic types. Don't report an
+            // additional copy error here, since it's not typically useful.
+            if !normalization_errors.is_empty() || ty.references_error() {
                 tcx.sess.delay_span_bug(field_span, format!("couldn't normalize struct field `{unnormalized_ty}` when checking Copy implementation"));
                 continue;
             }
@@ -106,16 +111,11 @@ pub fn type_allowed_to_implement_copy<'tcx>(
             // Check regions assuming the self type of the impl is WF
             let outlives_env = OutlivesEnvironment::with_bounds(
                 param_env,
-                Some(&infcx),
                 infcx.implied_bounds_tys(
                     param_env,
                     parent_cause.body_id,
                     FxIndexSet::from_iter([self_type]),
                 ),
-            );
-            infcx.process_registered_region_obligations(
-                outlives_env.region_bound_pairs(),
-                param_env,
             );
             let errors = infcx.resolve_regions(&outlives_env);
             if !errors.is_empty() {

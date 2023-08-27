@@ -8,7 +8,7 @@ extern crate rustc_macros;
 pub use self::Level::*;
 use rustc_ast::node_id::NodeId;
 use rustc_ast::{AttrId, Attribute};
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
 use rustc_error_messages::{DiagnosticMessage, MultiSpan};
 use rustc_hir::HashStableContext;
@@ -529,10 +529,21 @@ pub enum BuiltinLintDiagnostics {
         vis_span: Span,
         ident_span: Span,
     },
+    AmbiguousGlobReexports {
+        /// The name for which collision(s) have occurred.
+        name: String,
+        /// The name space for which the collision(s) occurred in.
+        namespace: String,
+        /// Span where the name is first re-exported.
+        first_reexport_span: Span,
+        /// Span where the same name is also re-exported.
+        duplicate_reexport_span: Span,
+    },
 }
 
 /// Lints that are buffered up early on in the `Session` before the
 /// `LintLevels` is calculated.
+#[derive(Debug)]
 pub struct BufferedEarlyLint {
     /// The span of code that we are linting on.
     pub span: MultiSpan,
@@ -551,7 +562,7 @@ pub struct BufferedEarlyLint {
     pub diagnostic: BuiltinLintDiagnostics,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct LintBuffer {
     pub map: FxIndexMap<NodeId, Vec<BufferedEarlyLint>>,
 }
@@ -600,6 +611,8 @@ impl LintBuffer {
         self.add_lint(lint, id, sp.into(), msg, diagnostic)
     }
 }
+
+pub type RegisteredTools = FxIndexSet<Ident>;
 
 /// Declares a static item of type `&'static Lint`.
 ///

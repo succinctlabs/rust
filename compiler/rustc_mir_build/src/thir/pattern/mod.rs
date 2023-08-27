@@ -21,29 +21,20 @@ use rustc_middle::mir::interpret::{
     ConstValue, ErrorHandled, LitToConstError, LitToConstInput, Scalar,
 };
 use rustc_middle::mir::{self, UserTypeProjection};
-use rustc_middle::mir::{BorrowKind, Field, Mutability};
+use rustc_middle::mir::{BorrowKind, Mutability};
 use rustc_middle::thir::{Ascription, BindingMode, FieldPat, LocalVarId, Pat, PatKind, PatRange};
 use rustc_middle::ty::subst::{GenericArg, SubstsRef};
 use rustc_middle::ty::CanonicalUserTypeAnnotation;
-use rustc_middle::ty::{self, AdtDef, ConstKind, DefIdTree, Region, Ty, TyCtxt, UserType};
+use rustc_middle::ty::{self, AdtDef, ConstKind, Region, Ty, TyCtxt, UserType};
 use rustc_span::{Span, Symbol};
+use rustc_target::abi::FieldIdx;
 
 use std::cmp::Ordering;
-
-#[derive(Clone, Debug)]
-enum PatternError {
-    AssocConstInPattern(Span),
-    ConstParamInPattern(Span),
-    StaticInPattern(Span),
-    NonConstPath(Span),
-}
 
 struct PatCtxt<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     typeck_results: &'a ty::TypeckResults<'tcx>,
-    errors: Vec<PatternError>,
-    include_lint_checks: bool,
 }
 
 pub(super) fn pat_from_hir<'a, 'tcx>(
@@ -52,30 +43,13 @@ pub(super) fn pat_from_hir<'a, 'tcx>(
     typeck_results: &'a ty::TypeckResults<'tcx>,
     pat: &'tcx hir::Pat<'tcx>,
 ) -> Box<Pat<'tcx>> {
-    let mut pcx = PatCtxt::new(tcx, param_env, typeck_results);
+    let mut pcx = PatCtxt { tcx, param_env, typeck_results };
     let result = pcx.lower_pattern(pat);
-    if !pcx.errors.is_empty() {
-        let msg = format!("encountered errors lowering pattern: {:?}", pcx.errors);
-        tcx.sess.delay_span_bug(pat.span, &msg);
-    }
     debug!("pat_from_hir({:?}) = {:?}", pat, result);
     result
 }
 
 impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        typeck_results: &'a ty::TypeckResults<'tcx>,
-    ) -> Self {
-        PatCtxt { tcx, param_env, typeck_results, errors: vec![], include_lint_checks: false }
-    }
-
-    fn include_lint_checks(&mut self) -> &mut Self {
-        self.include_lint_checks = true;
-        self
-    }
-
     fn lower_pattern(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
         // When implicit dereferences have been inserted in this pattern, the unadjusted lowered
         // pattern has the type that results *after* dereferencing. For example, in this code:
@@ -356,7 +330,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 let subpatterns = fields
                     .iter()
                     .map(|field| FieldPat {
-                        field: Field::new(self.typeck_results.field_index(field.hir_id)),
+                        field: self.typeck_results.field_index(field.hir_id),
                         pattern: self.lower_pattern(&field.pat),
                     })
                     .collect();
@@ -379,7 +353,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         pats.iter()
             .enumerate_and_adjust(expected_len, gap_pos)
             .map(|(i, subpattern)| FieldPat {
-                field: Field::new(i),
+                field: FieldIdx::new(i),
                 pattern: self.lower_pattern(subpattern),
             })
             .collect()
@@ -472,12 +446,15 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
             | Res::SelfTyAlias { .. }
             | Res::SelfCtor(..) => PatKind::Leaf { subpatterns },
             _ => {
-                let pattern_error = match res {
-                    Res::Def(DefKind::ConstParam, _) => PatternError::ConstParamInPattern(span),
-                    Res::Def(DefKind::Static(_), _) => PatternError::StaticInPattern(span),
-                    _ => PatternError::NonConstPath(span),
+                match res {
+                    Res::Def(DefKind::ConstParam, _) => {
+                        self.tcx.sess.emit_err(ConstParamInPattern { span })
+                    }
+                    Res::Def(DefKind::Static(_), _) => {
+                        self.tcx.sess.emit_err(StaticInPattern { span })
+                    }
+                    _ => self.tcx.sess.emit_err(NonConstPath { span }),
                 };
-                self.errors.push(pattern_error);
                 PatKind::Wild
             }
         };
@@ -530,7 +507,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 // It should be assoc consts if there's no error but we cannot resolve it.
                 debug_assert!(is_associated_const);
 
-                self.errors.push(PatternError::AssocConstInPattern(span));
+                self.tcx.sess.emit_err(AssocConstInPattern { span });
 
                 return pat_from_kind(PatKind::Wild);
             }
@@ -608,7 +585,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         match value {
             mir::ConstantKind::Ty(c) => match c.kind() {
                 ConstKind::Param(_) => {
-                    self.errors.push(PatternError::ConstParamInPattern(span));
+                    self.tcx.sess.emit_err(ConstParamInPattern { span });
                     return PatKind::Wild;
                 }
                 ConstKind::Error(_) => {
@@ -723,7 +700,7 @@ macro_rules! ClonePatternFoldableImpls {
 }
 
 ClonePatternFoldableImpls! { <'tcx>
-    Span, Field, Mutability, Symbol, LocalVarId, usize,
+    Span, FieldIdx, Mutability, Symbol, LocalVarId, usize,
     Region<'tcx>, Ty<'tcx>, BindingMode, AdtDef<'tcx>,
     SubstsRef<'tcx>, &'tcx GenericArg<'tcx>, UserType<'tcx>,
     UserTypeProjection, CanonicalUserTypeAnnotation<'tcx>

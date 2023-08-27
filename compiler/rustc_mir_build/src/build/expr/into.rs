@@ -6,7 +6,6 @@ use rustc_ast::InlineAsmOptions;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
-use rustc_index::vec::Idx;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::CanonicalUserTypeAnnotation;
@@ -229,7 +228,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     this.cfg.terminate(
                         loop_block,
                         source_info,
-                        TerminatorKind::FalseUnwind { real_target: body_block, unwind: None },
+                        TerminatorKind::FalseUnwind {
+                            real_target: body_block,
+                            unwind: UnwindAction::Continue,
+                        },
                     );
                     this.diverge_from(loop_block);
 
@@ -265,7 +267,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     TerminatorKind::Call {
                         func: fun,
                         args,
-                        cleanup: None,
+                        unwind: UnwindAction::Continue,
                         destination,
                         // The presence or absence of a return edge affects control-flow sensitive
                         // MIR checks and ultimately whether code is accepted or not. We can only
@@ -319,7 +321,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // See the notes for `ExprKind::Array` in `as_rvalue` and for
                 // `ExprKind::Borrow` above.
                 let is_union = adt_def.is_union();
-                let active_field_index = is_union.then(|| fields[0].name.index());
+                let active_field_index = is_union.then(|| fields[0].name);
 
                 let scope = this.local_scope();
 
@@ -328,7 +330,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let fields_map: FxHashMap<_, _> = fields
                     .into_iter()
                     .map(|f| {
-                        let local_info = Box::new(LocalInfo::AggregateTemp);
                         (
                             f.name,
                             unpack!(
@@ -336,7 +337,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                     block,
                                     Some(scope),
                                     &this.thir[f.expr],
-                                    Some(local_info),
+                                    LocalInfo::AggregateTemp,
                                     NeedsTemporary::Maybe,
                                 )
                             ),
@@ -344,10 +345,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     })
                     .collect();
 
-                let field_names: Vec<_> =
-                    (0..adt_def.variant(variant_index).fields.len()).map(Field::new).collect();
+                let field_names = adt_def.variant(variant_index).fields.indices();
 
-                let fields: Vec<_> = if let Some(FruInfo { base, field_types }) = base {
+                let fields = if let Some(FruInfo { base, field_types }) = base {
                     let place_builder =
                         unpack!(block = this.as_place_builder(block, &this.thir[*base]));
 
@@ -364,7 +364,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         })
                         .collect()
                 } else {
-                    field_names.iter().filter_map(|n| fields_map.get(n).cloned()).collect()
+                    field_names.filter_map(|n| fields_map.get(&n).cloned()).collect()
                 };
 
                 let inferred_ty = expr.ty;
@@ -469,7 +469,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         } else {
                             Some(destination_block)
                         },
-                        cleanup: None,
+                        unwind: if options.contains(InlineAsmOptions::MAY_UNWIND) {
+                            UnwindAction::Continue
+                        } else {
+                            UnwindAction::Unreachable
+                        },
                     },
                 );
                 if options.contains(InlineAsmOptions::MAY_UNWIND) {
@@ -526,7 +530,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         block,
                         Some(scope),
                         &this.thir[value],
-                        None,
+                        LocalInfo::Boring,
                         NeedsTemporary::No
                     )
                 );

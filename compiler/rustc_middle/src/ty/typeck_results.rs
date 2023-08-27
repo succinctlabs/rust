@@ -8,10 +8,9 @@ use crate::{
     },
 };
 use rustc_data_structures::{
-    fx::FxHashMap,
+    fx::{FxHashMap, FxIndexMap},
     sync::Lrc,
     unord::{UnordItems, UnordSet},
-    vec_map::VecMap,
 };
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
@@ -26,6 +25,7 @@ use rustc_macros::HashStable;
 use rustc_middle::mir::FakeReadCause;
 use rustc_session::Session;
 use rustc_span::Span;
+use rustc_target::abi::FieldIdx;
 use std::{collections::hash_map::Entry, hash::Hash, iter};
 
 use super::RvalueScopes;
@@ -43,7 +43,7 @@ pub struct TypeckResults<'tcx> {
     /// or patterns (`S { field }`). The index is often useful by itself, but to learn more
     /// about the field you also need definition of the variant to which the field
     /// belongs, but it may not exist if it's a tuple field (`tuple.0`).
-    field_indices: ItemLocalMap<usize>,
+    field_indices: ItemLocalMap<FieldIdx>,
 
     /// Stores the types for various nodes in the AST. Note that this table
     /// is not guaranteed to be populated outside inference. See
@@ -155,7 +155,7 @@ pub struct TypeckResults<'tcx> {
     /// by this function. We also store the
     /// type here, so that mir-borrowck can use it as a hint for figuring out hidden types,
     /// even if they are only set in dead code (which doesn't show up in MIR).
-    pub concrete_opaque_types: VecMap<LocalDefId, ty::OpaqueHiddenType<'tcx>>,
+    pub concrete_opaque_types: FxIndexMap<LocalDefId, ty::OpaqueHiddenType<'tcx>>,
 
     /// Tracks the minimum captures required for a closure;
     /// see `MinCaptureInformationMap` for more details.
@@ -314,19 +314,19 @@ impl<'tcx> TypeckResults<'tcx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.type_dependent_defs }
     }
 
-    pub fn field_indices(&self) -> LocalTableInContext<'_, usize> {
+    pub fn field_indices(&self) -> LocalTableInContext<'_, FieldIdx> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.field_indices }
     }
 
-    pub fn field_indices_mut(&mut self) -> LocalTableInContextMut<'_, usize> {
+    pub fn field_indices_mut(&mut self) -> LocalTableInContextMut<'_, FieldIdx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.field_indices }
     }
 
-    pub fn field_index(&self, id: hir::HirId) -> usize {
+    pub fn field_index(&self, id: hir::HirId) -> FieldIdx {
         self.field_indices().get(id).cloned().expect("no index for a field")
     }
 
-    pub fn opt_field_index(&self, id: hir::HirId) -> Option<usize> {
+    pub fn opt_field_index(&self, id: hir::HirId) -> Option<FieldIdx> {
         self.field_indices().get(id).cloned()
     }
 

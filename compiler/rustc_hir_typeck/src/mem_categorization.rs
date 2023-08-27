@@ -59,10 +59,9 @@ use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_hir::PatKind;
-use rustc_index::vec::Idx;
 use rustc_infer::infer::InferCtxt;
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 use rustc_trait_selection::infer::InferCtxtExt;
 
 pub(crate) trait HirNode {
@@ -120,8 +119,8 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
         self.infcx.tcx
     }
 
-    pub(crate) fn type_is_copy_modulo_regions(&self, ty: Ty<'tcx>, span: Span) -> bool {
-        self.infcx.type_is_copy_modulo_regions(self.param_env, ty, span)
+    pub(crate) fn type_is_copy_modulo_regions(&self, ty: Ty<'tcx>) -> bool {
+        self.infcx.type_is_copy_modulo_regions(self.param_env, ty)
     }
 
     fn resolve_vars_if_possible<T>(&self, value: T) -> T
@@ -331,7 +330,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
                     expr,
                     base,
                     expr_ty,
-                    ProjectionKind::Field(field_idx as u32, VariantIdx::new(0)),
+                    ProjectionKind::Field(field_idx, FIRST_VARIANT),
                 ))
             }
 
@@ -382,7 +381,6 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             | hir::ExprKind::Struct(..)
             | hir::ExprKind::Repeat(..)
             | hir::ExprKind::InlineAsm(..)
-            | hir::ExprKind::Box(..)
             | hir::ExprKind::Err(_) => Ok(self.cat_rvalue(expr.hir_id, expr.span, expr_ty)),
         }
     }
@@ -562,7 +560,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             | Res::SelfTyParam { .. }
             | Res::SelfTyAlias { .. } => {
                 // Structs and Unions have only have one variant.
-                Ok(VariantIdx::new(0))
+                Ok(FIRST_VARIANT)
             }
             _ => bug!("expected ADT path, found={:?}", res),
         }
@@ -676,7 +674,8 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
 
                 for (i, subpat) in subpats.iter().enumerate_and_adjust(total_fields, dots_pos) {
                     let subpat_ty = self.pat_ty_adjusted(subpat)?;
-                    let projection_kind = ProjectionKind::Field(i as u32, VariantIdx::new(0));
+                    let projection_kind =
+                        ProjectionKind::Field(FieldIdx::from_usize(i), FIRST_VARIANT);
                     let sub_place =
                         self.cat_projection(pat, place_with_id.clone(), subpat_ty, projection_kind);
                     self.cat_pattern_(sub_place, subpat, op)?;
@@ -691,7 +690,8 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
 
                 for (i, subpat) in subpats.iter().enumerate_and_adjust(total_fields, dots_pos) {
                     let subpat_ty = self.pat_ty_adjusted(subpat)?;
-                    let projection_kind = ProjectionKind::Field(i as u32, variant_index);
+                    let projection_kind =
+                        ProjectionKind::Field(FieldIdx::from_usize(i), variant_index);
                     let sub_place =
                         self.cat_projection(pat, place_with_id.clone(), subpat_ty, projection_kind);
                     self.cat_pattern_(sub_place, subpat, op)?;
@@ -716,7 +716,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
                         pat,
                         place_with_id.clone(),
                         field_ty,
-                        ProjectionKind::Field(field_index as u32, variant_index),
+                        ProjectionKind::Field(field_index, variant_index),
                     );
                     self.cat_pattern_(field_place, fp.pat, op)?;
                 }

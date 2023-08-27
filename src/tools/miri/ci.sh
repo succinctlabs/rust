@@ -43,7 +43,9 @@ function run_tests {
     # optimizations up all the way, too).
     # Optimizations change diagnostics (mostly backtraces), so we don't check
     # them. Also error locations change so we don't run the failing tests.
-    MIRIFLAGS="${MIRIFLAGS:-} -O -Zmir-opt-level=4" MIRI_SKIP_UI_CHECKS=1 ./miri test -- tests/{pass,panic}
+    # We explicitly enable debug-assertions here, they are disabled by -O but we have tests
+    # which exist to check that we panic on debug assertion failures.
+    MIRIFLAGS="${MIRIFLAGS:-} -O -Zmir-opt-level=4 -Cdebug-assertions=yes" MIRI_SKIP_UI_CHECKS=1 ./miri test -- tests/{pass,panic}
 
     # Also run some many-seeds tests. 64 seeds means this takes around a minute per test.
     for FILE in tests/many-seeds/*.rs; do
@@ -62,8 +64,8 @@ function run_tests {
   if [ "$HOST_TARGET" = x86_64-unknown-linux-gnu ]; then
     # These act up on Windows (`which miri` produces a filename that does not exist?!?),
     # so let's do this only on Linux. Also makes sure things work without these set.
-    export RUSTC=$(which rustc)
-    export MIRI=$(which miri)
+    export RUSTC=$(which rustc) # Produces a warning unless we also set MIRI
+    export MIRI=$(rustc +miri --print sysroot)/bin/miri
   fi
   mkdir -p .cargo
   echo 'build.rustc-wrapper = "thisdoesnotexist"' > .cargo/config.toml

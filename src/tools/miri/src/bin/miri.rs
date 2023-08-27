@@ -22,17 +22,20 @@ use log::debug;
 
 use rustc_data_structures::sync::Lrc;
 use rustc_driver::Compilation;
-use rustc_hir::{self as hir, def_id::LOCAL_CRATE, Node};
+use rustc_hir::{self as hir, Node};
 use rustc_interface::interface::Config;
 use rustc_middle::{
     middle::exported_symbols::{
         ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
     },
+    query::LocalCrate,
     ty::{query::ExternProviders, TyCtxt},
 };
+use rustc_session::config::OptLevel;
+
 use rustc_session::{config::CrateType, search_paths::PathKind, CtfeBacktrace};
 
-use miri::{BacktraceStyle, ProvenanceMode, RetagFields};
+use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields};
 
 struct MiriCompilerCalls {
     miri_config: miri::MiriConfig,
@@ -82,6 +85,21 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 env::set_current_dir(cwd).unwrap();
             }
 
+            if tcx.sess.opts.optimize != OptLevel::No {
+                tcx.sess.warn("Miri does not support optimizations. If you have enabled optimizations \
+                    by selecting a Cargo profile (such as --release) which changes other profile settings \
+                    such as whether debug assertions and overflow checks are enabled, those settings are \
+                    still applied.");
+            }
+            if tcx.sess.mir_opt_level() > 0 {
+                tcx.sess.warn("You have explicitly enabled MIR optimizations, overriding Miri's default \
+                    which is to completely disable them. Any optimizations may hide UB that Miri would \
+                    otherwise detect, and it is not necessarily possible to predict what kind of UB will \
+                    be missed. If you are enabling optimizations to make Miri run faster, we advise using \
+                    cfg(miri) to shrink your workload instead. The performance benefit of enabling MIR \
+                    optimizations is usually marginal at best.");
+            }
+
             if let Some(return_code) = miri::eval_entry(tcx, entry_def_id, entry_type, config) {
                 std::process::exit(
                     i32::try_from(return_code).expect("Return value was too large!"),
@@ -107,13 +125,15 @@ impl rustc_driver::Callbacks for MiriBeRustCompilerCalls {
             config.override_queries = Some(|_, local_providers, _| {
                 // `exported_symbols` and `reachable_non_generics` provided by rustc always returns
                 // an empty result if `tcx.sess.opts.output_types.should_codegen()` is false.
-                local_providers.exported_symbols = |tcx, cnum| {
-                    assert_eq!(cnum, LOCAL_CRATE);
+                local_providers.exported_symbols = |tcx, LocalCrate| {
+                    let reachable_set = tcx.with_stable_hashing_context(|hcx| {
+                        tcx.reachable_set(()).to_sorted(&hcx, true)
+                    });
                     tcx.arena.alloc_from_iter(
                         // This is based on:
                         // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L62-L63
                         // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L174
-                        tcx.reachable_set(()).iter().filter_map(|&local_def_id| {
+                        reachable_set.into_iter().filter_map(|&local_def_id| {
                             // Do the same filtering that rustc does:
                             // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L84-L102
                             // Otherwise it may cause unexpected behaviours and ICEs
@@ -314,6 +334,8 @@ fn main() {
             miri_config.validate = false;
         } else if arg == "-Zmiri-disable-stacked-borrows" {
             miri_config.borrow_tracker = None;
+        } else if arg == "-Zmiri-tree-borrows" {
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
         } else if arg == "-Zmiri-disable-data-race-detector" {
             miri_config.data_race_detector = false;
             miri_config.weak_memory_emulation = false;
