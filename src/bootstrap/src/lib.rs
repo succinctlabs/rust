@@ -94,6 +94,8 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
     (Some(Mode::Std), "target_os", Some(&["zkvm"])),
     // #[cfg(bootstrap)] risc0
     (Some(Mode::Std), "target_vendor", Some(&["risc0"])),
+    // #[cfg(bootstrap)] succinct
+    (Some(Mode::Std), "target_vendor", Some(&["succinct"])),
     (Some(Mode::Std), "target_arch", Some(&["spirv", "nvptx", "xtensa"])),
     /* Extra names used by dependencies */
     // FIXME: Used by serde_json, but we should not be triggering on external dependencies.
