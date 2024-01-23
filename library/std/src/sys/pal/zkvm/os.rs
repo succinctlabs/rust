@@ -111,7 +111,7 @@ pub fn getenv(varname: &OsStr) -> Option<OsString> {
     // reimplement "os_str" instead of just using the generic unix
     // "os_str".
     let u8s: &[u8] = unsafe { crate::slice::from_raw_parts(words.cast() as *const u8, nbytes) };
-    Some(OsString::from_inner(super::os_str::Buf { inner: u8s.to_vec() }))
+    Some(OsString::from_inner(crate::sys::os_str::Buf { inner: u8s.to_vec() }))
 }
 
 pub fn setenv(_: &OsStr, _: &OsStr) -> io::Result<()> {

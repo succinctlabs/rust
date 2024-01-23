@@ -33,7 +33,7 @@ impl Args {
         // "os_str".
         let arg_bytes: &[u8] =
             unsafe { crate::slice::from_raw_parts(words.cast() as *const u8, arg_len) };
-        OsString::from_inner(super::os_str::Buf { inner: arg_bytes.to_vec() })
+        OsString::from_inner(crate::sys::os_str::Buf { inner: arg_bytes.to_vec() })
     }
 }
 
