@@ -10,7 +10,20 @@ on:
 
 jobs:
   build: 
-    runs-on: buildjet-32vcpu-ubuntu-2204
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     include:
+    #       - os: macOS
+    #         arch: ARM64
+    #         triple: aarch64-apple-darwin
+    #       - os: macOS
+    #         arch: X64
+    #         triple: x86_64-apple-darwin
+    #       - os: Linux
+    #         arch: X64
+    #         triple: x86_64-unknown-linux-gnu
+    # runs-on: [buildjet-32vcpu-ubuntu-2204, "${{ matrix.os }}", "${{ matrix.arch }}"]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
@@ -41,7 +54,7 @@ jobs:
           token: ${{ secrets.PRIVATE_PULL_TOKEN }}
 
       - name: Build
-        run: cargo run --bin cargo-prove -- prove build-toolchain
+        run: GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo run --bin cargo-prove -- prove build-toolchain
         working-directory: vm
 
       - name: Archive build output
