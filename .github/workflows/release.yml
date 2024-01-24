@@ -29,6 +29,7 @@ jobs:
         with:
           submodules: 'recursive'
           path: rust
+          ref: succinct
           fetch-depth: 0
 
       - name: Check out succinctlabs/vm
