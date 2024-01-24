@@ -34,6 +34,9 @@ jobs:
         with:
             toolchain: stable
 
+      - name: Install ninja and cmake
+        uses: lukka/get-cmake@v3.27.4
+
       - name: Check out succinctlabs/vm
         uses: actions/checkout@v3
         with:
