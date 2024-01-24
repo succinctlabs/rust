@@ -34,14 +34,6 @@ jobs:
         with:
             toolchain: stable
 
-      - name: Check out succinctlabs/rust
-        uses: actions/checkout@v3
-        with:
-          submodules: 'recursive'
-          path: rust
-          ref: succinct
-          fetch-depth: 0
-
       - name: Check out succinctlabs/vm
         uses: actions/checkout@v3
         with:
@@ -50,15 +42,15 @@ jobs:
           ref: john/cargo-succinct-build-toolchain
           token: ${{ secrets.PRIVATE_PULL_TOKEN }}
 
-      - name: Build
-        run: GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo run --bin cargo-prove -- prove build-toolchain
-        working-directory: vm
+      - name: Install cargo prove
+        run: cargo install --path vm/cargo-prove
+        working-directory: vm/core
+
+      - name: Build toolchain
+        run: GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo prove build-toolchain
 
       - name: Archive build output
         uses: actions/upload-artifact@v3
         with:
           name: rust-toolchain-ubuntu
-          path: |
-            rust/build/${{ matrix.triple }}/stage2
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/src
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/rustc-src
+          path: rust/build/x86_64-unknown-linux-gnu/stage2
