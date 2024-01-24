@@ -9,21 +9,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build: 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macOS
-            arch: ARM64
-            triple: aarch64-apple-darwin
-          - os: macOS
-            arch: X64
-            triple: x86_64-apple-darwin
-          - os: Linux
-            arch: X64
-            triple: x86_64-unknown-linux-gnu
-    runs-on: [buildjet-32vcpu-ubuntu-2204, "${{ matrix.os }}", "${{ matrix.arch }}"]
+  build-ubuntu: 
+    runs-on: [buildjet-32vcpu-ubuntu-2204]
     steps:
       - name: Set up git private repo access
         run: |
@@ -55,14 +42,92 @@ jobs:
       - name: Archive build output
         uses: actions/upload-artifact@v3
         with:
-          name: rust-toolchain-${{ matrix.triple }}
+          name: rust-toolchain-x86_64-unknown-linux-gnu
           path: |
-            rust/build/${{ matrix.triple }}/stage2
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/src
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/rustc-src
+            rust/build/x86_64-unknown-linux-gnu/stage2
+            !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/src
+            !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/rustc-src
+
+  build-macos-13-arm64: 
+    runs-on: [macos-13-arm64]
+    steps:
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.PRIVATE_PULL_TOKEN }}@github.com".insteadOf ssh://git@github.com
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: stable
+
+      - name: Install ninja and cmake
+        uses: lukka/get-cmake@v3.27.4
+
+      - name: Check out succinctlabs/vm
+        uses: actions/checkout@v3
+        with:
+          repository: succinctlabs/vm
+          path: vm
+          ref: john/cargo-succinct-build-toolchain
+          token: ${{ secrets.PRIVATE_PULL_TOKEN }}
+
+      - name: Install cargo prove
+        run: cargo install --locked --path .
+        working-directory: vm/cli
+
+      - name: Build toolchain
+        run: GITHUB_ACTIONS=false GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo prove build-toolchain
+
+      - name: Archive build output
+        uses: actions/upload-artifact@v3
+        with:
+          name: rust-toolchain-aarch64-apple-darwin
+          path: |
+            rust/build/aarch64-apple-darwin/stage2
+            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/src
+            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/rustc-src
+
+  build-macos-13: 
+    runs-on: [macos-13]
+    steps:
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.PRIVATE_PULL_TOKEN }}@github.com".insteadOf ssh://git@github.com
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: stable
+
+      - name: Install ninja and cmake
+        uses: lukka/get-cmake@v3.27.4
+
+      - name: Check out succinctlabs/vm
+        uses: actions/checkout@v3
+        with:
+          repository: succinctlabs/vm
+          path: vm
+          ref: john/cargo-succinct-build-toolchain
+          token: ${{ secrets.PRIVATE_PULL_TOKEN }}
+
+      - name: Install cargo prove
+        run: cargo install --locked --path .
+        working-directory: vm/cli
+
+      - name: Build toolchain
+        run: GITHUB_ACTIONS=false GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo prove build-toolchain
+
+      - name: Archive build output
+        uses: actions/upload-artifact@v3
+        with:
+          name: x86_64-apple-darwin
+          path: |
+            rust/build/x86_64-apple-darwin/stage2
+            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/src
+            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/rustc-src
 
   release:
-    needs: build
+    needs: [build-ubuntu, build-macos-13, build-macos-13-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
