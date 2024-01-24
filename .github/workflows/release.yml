@@ -23,7 +23,7 @@ jobs:
     #       - os: Linux
     #         arch: X64
     #         triple: x86_64-unknown-linux-gnu
-    # runs-on: [buildjet-32vcpu-ubuntu-2204, "${{ matrix.os }}", "${{ matrix.arch }}"]
+    runs-on: [buildjet-32vcpu-ubuntu-2204]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
