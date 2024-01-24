@@ -69,7 +69,7 @@ jobs:
         ls -lha ./assets
     - name: Create release
       env:
-        GITHUB_TOKEN: ${{ secrets.PRIVATE_PULL_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         echo "Installing gh CLI..."
         curl -L https://github.com/cli/cli/releases/download/v2.17.0/gh_2.17.0_linux_amd64.tar.gz | \
