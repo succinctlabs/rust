@@ -48,8 +48,8 @@ jobs:
             !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/src
             !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/rustc-src
 
-  build-macos-13-arm64: 
-    runs-on: [macos-13-arm64]
+  build-macos-x86: 
+    runs-on: [macos-latest-large]
     steps:
       - name: Set up git private repo access
         run: |
@@ -87,8 +87,8 @@ jobs:
             !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/src
             !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/rustc-src
 
-  build-macos-13: 
-    runs-on: [macos-13]
+  build-macos-arm64: 
+    runs-on: [macos-latest-xlarge]
     steps:
       - name: Set up git private repo access
         run: |
