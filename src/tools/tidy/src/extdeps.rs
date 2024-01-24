@@ -26,7 +26,7 @@ pub fn check(root: &Path, bad: &mut bool) {
         let source = line.split_once('=').unwrap().1.trim();
 
         // Ensure source is allowed.
-        if !ALLOWED_SOURCES.contains(&&*source) && !source.contains("risc0") {
+        if !ALLOWED_SOURCES.contains(&&*source) && !source.contains("succinct") {
             tidy_error!(bad, "invalid source: {}", source);
         }
     }
