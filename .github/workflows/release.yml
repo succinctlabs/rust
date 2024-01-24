@@ -47,7 +47,7 @@ jobs:
         working-directory: vm/cli
 
       - name: Build toolchain
-        run: GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo prove build-toolchain
+        run: GITHUB_ACTIONS=false GITHUB_ACCESS_TOKEN=${{ secrets.PRIVATE_PULL_TOKEN }} cargo prove build-toolchain
 
       - name: Archive build output
         uses: actions/upload-artifact@v3
