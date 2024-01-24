@@ -2,11 +2,8 @@ name: Release
 
 on:
   push:
-    branches: [ succinct ]
-  pull_request:
-    branches: [ succinct ]
-  workflow_call:
-  workflow_dispatch:
+    tags:
+      - '*'
 
 jobs:
   build-ubuntu: 
