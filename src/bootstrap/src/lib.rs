@@ -92,9 +92,7 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
     // (Some(Mode::Std), "target_os", Some(&[])),
     // #[cfg(bootstrap)] zkvm
     (Some(Mode::Std), "target_os", Some(&["zkvm"])),
-    // #[cfg(bootstrap)] risc0
-    (Some(Mode::Std), "target_vendor", Some(&["risc0"])),
-    // #[cfg(bootstrap)] succinct
+    // #[cfg(bootstrap)] risc0 succinct
     (Some(Mode::Std), "target_vendor", Some(&["succinct"])),
     (Some(Mode::Std), "target_arch", Some(&["spirv", "nvptx", "xtensa"])),
     /* Extra names used by dependencies */
