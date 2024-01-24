@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    branches: [ succinct ]
+  pull_request:
+    branches: [ succinct ]
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build: 
+    runs-on: buildjet-32vcpu-ubuntu-2204
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.PRIVATE_PULL_TOKEN }}@github.com".insteadOf ssh://git@github.com
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: stable
+
+      - name: Check out succinctlabs/rust
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+          path: rust
+          fetch-depth: 0
+
+      - name: Check out succinctlabs/vm
+        uses: actions/checkout@v3
+        with:
+          repository: succinctlabs/vm
+          ref: john/cargo-succinct-build-toolchain
+          path: vm
+
+      - name: Build
+        run: cargo run --bin cargo-prove -- prove build-toolchain
+        working-directory: vm
+
+      - name: Archive build output
+        uses: actions/upload-artifact@v3
+        with:
+          name: rust-toolchain-ubuntu
+          path: |
+            rust/build/${{ matrix.triple }}/stage2
+            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/src
+            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/rustc-src
