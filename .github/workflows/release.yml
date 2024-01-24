@@ -78,11 +78,11 @@ jobs:
       - name: Archive build output
         uses: actions/upload-artifact@v3
         with:
-          name: rust-toolchain-aarch64-apple-darwin
+          name: rust-toolchain-x86_64-apple-darwin
           path: |
-            rust/build/aarch64-apple-darwin/stage2
-            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/src
-            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/rustc-src
+            rust/build/x86_64-apple-darwin/stage2
+            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/src
+            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/rustc-src
 
   build-macos-arm64: 
     runs-on: [macos-latest-xlarge]
@@ -117,11 +117,11 @@ jobs:
       - name: Archive build output
         uses: actions/upload-artifact@v3
         with:
-          name: x86_64-apple-darwin
+          name: rust-toolchain-aarch64-apple-darwin
           path: |
-            rust/build/x86_64-apple-darwin/stage2
-            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/src
-            !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/rustc-src
+            rust/build/aarch64-apple-darwin/stage2
+            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/src
+            !rust/build/aarch64-apple-darwin/stage2/lib/rustlib/rustc-src
 
   release:
     needs: [build-ubuntu, build-macos-x86, build-macos-arm64]
