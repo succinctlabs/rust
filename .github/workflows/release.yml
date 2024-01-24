@@ -53,4 +53,7 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: rust-toolchain-ubuntu
-          path: rust/build/x86_64-unknown-linux-gnu/stage2
+          path: |
+            rust/build/x86_64-unknown-linux-gnu/stage2
+            !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/src
+            !rust/build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/rustc-src
