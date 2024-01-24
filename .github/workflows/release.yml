@@ -10,19 +10,6 @@ on:
 
 jobs:
   build: 
-    # strategy:
-    #   fail-fast: false
-    #   matrix:
-    #     include:
-    #       - os: macOS
-    #         arch: ARM64
-    #         triple: aarch64-apple-darwin
-    #       - os: macOS
-    #         arch: X64
-    #         triple: x86_64-apple-darwin
-    #       - os: Linux
-    #         arch: X64
-    #         triple: x86_64-unknown-linux-gnu
     runs-on: [buildjet-32vcpu-ubuntu-2204]
     steps:
       - name: Set up git private repo access
@@ -82,7 +69,7 @@ jobs:
         ls -lha ./assets
     - name: Create release
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.PRIVATE_PULL_TOKEN }}
       run: |
         echo "Installing gh CLI..."
         curl -L https://github.com/cli/cli/releases/download/v2.17.0/gh_2.17.0_linux_amd64.tar.gz | \
