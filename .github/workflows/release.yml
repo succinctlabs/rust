@@ -127,7 +127,7 @@ jobs:
             !rust/build/x86_64-apple-darwin/stage2/lib/rustlib/rustc-src
 
   release:
-    needs: [build-ubuntu, build-macos-13, build-macos-13-arm64]
+    needs: [build-ubuntu, build-macos-x86, build-macos-13-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
