@@ -25,9 +25,6 @@ jobs:
     #         triple: x86_64-unknown-linux-gnu
     runs-on: [buildjet-32vcpu-ubuntu-2204]
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
       - name: Set up git private repo access
         run: |
           git config --global url."https://${{ secrets.PRIVATE_PULL_TOKEN }}@github.com".insteadOf ssh://git@github.com
