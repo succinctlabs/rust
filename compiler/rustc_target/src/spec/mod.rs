@@ -1161,9 +1161,9 @@ impl StackProbeType {
                     .and_then(|o| o.as_array())
                     .ok_or_else(|| "expected `min-llvm-version-for-inline` to be an array")?;
                 let mut iter = min_version.into_iter().map(|v| {
-                    let int = v.as_u64().ok_or_else(
-                        || "expected `min-llvm-version-for-inline` values to be integers",
-                    )?;
+                    let int = v.as_u64().ok_or_else(|| {
+                        "expected `min-llvm-version-for-inline` values to be integers"
+                    })?;
                     u32::try_from(int)
                         .map_err(|_| "`min-llvm-version-for-inline` values don't convert to u32")
                 });
@@ -1597,7 +1597,7 @@ supported_targets! {
     ("x86_64-unikraft-linux-musl", x86_64_unikraft_linux_musl),
 
     ("riscv32i-unknown-none-elf", riscv32i_unknown_none_elf),
-    ("riscv32im-risc0-zkvm-elf", riscv32im_risc0_zkvm_elf),
+    ("riscv32im-succinct-zkvm-elf", riscv32im_succinct_zkvm_elf),
     ("riscv32im-unknown-none-elf", riscv32im_unknown_none_elf),
     ("riscv32imc-unknown-none-elf", riscv32imc_unknown_none_elf),
     ("riscv32imc-esp-espidf", riscv32imc_esp_espidf),

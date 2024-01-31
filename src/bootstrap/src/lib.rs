@@ -92,8 +92,8 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
     // (Some(Mode::Std), "target_os", Some(&[])),
     // #[cfg(bootstrap)] zkvm
     (Some(Mode::Std), "target_os", Some(&["zkvm"])),
-    // #[cfg(bootstrap)] risc0
-    (Some(Mode::Std), "target_vendor", Some(&["risc0"])),
+    // #[cfg(bootstrap)] succinct
+    (Some(Mode::Std), "target_vendor", Some(&["succinct"])),
     (Some(Mode::Std), "target_arch", Some(&["spirv", "nvptx", "xtensa"])),
     /* Extra names used by dependencies */
     // FIXME: Used by serde_json, but we should not be triggering on external dependencies.
@@ -762,7 +762,11 @@ impl Build {
     /// Component directory that Cargo will produce output into (e.g.
     /// release/debug)
     fn cargo_dir(&self) -> &'static str {
-        if self.config.rust_optimize.is_release() { "release" } else { "debug" }
+        if self.config.rust_optimize.is_release() {
+            "release"
+        } else {
+            "debug"
+        }
     }
 
     fn tools_dir(&self, compiler: Compiler) -> PathBuf {
@@ -1747,7 +1751,11 @@ impl Build {
         use std::os::unix::fs::symlink as symlink_file;
         #[cfg(windows)]
         use std::os::windows::fs::symlink_file;
-        if !self.config.dry_run() { symlink_file(src.as_ref(), link.as_ref()) } else { Ok(()) }
+        if !self.config.dry_run() {
+            symlink_file(src.as_ref(), link.as_ref())
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns if config.ninja is enabled, and checks for ninja existence,
