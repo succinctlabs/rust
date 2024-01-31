@@ -17,9 +17,6 @@ jobs:
           - os: macOS
             arch: ARM64
             triple: aarch64-apple-darwin
-          - os: macOS
-            arch: X64
-            triple: x86_64-apple-darwin
           - os: Linux
             arch: X64
             triple: x86_64-unknown-linux-gnu
