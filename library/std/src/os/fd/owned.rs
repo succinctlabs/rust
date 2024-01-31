@@ -9,7 +9,7 @@ use crate::fs;
 use crate::io;
 use crate::marker::PhantomData;
 use crate::mem::forget;
-#[cfg(not(any(target_arch = "wasm32", target_env = "sgx", target_os = "hermit")))]
+#[cfg(not(any(target_arch = "wasm32", target_env = "sgx", target_os = "hermit", target_os = "zkvm")))]
 use crate::sys::cvt;
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 

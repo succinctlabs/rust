@@ -14,10 +14,11 @@ pub mod raw;
 // documented don't compile (missing things in `libc` which is empty),
 // so just omit them with an empty module and add the "unstable" attribute.
 
-// Unix, linux, wasi and windows are handled a bit differently.
+// Unix, linux, wasi, windows, and zkvm are handled a bit differently.
 #[cfg(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -27,6 +28,7 @@ pub mod unix {}
 #[cfg(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -36,6 +38,7 @@ pub mod linux {}
 #[cfg(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -45,6 +48,7 @@ pub mod wasi {}
 #[cfg(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -56,6 +60,7 @@ pub mod windows {}
 #[cfg(not(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -67,6 +72,7 @@ pub mod unix;
 #[cfg(not(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -78,6 +84,7 @@ pub mod linux;
 #[cfg(not(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
@@ -89,6 +96,7 @@ pub mod wasi;
 #[cfg(not(all(
     doc,
     any(
+        target_os = "zkvm",
         all(target_arch = "wasm32", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     )
