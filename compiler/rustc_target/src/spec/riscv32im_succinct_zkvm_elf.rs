@@ -10,7 +10,7 @@ pub fn target() -> Target {
 
         options: TargetOptions {
             os: "zkvm".into(),
-            vendor: "risc0".into(),
+            vendor: "succinct".into(),
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("rust-lld".into()),
             cpu: "generic-rv32".into(),
