@@ -1,4 +1,4 @@
-//! System bindings for the risc0 zkvm platform
+//! System bindings for the curta zkvm platform
 //!
 //! This module contains the facade (aka platform-specific) implementations of
 //! OS level functionality for zkvm.

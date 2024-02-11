@@ -1,10 +1,10 @@
-//! ABI definitions for symbols exported by risc0-zkvm-platform.
+//! ABI definitions for symbols exported by curta-zkvm-platform.
 
-// Included here so we don't have to depend on risc0-zkvm-platform.
+// Included here so we don't have to depend on curta-zkvm-platform.
 //
 // FIXME: Should we move this to the "libc" crate?  It seems like other
 // architectures put a lot of this kind of stuff there.  But there's
-// currently no risc0 fork of the libc crate, so we'd either have to
+// currently no curta fork of the libc crate, so we'd either have to
 // fork it or upstream it.
 
 #![allow(dead_code)]
@@ -19,7 +19,7 @@ pub mod fileno {
 }
 
 extern "C" {
-    // Wrappers around syscalls provided by risc0-zkvm-platform:
+    // Wrappers around syscalls provided by curta-zkvm-platform:
     pub fn sys_halt();
     pub fn sys_output(output_id: u32, output_value: u32);
     pub fn sys_sha_compress(
