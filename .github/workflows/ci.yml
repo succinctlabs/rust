@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ risc0 ]
+    branches: [succinct]
   pull_request:
-    branches: [ risc0 ]
+    branches: [succinct]
   workflow_call:
   workflow_dispatch:
 
@@ -14,37 +14,43 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macOS
-            arch: ARM64
+          - os: macos-14
             triple: aarch64-apple-darwin
-          - os: Linux
-            arch: X64
+          - os: ubuntu-22.04
             triple: x86_64-unknown-linux-gnu
-    runs-on: [ self-hosted, prod, "${{ matrix.os }}", "${{ matrix.arch }}" ]
+          - os: ubuntu-22.04
+            triple: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Rust
-        uses: risc0/actions-rs-toolchain@v1
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        id: rustc-toolchain
+        uses: actions-rs/toolchain@v1
         with:
-            toolchain: stable
+          profile: minimal
+          toolchain: nightly-2024-01-25
+          override: true
+
       - uses: lukka/get-cmake@v3.27.4
 
-      - name: Check out risc0/rust
+      - name: Check out succinctlabs/rust
         uses: actions/checkout@v3
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
           path: rust
           fetch-depth: 0
 
-      - name: Check out risc0/risc0
+      - name: Check out succinctlabs/sp1
         uses: actions/checkout@v3
         with:
-          repository: risc0/risc0
+          repository: succinctlabs/sp1
           ref: main
-          path: risc0
+          path: sp1
 
       - name: Build
-        run: GITHUB_ACTIONS=false RISC0_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-risczero -- risczero build-toolchain
-        working-directory: risc0
+        run: GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+        working-directory: sp1
 
       - name: Archive build output
         uses: actions/upload-artifact@v3
