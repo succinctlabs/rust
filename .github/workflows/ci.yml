@@ -22,17 +22,19 @@ jobs:
             triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install nightly toolchain
         id: rustc-toolchain
         uses: actions-rs/toolchain@v1
         with:
-          profile: minimal
           toolchain: nightly-2024-01-25
           default: true
 
       - uses: lukka/get-cmake@v3.27.4
+
+      - name: Show rust version
+        run: |
+          cargo version
+          rustup toolchain list
 
       - name: Check out succinctlabs/rust
         uses: actions/checkout@v3
