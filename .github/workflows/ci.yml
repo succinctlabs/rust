@@ -16,7 +16,9 @@ jobs:
         include:
           - os: macos-14
             triple: aarch64-apple-darwin
-          - os: ubuntu-22.04
+          - os: macos-13
+            triple: x86_64-apple-darwin
+          - os: buildjet-32vcpu-ubuntu-2204
             triple: x86_64-unknown-linux-gnu
           - os: buildjet-32vcpu-ubuntu-2204-arm
             triple: aarch64-unknown-linux-gnu
@@ -59,6 +61,4 @@ jobs:
         with:
           name: rust-toolchain-${{ matrix.triple }}
           path: |
-            rust/build/${{ matrix.triple }}/stage2
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/src
-            !rust/build/${{ matrix.triple }}/stage2/lib/rustlib/rustc-src
+            sp1/rust-toolchain-${{ matrix.triple }}.tar.gz
