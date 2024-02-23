@@ -30,7 +30,7 @@ jobs:
         with:
           profile: minimal
           toolchain: nightly-2024-01-25
-          override: true
+          default: true
 
       - uses: lukka/get-cmake@v3.27.4
 
