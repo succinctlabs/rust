@@ -16,7 +16,7 @@ jobs:
             triple: x86_64-apple-darwin
           - os: buildjet-32vcpu-ubuntu-2004
             triple: x86_64-unknown-linux-gnu
-          - os: buildjet-32vcpu-ubuntu-2004-arm
+          - os: buildjet-32vcpu-ubuntu-2204-arm
             triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
