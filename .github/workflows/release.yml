@@ -26,6 +26,8 @@ jobs:
           curl -L https://github.com/cli/cli/releases/download/v2.17.0/gh_2.17.0_linux_amd64.tar.gz | \
             tar xvz  --strip-components=2 --exclude=man
           chmod +x ./gh
+          mkdir tars
+          mv ./artifacts/*/*.tar.gz tars/
 
           ./gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./artifacts/* || \
           ./gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./artifacts/*
