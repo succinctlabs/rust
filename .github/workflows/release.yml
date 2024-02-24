@@ -29,5 +29,5 @@ jobs:
           mkdir tars
           mv ./artifacts/*/*.tar.gz tars/
 
-          ./gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./artifacts/* || \
-          ./gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./artifacts/*
+          ./gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/* || \
+          ./gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/*
