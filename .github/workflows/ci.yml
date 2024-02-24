@@ -1,10 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [succinct]
-  pull_request:
-    branches: [succinct]
   workflow_call:
   workflow_dispatch:
 
