@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: succinctlabs/sp1
-          ref: chris/static-toolchain
+          ref: main
           path: sp1
 
       - name: Build
