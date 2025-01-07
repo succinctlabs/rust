@@ -45,7 +45,7 @@ use std::{fmt, io};
 use rustc_fs_util::try_canonicalize;
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_span::symbol::{Symbol, kw, sym};
 use serde_json::Value;
 use tracing::debug;
 
@@ -1754,7 +1754,7 @@ supported_targets! {
     ("aarch64-unknown-trusty", aarch64_unknown_trusty),
 
     ("riscv32i-unknown-none-elf", riscv32i_unknown_none_elf),
-    ("riscv32im-risc0-zkvm-elf", riscv32im_risc0_zkvm_elf),
+    ("riscv32im-succinct-zkvm-elf", riscv32im_succinct_zkvm_elf),
     ("riscv32im-unknown-none-elf", riscv32im_unknown_none_elf),
     ("riscv32ima-unknown-none-elf", riscv32ima_unknown_none_elf),
     ("riscv32imc-unknown-none-elf", riscv32imc_unknown_none_elf),
@@ -3328,10 +3328,10 @@ impl Target {
 
         // Each field should have been read using `Json::remove` so any keys remaining are unused.
         let remaining_keys = obj.keys();
-        Ok((
-            base,
-            TargetWarnings { unused_fields: remaining_keys.cloned().collect(), incorrect_type },
-        ))
+        Ok((base, TargetWarnings {
+            unused_fields: remaining_keys.cloned().collect(),
+            incorrect_type,
+        }))
     }
 
     /// Load a built-in target

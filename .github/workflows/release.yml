@@ -1,0 +1,39 @@
+name: Release
+on:
+  push:
+    tags:
+      - "*"
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+      - name: List artifact contents
+        run: |
+          echo "Listing artifacts directory:"
+          ls -R artifacts
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Installing gh CLI..."
+          curl -L https://github.com/cli/cli/releases/download/v2.17.0/gh_2.17.0_linux_amd64.tar.gz | \
+            tar xvz  --strip-components=2 --exclude=man
+          chmod +x ./gh
+          mkdir tars
+          find artifacts -name "*.tar.gz" -exec mv {} tars/ \;
+          if [ "$(ls -A tars)" ]; then
+            ./gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/* || \
+            ./gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/*
+          else
+            echo "No files to release. Exiting."
+            exit 1
+          fi
