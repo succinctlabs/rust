@@ -31,7 +31,7 @@ jobs:
           mkdir tars
           find artifacts -name "*.tar.gz" -exec mv {} tars/ \;
           if [ "$(ls -A tars)" ]; then
-            ./gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/* || \
+            ./gh release create -p --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/* || \
             ./gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" ./tars/*
           else
             echo "No files to release. Exiting."
