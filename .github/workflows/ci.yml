@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-buildjet:
     strategy:
       fail-fast: false
       matrix:
@@ -16,8 +16,6 @@ jobs:
             triple: x86_64-apple-darwin
           - os: buildjet-32vcpu-ubuntu-2004
             triple: x86_64-unknown-linux-gnu
-          - os: buildjet-32vcpu-ubuntu-2204-arm
-            triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Rust
@@ -62,3 +60,52 @@ jobs:
         with:
           name: rust-toolchain-${{ matrix.triple }}
           path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
+
+  build-runs-on:
+    strategy:
+      fail-fast: false
+    runs-on: [runs-on, runner=32cpu-linux-arm64, image=ubuntu22-full-arm64, "run-id=${{ github.run_id }}"]
+    steps:
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: lukka/get-cmake@v3.27.4
+
+      - name: Install Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.21.4
+          check-latest: true
+
+      - name: Show rust version
+        run: |
+          cargo version
+          rustup toolchain list
+
+      - name: Check out succinctlabs/rust
+        uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+          path: rust
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Check out succinctlabs/sp1
+        uses: actions/checkout@v3
+        with:
+          repository: succinctlabs/sp1
+          ref: dev
+          path: sp1
+
+      - name: Build
+        run: |
+          cd sp1/crates/cli
+          GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+
+      - name: Archive build output
+        uses: actions/upload-artifact@v3
+        with:
+          name: rust-toolchain-${{ matrix.triple }}
+          path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
+
