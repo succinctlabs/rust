@@ -56,7 +56,7 @@ jobs:
           GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
 
       - name: Archive build output
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-${{ matrix.triple }}
           path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
@@ -104,7 +104,7 @@ jobs:
           GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
 
       - name: Archive build output
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-aarch64-unknown-linux-gnu
           path: sp1/crates/cli/rust-toolchain-aarch64-unknown-linux-gnu.tar.gz
