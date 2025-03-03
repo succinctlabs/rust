@@ -21,7 +21,7 @@ jobs:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.82.0
       - uses: lukka/get-cmake@v3.27.4
 
       - name: Install Go
@@ -69,7 +69,7 @@ jobs:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.82.0
       - uses: lukka/get-cmake@v3.27.4
 
       - name: Install Go
