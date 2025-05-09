@@ -11,30 +11,13 @@ pub struct Args {
 }
 
 pub fn args() -> Args {
-    let count = unsafe { abi::sys_argc() };
-    Args { i_forward: 0, i_back: 0, count }
+    Args { i_forward: 0, i_back: 0, count: 0 }
 }
 
 impl Args {
-    /// Use sys_argv to get the arg at the requested index. Does not check that i is less than argc
-    /// and will not return if the index is out of bounds.
+    /// Args::argv is currently not implemented.
     fn argv(i: usize) -> OsString {
-        let arg_len = unsafe { abi::sys_argv(crate::ptr::null_mut(), 0, i) };
-
-        let arg_len_words = (arg_len + WORD_SIZE - 1) / WORD_SIZE;
-        let words = unsafe { abi::sys_alloc_words(arg_len_words) };
-
-        let arg_len2 = unsafe { abi::sys_argv(words, arg_len_words, i) };
-        debug_assert_eq!(arg_len, arg_len2);
-
-        // Convert to OsString.
-        //
-        // FIXME: We can probably get rid of the extra copy here if we
-        // reimplement "os_str" instead of just using the generic unix
-        // "os_str".
-        let arg_bytes: &[u8] =
-            unsafe { crate::slice::from_raw_parts(words.cast() as *const u8, arg_len) };
-        OsString::from_inner(os_str::Buf { inner: arg_bytes.to_vec() })
+        panic!("Args::argv is currently not implemented");
     }
 }
 

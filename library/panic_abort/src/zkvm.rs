@@ -12,12 +12,14 @@ pub(crate) unsafe fn zkvm_set_abort_message(payload: &mut dyn PanicPayload) {
             None => &[],
         },
     };
-    if msg.is_empty() {
-        return;
+    
+    extern "C" {
+        fn syscall_halt(exit_code: u8) -> !;
+        fn sys_panic(msg_ptr: *const u8, len: usize) -> !;
     }
 
-    extern "C" {
-        fn sys_panic(msg_ptr: *const u8, len: usize) -> !;
+    if msg.is_empty() {
+        syscall_halt(1);
     }
 
     sys_panic(msg.as_ptr(), msg.len());

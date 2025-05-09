@@ -14,7 +14,10 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(unsafe { abi::sys_read(fileno::STDIN, buf.as_mut_ptr(), buf.len()) })
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "io::Read for Stdin is currently not implemented",
+        ));
     }
 }
 
