@@ -1,8 +1,5 @@
-use super::{WORD_SIZE, abi};
 use crate::ffi::OsString;
 use crate::fmt;
-use crate::sys::os_str;
-use crate::sys_common::FromInner;
 
 pub struct Args {
     i_forward: usize,
@@ -16,7 +13,7 @@ pub fn args() -> Args {
 
 impl Args {
     /// Args::argv is currently not implemented.
-    fn argv(i: usize) -> OsString {
+    fn argv(_i: usize) -> OsString {
         panic!("Args::argv is currently not implemented");
     }
 }

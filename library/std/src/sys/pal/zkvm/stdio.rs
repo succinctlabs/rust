@@ -13,7 +13,7 @@ impl Stdin {
 }
 
 impl io::Read for Stdin {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "io::Read for Stdin is currently not implemented",
