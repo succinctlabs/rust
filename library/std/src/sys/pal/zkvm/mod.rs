@@ -1,4 +1,4 @@
-//! System bindings for the risc0 zkvm platform
+//! System bindings for the sp1-zkvm.
 //!
 //! This module contains the facade (aka platform-specific) implementations of
 //! OS level functionality for zkvm.

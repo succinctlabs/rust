@@ -1,10 +1,10 @@
-//! ABI definitions for symbols exported by risc0-zkvm-platform.
+//! ABI definitions for symbols exported by sp1-zkvm.
 
-// Included here so we don't have to depend on risc0-zkvm-platform.
+// Included here so we don't have to depend on sp1-zkvm.
 //
 // FIXME: Should we move this to the "libc" crate?  It seems like other
 // architectures put a lot of this kind of stuff there.  But there's
-// currently no risc0 fork of the libc crate, so we'd either have to
+// currently no succinct fork of the libc crate, so we'd either have to
 // fork it or upstream it.
 
 #![allow(dead_code)]
@@ -19,7 +19,7 @@ pub mod fileno {
 }
 
 unsafe extern "C" {
-    // Wrappers around syscalls provided by risc0-zkvm-platform:
+    // Wrappers around syscalls provided by sp1-zkvm-platform:
     pub fn sys_halt();
     pub fn sys_output(output_id: u32, output_value: u32);
     pub fn sys_sha_compress(
@@ -34,7 +34,7 @@ unsafe extern "C" {
         buf: *const u8,
         count: u32,
     );
-    pub fn sys_rand(recv_buf: *mut u32, words: usize);
+    pub fn sys_rand(recv_buf: *mut u8, words: usize);
     pub fn sys_panic(msg_ptr: *const u8, len: usize) -> !;
     pub fn sys_log(msg_ptr: *const u8, len: usize);
     pub fn sys_cycle_count() -> usize;
