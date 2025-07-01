@@ -1,45 +1,26 @@
-use crate::ffi::{OsStr, OsString};
-use crate::num::NonZero;
-use crate::sync::OnceLock;
-use crate::sys::pal::{WORD_SIZE, abi};
-use crate::{fmt, ptr, slice};
-
-pub fn args() -> Args {
-    Args { iter: ARGS.get_or_init(|| get_args()).iter() }
-}
-
-fn get_args() -> Vec<&'static OsStr> {
-    let argc = unsafe { abi::sys_argc() };
-    let mut args = Vec::with_capacity(argc);
-
-    for i in 0..argc {
-        // Get the size of the argument then the data.
-        let arg_len = unsafe { abi::sys_argv(ptr::null_mut(), 0, i) };
-
-        let arg_len_words = (arg_len + WORD_SIZE - 1) / WORD_SIZE;
-        let words = unsafe { abi::sys_alloc_words(arg_len_words) };
-
-        let arg_len2 = unsafe { abi::sys_argv(words, arg_len_words, i) };
-        debug_assert_eq!(arg_len, arg_len2);
-
-        let arg_bytes = unsafe { slice::from_raw_parts(words.cast(), arg_len) };
-        args.push(unsafe { OsStr::from_encoded_bytes_unchecked(arg_bytes) });
-    }
-    args
-}
-
-static ARGS: OnceLock<Vec<&'static OsStr>> = OnceLock::new();
+use crate::ffi::OsString;
+use crate::fmt;
 
 pub struct Args {
-    iter: slice::Iter<'static, &'static OsStr>,
+    i_forward: usize,
+    i_back: usize,
+    count: usize,
 }
 
-impl !Send for Args {}
-impl !Sync for Args {}
+pub fn args() -> Args {
+    Args { i_forward: 0, i_back: 0, count: 0 }
+}
+
+impl Args {
+    /// Args::argv is currently not implemented.
+    fn argv(_i: usize) -> OsString {
+        panic!("Args::argv is currently not implemented");
+    }
+}
 
 impl fmt::Debug for Args {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.iter.as_slice().fmt(f)
+        f.debug_list().finish()
     }
 }
 
@@ -47,48 +28,34 @@ impl Iterator for Args {
     type Item = OsString;
 
     fn next(&mut self) -> Option<OsString> {
-        self.iter.next().map(|arg| arg.to_os_string())
+        if self.i_forward >= self.count - self.i_back {
+            None
+        } else {
+            let arg = Self::argv(self.i_forward);
+            self.i_forward += 1;
+            Some(arg)
+        }
     }
 
-    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
+        (self.count, Some(self.count))
     }
+}
 
-    #[inline]
-    fn count(self) -> usize {
-        self.iter.len()
-    }
-
-    fn last(self) -> Option<OsString> {
-        self.iter.last().map(|arg| arg.to_os_string())
-    }
-
-    #[inline]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.iter.advance_by(n)
+impl ExactSizeIterator for Args {
+    fn len(&self) -> usize {
+        self.count
     }
 }
 
 impl DoubleEndedIterator for Args {
     fn next_back(&mut self) -> Option<OsString> {
-        self.iter.next_back().map(|arg| arg.to_os_string())
-    }
-
-    #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.iter.advance_back_by(n)
-    }
-}
-
-impl ExactSizeIterator for Args {
-    #[inline]
-    fn len(&self) -> usize {
-        self.iter.len()
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.iter.is_empty()
+        if self.i_back >= self.count - self.i_forward {
+            None
+        } else {
+            let arg = Self::argv(self.count - 1 - self.i_back);
+            self.i_back += 1;
+            Some(arg)
+        }
     }
 }
