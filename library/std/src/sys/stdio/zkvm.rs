@@ -1,4 +1,4 @@
-use crate::io::{self, BorrowedCursor};
+use crate::io;
 use crate::sys::pal::abi::{self, fileno};
 
 pub struct Stdin;
@@ -12,16 +12,11 @@ impl Stdin {
 }
 
 impl io::Read for Stdin {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(unsafe { abi::sys_read(fileno::STDIN, buf.as_mut_ptr(), buf.len()) })
-    }
-
-    fn read_buf(&mut self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
-        unsafe {
-            let n = abi::sys_read(fileno::STDIN, buf.as_mut().as_mut_ptr().cast(), buf.capacity());
-            buf.advance_unchecked(n);
-        }
-        Ok(())
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "io::Read for Stdin is currently not implemented",
+        ));
     }
 }
 
