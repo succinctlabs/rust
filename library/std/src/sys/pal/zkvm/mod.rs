@@ -1,4 +1,4 @@
-//! System bindings for the risc0 zkvm platform
+//! System bindings for the succinct zkvm platform
 //!
 //! This module contains the facade (aka platform-specific) implementations of
 //! OS level functionality for zkvm.
@@ -14,8 +14,6 @@ pub mod abi;
 pub mod os;
 #[path = "../unsupported/pipe.rs"]
 pub mod pipe;
-#[path = "../unsupported/thread.rs"]
-pub mod thread;
 #[path = "../unsupported/time.rs"]
 pub mod time;
 
