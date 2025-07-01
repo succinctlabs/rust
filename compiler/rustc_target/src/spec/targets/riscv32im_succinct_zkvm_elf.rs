@@ -8,7 +8,7 @@ pub(crate) fn target() -> Target {
         data_layout: "e-m:e-p:32:32-i64:64-n32-S128".into(),
         llvm_target: "riscv32".into(),
         metadata: TargetMetadata {
-            description: Some("RISC Zero's zero-knowledge Virtual Machine (RV32IM ISA)".into()),
+            description: Some("Succinct's zero-knowledge Virtual Machine (RV32IM ISA)".into()),
             tier: Some(3),
             host_tools: Some(false),
             std: None, // ?
@@ -18,7 +18,7 @@ pub(crate) fn target() -> Target {
 
         options: TargetOptions {
             os: Os::Zkvm,
-            vendor: "risc0".into(),
+            vendor: "succinct".into(),
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("rust-lld".into()),
             cpu: "generic-rv32".into(),

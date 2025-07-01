@@ -110,7 +110,7 @@
     - [powerpc64le-unknown-linux-musl](platform-support/powerpc64le-unknown-linux-musl.md)
     - [riscv32e\*-unknown-none-elf](platform-support/riscv32e-unknown-none-elf.md)
     - [riscv32i\*-unknown-none-elf](platform-support/riscv32-unknown-none-elf.md)
-    - [riscv32im-risc0-zkvm-elf](platform-support/riscv32im-risc0-zkvm-elf.md)
+    - [riscv32im-succinct-zkvm-elf](platform-support/riscv32im-succinct-zkvm-elf.md)
     - [riscv32imac-unknown-xous-elf](platform-support/riscv32imac-unknown-xous-elf.md)
     - [riscv64im-unknown-none-elf](platform-support/riscv64im-unknown-none-elf.md)
     - [riscv64gc-unknown-linux-gnu](platform-support/riscv64gc-unknown-linux-gnu.md)

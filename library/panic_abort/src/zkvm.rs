@@ -12,9 +12,6 @@ pub(crate) unsafe fn zkvm_set_abort_message(payload: &mut dyn PanicPayload) {
             None => &[],
         },
     };
-    if msg.is_empty() {
-        return;
-    }
 
     unsafe extern "C" {
         fn sys_panic(msg_ptr: *const u8, len: usize) -> !;
