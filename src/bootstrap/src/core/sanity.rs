@@ -40,6 +40,7 @@ const STAGE0_MISSING_TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnumsan",
     "x86_64-unknown-linux-gnutsan",
     "riscv32im-succinct-zkvm-elf",
+    "riscv64im-succinct-zkvm-elf",
 ];
 
 /// Minimum version threshold for libstdc++ required when using prebuilt LLVM
