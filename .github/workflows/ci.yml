@@ -43,23 +43,16 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      - name: Check out succinctlabs/sp1
-        uses: actions/checkout@v3
-        with:
-          repository: succinctlabs/sp1
-          ref: dev
-          path: sp1
-
       - name: Build
         run: |
-          cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+          cd rust
+          ./build_toolchain_succinct.sh
 
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-${{ matrix.triple }}
-          path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
+          path: rust/rust-toolchain-${{ matrix.triple }}.tar.gz
 
   build-runs-on:
     strategy:
@@ -91,20 +84,13 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      - name: Check out succinctlabs/sp1
-        uses: actions/checkout@v3
-        with:
-          repository: succinctlabs/sp1
-          ref: dev
-          path: sp1
-
       - name: Build
         run: |
-          cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+          cd rust
+          ./build_toolchain_succinct.sh
 
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-aarch64-unknown-linux-gnu
-          path: sp1/crates/cli/rust-toolchain-aarch64-unknown-linux-gnu.tar.gz
+          path: rust/rust-toolchain-aarch64-unknown-linux-gnu.tar.gz

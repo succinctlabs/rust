@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "cc"
 version = "1.2.17"
-source = "git+https://github.com/leruaa/cc-rs?branch=aurelien%2Fadd-succinct-target#1cdaea42e4044e135817d49005f8b7e812e4cbfa"
+source = "git+https://github.com/succinctlabs/cc-rs?branch=add-succinct-target#a182366ce32d9bac95bfd2d65cf212262a809257"
 dependencies = [
  "shlex",
 ]

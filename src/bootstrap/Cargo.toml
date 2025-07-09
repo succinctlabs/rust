@@ -95,4 +95,4 @@ debug = 0
 bootstrap.debug = 1
 
 [patch.crates-io]
-cc = { git = "https://github.com/leruaa/cc-rs", branch = "aurelien/add-succinct-target" }
+cc = { git = "https://github.com/succinctlabs/cc-rs", branch = "add-succinct-target" }
