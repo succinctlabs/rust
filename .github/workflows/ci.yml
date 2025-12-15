@@ -18,6 +18,9 @@ jobs:
           - os: buildjet-32vcpu-ubuntu-2004
             triple: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: 13.0
+      MACOSX_STD_DEPLOYMENT_TARGET: 13.0
     steps:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
