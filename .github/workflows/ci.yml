@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-buildjet:
+  build-macos:
     strategy:
       fail-fast: false
       matrix:
@@ -15,8 +15,6 @@ jobs:
             triple: aarch64-apple-darwin
           - os: macos-15-intel
             triple: x86_64-apple-darwin
-          - os: buildjet-32vcpu-ubuntu-2004
-            triple: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Rust
@@ -65,7 +63,15 @@ jobs:
   build-runs-on:
     strategy:
       fail-fast: false
-    runs-on: [runs-on, runner=32cpu-linux-arm64, image=ubuntu22-full-arm64, disk=large, "run-id=${{ github.run_id }}"]
+      matrix:
+        include:
+          - runner: 32cpu-linux-arm64
+            image: ubuntu22-full-arm64
+            triple: aarch64-unknown-linux-gnu
+          - runner: 32cpu-linux-x64
+            image: ubuntu22-full-x64
+            triple: x86_64-unknown-linux-gnu
+    runs-on: [runs-on, "runner=${{ matrix.runner }}", "image=${{ matrix.image }}", disk=large, "run-id=${{ github.run_id }}"]
     steps:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
@@ -107,5 +113,5 @@ jobs:
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
-          name: rust-toolchain-aarch64-unknown-linux-gnu
-          path: sp1/crates/cli/rust-toolchain-aarch64-unknown-linux-gnu.tar.gz
+          name: rust-toolchain-${{ matrix.triple }}
+          path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
