@@ -4,6 +4,10 @@ on:
   workflow_call:
   workflow_dispatch:
 
+env:
+  RUSTUP_TOOLCHAIN: 1.98.0
+  SP1_BUILDER_REVISION: a3f98a36431af2d5c0789702b3b6510565a4f391
+
 jobs:
   build-macos:
     strategy:
@@ -18,9 +22,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.87.0
+        run: rustup toolchain install --no-self-update --profile minimal "$RUSTUP_TOOLCHAIN"
       - uses: lukka/get-cmake@v3.27.4
 
       - name: Install Go
@@ -35,7 +37,7 @@ jobs:
           rustup toolchain list
 
       - name: Check out succinctlabs/rust
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           submodules: "recursive"
           path: rust
@@ -43,22 +45,29 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Check out succinctlabs/sp1
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           repository: succinctlabs/sp1
-          ref: xuejie/build-rv64-library-target
+          ref: ${{ env.SP1_BUILDER_REVISION }}
           path: sp1
+
+      - name: Test toolchain archive validation
+        run: python3 rust/.github/scripts/test-validate-toolchain.py
 
       - name: Build
         run: |
           cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain
+
+      - name: Validate toolchain archive
+        run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
 
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-${{ matrix.triple }}
           path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
 
   build-runs-on:
     strategy:
@@ -74,9 +83,7 @@ jobs:
     runs-on: [runs-on, "runner=${{ matrix.runner }}", "image=${{ matrix.image }}", disk=large, "run-id=${{ github.run_id }}"]
     steps:
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.87.0
+        run: rustup toolchain install --no-self-update --profile minimal "$RUSTUP_TOOLCHAIN"
       - uses: lukka/get-cmake@v3.27.4
 
       - name: Install Go
@@ -91,7 +98,7 @@ jobs:
           rustup toolchain list
 
       - name: Check out succinctlabs/rust
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           submodules: "recursive"
           path: rust
@@ -99,19 +106,26 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Check out succinctlabs/sp1
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           repository: succinctlabs/sp1
-          ref: xuejie/build-rv64-library-target
+          ref: ${{ env.SP1_BUILDER_REVISION }}
           path: sp1
+
+      - name: Test toolchain archive validation
+        run: python3 rust/.github/scripts/test-validate-toolchain.py
 
       - name: Build
         run: |
           cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR=$GITHUB_WORKSPACE cargo run --bin cargo-prove -- prove build-toolchain
+          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain
+
+      - name: Validate toolchain archive
+        run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
 
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
           name: rust-toolchain-${{ matrix.triple }}
           path: sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
