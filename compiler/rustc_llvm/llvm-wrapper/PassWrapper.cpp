@@ -791,7 +791,18 @@ extern "C" LLVMRustResult LLVMRustOptimize(
     }
   }
 
+  ModulePassManager ExtraPassesMPM;
+  if (ExtraPassesLen) {
+    if (auto Err = PB.parsePassPipeline(
+            ExtraPassesMPM, StringRef(ExtraPasses, ExtraPassesLen))) {
+      std::string ErrMsg = toString(std::move(Err));
+      LLVMRustSetLastError(ErrMsg.c_str());
+      return LLVMRustResult::Failure;
+    }
+  }
+
   ModulePassManager MPM;
+  bool ExtraPassesAdded = false;
   bool NeedThinLTOBufferPasses = true;
   auto ThinLTOBuffer = std::make_unique<LLVMRustBuffer>();
   auto ThinLTOSummaryBuffer = std::make_unique<LLVMRustBuffer>();
@@ -820,6 +831,9 @@ extern "C" LLVMRustResult LLVMRustOptimize(
           // bitcode for embedding is obtained after performing
           // `ThinLTOPreLinkDefaultPipeline`.
           MPM.addPass(PB.buildThinLTOPreLinkDefaultPipeline(OptLevel));
+          // Embedded bitcode must include user passes such as lower-atomic.
+          MPM.addPass(std::move(ExtraPassesMPM));
+          ExtraPassesAdded = true;
           MPM.addPass(ThinLTOBitcodeWriterPass(
               ThinLTODataOS,
               ThinLTOSummaryBufferRef ? &ThinLinkDataOS : nullptr));
@@ -860,13 +874,8 @@ extern "C" LLVMRustResult LLVMRustOptimize(
       C(MPM, OptLevel, ThinOrFullLTOPhase::None);
   }
 
-  if (ExtraPassesLen) {
-    if (auto Err =
-            PB.parsePassPipeline(MPM, StringRef(ExtraPasses, ExtraPassesLen))) {
-      std::string ErrMsg = toString(std::move(Err));
-      LLVMRustSetLastError(ErrMsg.c_str());
-      return LLVMRustResult::Failure;
-    }
+  if (!ExtraPassesAdded) {
+    MPM.addPass(std::move(ExtraPassesMPM));
   }
 
   if (NeedThinLTOBufferPasses) {

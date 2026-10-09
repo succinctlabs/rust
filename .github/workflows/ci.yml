@@ -62,6 +62,9 @@ jobs:
       - name: Validate toolchain archive
         run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
 
+      - name: Test LTO guest builds and execution
+        run: python3 rust/.github/scripts/test-toolchain-lto.py "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
+
       - name: Archive build output
         uses: actions/upload-artifact@v4
         with:
@@ -122,6 +125,9 @@ jobs:
 
       - name: Validate toolchain archive
         run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
+
+      - name: Test LTO guest builds and execution
+        run: python3 rust/.github/scripts/test-toolchain-lto.py "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
 
       - name: Archive build output
         uses: actions/upload-artifact@v4
