@@ -47,6 +47,7 @@ def cache_key(rust, sp1, host):
     inputs = {
         "sources": sources,
         "builder": output("git", "rev-parse", "HEAD", cwd=sp1),
+        "builder_config": (sp1 / "crates/cli/src/commands/bootstrap.toml").read_text(),
         "host": host,
         # Installed CMake files can contain absolute paths.
         "workspace": str(rust.resolve()),

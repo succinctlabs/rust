@@ -68,6 +68,9 @@ jobs:
           git -C rust log -1 --format='%H %cs'
           python3 rust/.github/scripts/test-llvm-cache-key.py
 
+      - name: Retain compiler commit metadata
+        run: python3 rust/.github/scripts/configure-toolchain.py sp1
+
       - name: Identify LLVM build inputs
         id: llvm-key
         shell: bash
@@ -188,6 +191,9 @@ jobs:
           test "$(git -C rust rev-parse --is-shallow-repository)" = true
           git -C rust log -1 --format='%H %cs'
           python3 rust/.github/scripts/test-llvm-cache-key.py
+
+      - name: Retain compiler commit metadata
+        run: python3 rust/.github/scripts/configure-toolchain.py sp1
 
       - name: Identify LLVM build inputs
         id: llvm-key

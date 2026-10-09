@@ -13,6 +13,11 @@ spec = importlib.util.spec_from_file_location(
 )
 cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cache)
+spec = importlib.util.spec_from_file_location(
+    "configure_toolchain", Path(__file__).with_name("configure-toolchain.py")
+)
+configure = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(configure)
 
 
 class CacheKeyTests(unittest.TestCase):
@@ -32,7 +37,7 @@ class CacheKeyTests(unittest.TestCase):
             ".github/workflows/ci.yml", "compiler/rustc_llvm/wrapper",
         ):
             self.write(self.rust, path, "initial")
-        self.write(self.sp1, "bootstrap.toml", "initial")
+        self.write(self.sp1, "crates/cli/src/commands/bootstrap.toml", "[rust]\nlld = true\n")
         for repo in (self.rust, self.sp1):
             self.commit(repo)
         self.system = {"compiler": "compiler-1", "sdk": "sdk-1", "flags": ""}
@@ -75,9 +80,22 @@ class CacheKeyTests(unittest.TestCase):
 
     def test_builder_configuration_invalidates_cache(self):
         before = self.key()
-        self.write(self.sp1, "bootstrap.toml", "changed")
+        self.write(self.sp1, "crates/cli/src/commands/bootstrap.toml", "changed")
         self.commit(self.sp1)
         self.assertNotEqual(before, self.key())
+
+    def test_ci_override_preserves_options_and_invalidates_cache(self):
+        before = self.key()
+        path = self.sp1 / "crates/cli/src/commands/bootstrap.toml"
+        path.write_text(configure.retain_commit_hash(path.read_text()))
+        self.assertEqual(path.read_text(), "[rust]\nomit-git-hash = false\nlld = true\n")
+        # The checkout commit stays the same; the actual builder config must be keyed.
+        self.assertNotEqual(before, self.key())
+
+    def test_config_override_rejects_ambiguous_input(self):
+        for value in ("[build]\n", "[rust]\n[rust]\n", "[rust]\nomit-git-hash = true\n"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                configure.retain_commit_hash(value)
 
     def test_host_compiler_sdk_and_flags_invalidate_cache(self):
         self.assertNotEqual(self.key(), self.key("x86_64-unknown-linux-gnu"))
