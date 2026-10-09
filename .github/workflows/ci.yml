@@ -2,7 +2,16 @@ name: CI
 
 on:
   workflow_call:
+    inputs:
+      require-llvm-cache:
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      require-llvm-cache:
+        description: Require an exact LLVM cache hit when validating a warm build
+        type: boolean
+        default: false
 
 env:
   RUSTUP_TOOLCHAIN: 1.98.0
@@ -39,10 +48,9 @@ jobs:
       - name: Check out succinctlabs/rust
         uses: actions/checkout@v5
         with:
-          submodules: "recursive"
           path: rust
-          fetch-depth: 0
-          ref: ${{ github.ref }}
+          fetch-depth: 1
+          ref: ${{ github.sha }}
 
       - name: Check out succinctlabs/sp1
         uses: actions/checkout@v5
@@ -51,13 +59,74 @@ jobs:
           ref: ${{ env.SP1_BUILDER_REVISION }}
           path: sp1
 
+      # Bootstrap fetches only the submodules needed by compiler/rustc and library.
+      - name: Check shallow source metadata and cache key tests
+        shell: bash
+        run: |
+          test "$(git -C rust rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C rust rev-parse --is-shallow-repository)" = true
+          git -C rust log -1 --format='%H %cs'
+          python3 rust/.github/scripts/test-llvm-cache-key.py
+
+      - name: Retain compiler commit metadata
+        run: python3 rust/.github/scripts/configure-toolchain.py sp1
+
+      - name: Identify LLVM build inputs
+        id: llvm-key
+        shell: bash
+        run: |
+          key=$(python3 rust/.github/scripts/llvm-cache-key.py '${{ matrix.triple }}')
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore installed LLVM
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          # Keep the install and bootstrap stamp, without intermediate objects.
+          path: |
+            rust/build/${{ matrix.triple }}/llvm
+            !rust/build/${{ matrix.triple }}/llvm/build
+          key: ${{ steps.llvm-key.outputs.key }}
+
+      - name: Check LLVM cache result
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.llvm-cache.outputs.cache-hit }}
+          REQUIRE_HIT: ${{ inputs.require-llvm-cache }}
+        run: |
+          echo "LLVM cache hit: ${CACHE_HIT:-false}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$REQUIRE_HIT" = true ] && [ "$CACHE_HIT" != true ]; then
+            echo "Expected an exact LLVM cache hit." >&2
+            exit 1
+          fi
+          if [ "$CACHE_HIT" = true ]; then
+            test -s 'rust/build/${{ matrix.triple }}/llvm/.llvm-stamp'
+            'rust/build/${{ matrix.triple }}/llvm/bin/llvm-config' --version
+          fi
+
       - name: Test toolchain archive validation
         run: python3 rust/.github/scripts/test-validate-toolchain.py
 
       - name: Build
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.llvm-cache.outputs.cache-hit }}
         run: |
           cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain
+          SECONDS=0
+          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain 2>&1 | tee toolchain-build.log
+          echo "Toolchain build: $SECONDS seconds" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CACHE_HIT" = true ] && grep -q 'Building LLVM for' toolchain-build.log; then
+            echo "LLVM rebuilt despite an exact cache hit." >&2
+            exit 1
+          fi
+
+      - name: Check built compiler provenance
+        shell: bash
+        run: |
+          'rust/build/${{ matrix.triple }}/stage2/bin/rustc' -vV | tee rustc-version.txt
+          grep -Fx "commit-hash: $GITHUB_SHA" rustc-version.txt
+          test -s 'rust/build/${{ matrix.triple }}/llvm/.llvm-stamp'
 
       - name: Validate toolchain archive
         run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
@@ -103,10 +172,9 @@ jobs:
       - name: Check out succinctlabs/rust
         uses: actions/checkout@v5
         with:
-          submodules: "recursive"
           path: rust
-          fetch-depth: 0
-          ref: ${{ github.ref }}
+          fetch-depth: 1
+          ref: ${{ github.sha }}
 
       - name: Check out succinctlabs/sp1
         uses: actions/checkout@v5
@@ -115,13 +183,74 @@ jobs:
           ref: ${{ env.SP1_BUILDER_REVISION }}
           path: sp1
 
+      # Bootstrap fetches only the submodules needed by compiler/rustc and library.
+      - name: Check shallow source metadata and cache key tests
+        shell: bash
+        run: |
+          test "$(git -C rust rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C rust rev-parse --is-shallow-repository)" = true
+          git -C rust log -1 --format='%H %cs'
+          python3 rust/.github/scripts/test-llvm-cache-key.py
+
+      - name: Retain compiler commit metadata
+        run: python3 rust/.github/scripts/configure-toolchain.py sp1
+
+      - name: Identify LLVM build inputs
+        id: llvm-key
+        shell: bash
+        run: |
+          key=$(python3 rust/.github/scripts/llvm-cache-key.py '${{ matrix.triple }}')
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore installed LLVM
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          # Keep the install and bootstrap stamp, without intermediate objects.
+          path: |
+            rust/build/${{ matrix.triple }}/llvm
+            !rust/build/${{ matrix.triple }}/llvm/build
+          key: ${{ steps.llvm-key.outputs.key }}
+
+      - name: Check LLVM cache result
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.llvm-cache.outputs.cache-hit }}
+          REQUIRE_HIT: ${{ inputs.require-llvm-cache }}
+        run: |
+          echo "LLVM cache hit: ${CACHE_HIT:-false}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$REQUIRE_HIT" = true ] && [ "$CACHE_HIT" != true ]; then
+            echo "Expected an exact LLVM cache hit." >&2
+            exit 1
+          fi
+          if [ "$CACHE_HIT" = true ]; then
+            test -s 'rust/build/${{ matrix.triple }}/llvm/.llvm-stamp'
+            'rust/build/${{ matrix.triple }}/llvm/bin/llvm-config' --version
+          fi
+
       - name: Test toolchain archive validation
         run: python3 rust/.github/scripts/test-validate-toolchain.py
 
       - name: Build
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.llvm-cache.outputs.cache-hit }}
         run: |
           cd sp1/crates/cli
-          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain
+          SECONDS=0
+          GITHUB_ACTIONS=false SP1_BUILD_DIR="$GITHUB_WORKSPACE" cargo run --locked --no-default-features --bin cargo-prove -- prove build-toolchain 2>&1 | tee toolchain-build.log
+          echo "Toolchain build: $SECONDS seconds" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CACHE_HIT" = true ] && grep -q 'Building LLVM for' toolchain-build.log; then
+            echo "LLVM rebuilt despite an exact cache hit." >&2
+            exit 1
+          fi
+
+      - name: Check built compiler provenance
+        shell: bash
+        run: |
+          'rust/build/${{ matrix.triple }}/stage2/bin/rustc' -vV | tee rustc-version.txt
+          grep -Fx "commit-hash: $GITHUB_SHA" rustc-version.txt
+          test -s 'rust/build/${{ matrix.triple }}/llvm/.llvm-stamp'
 
       - name: Validate toolchain archive
         run: bash rust/.github/scripts/validate-toolchain.sh "sp1/crates/cli/rust-toolchain-${{ matrix.triple }}.tar.gz"
